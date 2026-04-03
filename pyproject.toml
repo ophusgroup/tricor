@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tricor"
+version = "0.1.0"
+description = "Construct disordered-to-ordered atomic supercells from 3 body distributions."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "matplotlib",
+    "ase",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tricor"]
