@@ -7,6 +7,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 from ase.atoms import Atoms
+from ase.data import chemical_symbols
 
 
 def _resolve_sigma(
@@ -112,6 +113,14 @@ class G3Distribution:
         self.species = list(distribution.species)
         self.species_pairs = list(distribution.species_pairs)
         self.pair_labels = list(distribution.pair_labels)
+        self.r = distribution.r.copy() if hasattr(distribution, "r") else self.bin_centers.copy()
+        self.r_num = getattr(distribution, "r_num", self.num_r)
+        if hasattr(distribution, "phi_num_bins"):
+            self.phi_num_bins = distribution.phi_num_bins
+            self.phi_edges = distribution.phi_edges.copy()
+            self.phi_step = distribution.phi_step
+            self.phi = distribution.phi.copy()
+            self.phi_deg = distribution.phi_deg.copy()
         self.is_target = True
 
         if not np.isclose(self.r_step, distribution.r_step):
@@ -147,6 +156,41 @@ class G3Distribution:
         self.source_distribution.measure_g3()
 
     def _make_target_array(self, source_g3: np.ndarray) -> np.ndarray:
+        if source_g3.ndim == 4 and getattr(self, "phi_num_bins", None) is not None:
+            centers = self.bin_centers.astype(np.float32, copy=False)
+            r01, r02 = np.meshgrid(centers, centers, indexing="ij")
+            average_radius = (r01 + r02) / 2.0
+
+            shell = np.square(centers + 0.5 * self.r_step).astype(np.float32, copy=False)
+            uniform = (shell[:, None] * shell[None, :]).astype(np.float32, copy=False)
+            uniform /= float(uniform.mean())
+            uniform = uniform[:, :, None]
+
+            if self.r_min is None:
+                envelope = np.zeros_like(average_radius, dtype=np.float32)
+            else:
+                width = max(self.r_max - self.r_min, self.r_step)
+                scaled = np.clip((average_radius - self.r_min) / width, 0.0, 1.0)
+                envelope = scaled * scaled * (3.0 - 2.0 * scaled)
+
+            blur_strength = 0.0 if self.blur_sigma is None else float(self.blur_sigma)
+            cumulative_blur = np.clip(
+                blur_strength * average_radius / max(self.r_max, self.r_step),
+                0.0,
+                0.95,
+            )
+            mix = np.maximum(envelope, cumulative_blur).astype(np.float32, copy=False)
+            mix = mix[:, :, None]
+
+            target = np.empty_like(source_g3, dtype=np.float32)
+            for pair_index in range(source_g3.shape[0]):
+                pair_uniform = uniform * float(np.mean(source_g3[pair_index]))
+                target[pair_index] = (
+                    (1.0 - mix) * source_g3[pair_index].astype(np.float32, copy=False)
+                    + mix * pair_uniform
+                )
+            return target
+
         centers = self.bin_centers.astype(np.float32, copy=False)
         r01, r02, r12 = np.meshgrid(centers, centers, centers, indexing="ij")
         average_radius = (r01 + r02 + r12) / 3.0
@@ -182,24 +226,35 @@ class G3Distribution:
         return target
 
     def measure_g3(
-        self, 
-        r_max,
-        r_step,
-        phi_num_bins = 90,
-        plot_g3 = True,
-    ):
+        self,
+        r_max: float | None = None,
+        r_step: float | None = None,
+        phi_num_bins: int = 90,
+        plot_g3: bool = True,
+    ) -> np.ndarray:
         """
         Measure 3 body distribution
         """
 
         # Coordinates
+        if r_max is None:
+            r_max = getattr(self, "r_max", None)
+        if r_step is None:
+            r_step = getattr(self, "r_step", None)
+        if r_max is None or r_step is None:
+            raise ValueError("r_max and r_step must be provided at least once.")
+
         self.r_max = r_max
         self.r_step = r_step
-        self.r = np.arange(0.0,r_max,r_step) + r_step/2
+        self.r = np.arange(0.0, r_max, r_step) + r_step / 2
         self.r_num = self.r.size
-        self.phi_num_bins = phi_num_bins
-        self.phi = np.linspace(0,np.pi,self.phi_num_bins,endpoint=False)
-        self.phi += (self.phi[1]-self.phi[0])/2
+        self.num_r = self.r_num
+        self.bin_centers = self.r
+        self.bin_edges = np.arange(self.r_num + 1, dtype=float) * self.r_step
+        self.phi_num_bins = int(phi_num_bins)
+        self.phi_edges = np.linspace(0.0, np.pi, self.phi_num_bins + 1)
+        self.phi_step = self.phi_edges[1] - self.phi_edges[0]
+        self.phi = self.phi_edges[:-1] + 0.5 * self.phi_step
         self.phi_deg = np.rad2deg(self.phi)
 
         # lattice parameters
@@ -238,6 +293,12 @@ class G3Distribution:
         for triplet_ind, (center_ind, neigh1_ind, neigh2_ind) in enumerate(self.g3_index):
             self.g3_lookup[center_ind, neigh1_ind, neigh2_ind] = triplet_ind
             self.g3_lookup[center_ind, neigh2_ind, neigh1_ind] = triplet_ind
+        species_labels = [chemical_symbols[int(spec)] for spec in self.species]
+        self.pair_labels = [
+            f"{species_labels[ind0]}{species_labels[ind1]}{species_labels[ind2]}"
+            for ind0, ind1, ind2 in self.g3_index
+        ]
+        self.species_pairs = list(self.g3_index)
 
         # determine required cell tiling
         dists = np.sum(
@@ -291,79 +352,110 @@ class G3Distribution:
                 np.sum(xyz_spec**2,axis=1)
             )
             xyz0[ind,:] = xyz_spec[ind_min,:]
+        self.xyz0 = xyz0
+        self.xyz_all = xyz_all
 
         # init g3
         self.g3count = np.zeros(
-            (self.num_triplets,self.phi_num_bins,self.r_num,self.r_num),
-            dtype='int',
+            (self.num_triplets, self.r_num, self.r_num, self.phi_num_bins),
+            dtype=np.int64,
         )
 
+        r_max_sq = float(self.r_max * self.r_max)
+        zero_tol = max(1e-12, (1e-9 * self.r_step) ** 2)
+        vector_table: list[list[np.ndarray]] = []
+        radius_sq_table: list[list[np.ndarray]] = []
+        radius_bin_table: list[list[np.ndarray]] = []
+
+        # Precompute neighbors for each center-species / neighbor-species combination.
+        for ind0 in range(self.num_species):
+            vectors_by_species: list[np.ndarray] = []
+            radius_sq_by_species: list[np.ndarray] = []
+            radius_bin_by_species: list[np.ndarray] = []
+            for indn in range(self.num_species):
+                vectors = xyz_all[indn] - xyz0[ind0]
+                radius_sq = np.einsum("ij,ij->i", vectors, vectors)
+                keep = (radius_sq > zero_tol) & (radius_sq < r_max_sq)
+                vectors = vectors[keep]
+                radius_sq = radius_sq[keep]
+                radius_bin = np.floor(np.sqrt(radius_sq) / self.r_step).astype(np.intp)
+                keep_bin = radius_bin < self.r_num
+                vectors_by_species.append(vectors[keep_bin])
+                radius_sq_by_species.append(radius_sq[keep_bin])
+                radius_bin_by_species.append(radius_bin[keep_bin])
+            vector_table.append(vectors_by_species)
+            radius_sq_table.append(radius_sq_by_species)
+            radius_bin_table.append(radius_bin_by_species)
+
+        flat_size = self.r_num * self.r_num * self.phi_num_bins
+
         # calculate g3
-        # for ind in np.arange(self.num_triplets):
-        for ind in np.arange(1):
-            ind0 = self.g3_index[ind,0]
-            ind1 = self.g3_index[ind,1]
-            ind2 = self.g3_index[ind,2]
-            
-            r01 = xyz_all[ind1] - xyz0[ind0]
-            r02 = xyz_all[ind2] - xyz0[ind0]
-            # r12 = 
+        for ind in range(self.num_triplets):
+            ind0, ind1, ind2 = self.g3_index[ind]
+            v01 = vector_table[ind0][ind1]
+            v02 = vector_table[ind0][ind2]
+            r01_sq = radius_sq_table[ind0][ind1]
+            r02_sq = radius_sq_table[ind0][ind2]
+            r01_bin = radius_bin_table[ind0][ind1]
+            r02_bin = radius_bin_table[ind0][ind2]
 
+            if v01.size == 0 or v02.size == 0:
+                continue
 
+            dot = v01 @ v02.T
+            denom = np.sqrt(r01_sq[:, None] * r02_sq[None, :])
+            cos_phi = np.clip(dot / denom, -1.0, 1.0)
+            phi_bin = np.floor(np.arccos(cos_phi) / self.phi_step).astype(np.intp)
+            np.clip(phi_bin, 0, self.phi_num_bins - 1, out=phi_bin)
 
+            rr_index = (
+                (r01_bin[:, None] * self.r_num + r02_bin[None, :]) * self.phi_num_bins
+            )
+            linear = rr_index + phi_bin
 
-            
+            if ind1 == ind2:
+                valid = np.ones(linear.shape, dtype=bool)
+                np.fill_diagonal(valid, False)
+                linear = linear[valid]
 
+            counts = np.bincount(linear.ravel(), minlength=flat_size)
+            self.g3count[ind] += counts.reshape(self.r_num, self.r_num, self.phi_num_bins)
 
+            # Explicitly mirror mixed-species neighbor channels so the stored array is
+            # symmetric in the two radial axes.
+            if ind1 != ind2:
+                rr_index_sym = (
+                    (r02_bin[None, :] * self.r_num + r01_bin[:, None]) * self.phi_num_bins
+                )
+                linear_sym = rr_index_sym + phi_bin
+                counts_sym = np.bincount(linear_sym.ravel(), minlength=flat_size)
+                self.g3count[ind] += counts_sym.reshape(
+                    self.r_num,
+                    self.r_num,
+                    self.phi_num_bins,
+                )
 
-
-        # """Populate a synthetic g3 grid with the right shape for notebook work."""
-        # if self.atoms is None:
-        #     raise ValueError("This distribution has no atomic structure to measure.")
-
-        # centers = self.bin_centers.astype(np.float32, copy=False)
-        # r01, r02, r12 = np.meshgrid(centers, centers, centers, indexing="ij")
-        # pair_count = len(self.species_pairs)
-        # g3 = np.empty((pair_count, self.num_r, self.num_r, self.num_r), dtype=np.float32)
-
-        # radial_decay = np.exp(-(r01 + r02 + r12) / max(self.r_max * 0.75, self.r_step))
-        # shell_center = 0.35 * self.r_max
-        # shell_width = max(0.2 * self.r_max, self.r_step)
-        # shell_peak = np.exp(
-        #     -(
-        #         np.square(r01 - shell_center)
-        #         + np.square(r02 - 1.2 * shell_center)
-        #         + np.square(r12 - 1.4 * shell_center)
-        #     )
-        #     / (2.0 * shell_width * shell_width)
-        # )
-        # oscillation = 0.5 * (1.0 + np.cos((r01 - r02) / max(self.r_step, 1e-8)))
-
-        # for pair_index, _pair in enumerate(self.species_pairs):
-        #     scale = amplitude * (1.0 + 0.2 * pair_index)
-        #     g3[pair_index] = baseline + scale * radial_decay * (0.35 + 0.65 * oscillation)
-        #     g3[pair_index] += 0.15 * (pair_index + 1) * shell_peak
-
-        # self.g3 = g3
-        # self.summary = {
-        #     "kind": "measured",
-        #     "num_atoms": len(self.atoms),
-        #     "num_species": len(self.species),
-        #     "num_pairs": len(self.species_pairs),
-        #     "shape": tuple(g3.shape),
-        #     "amplitude": amplitude,
-        #     "baseline": baseline,
-        # }
-        # if kwargs:
-        #     self.summary["measure_kwargs"] = dict(kwargs)
-        # self.history.append(
-        #     {
-        #         "event": "measure_g3",
-        #         "shape": tuple(g3.shape),
-        #         "kwargs": dict(kwargs),
-        #     }
-        # )
-        # return g3
+        self.g3 = self.g3count
+        self.summary = {
+            "kind": "measured",
+            "num_atoms": len(self.atoms),
+            "num_species": int(self.num_species),
+            "num_triplets": int(self.num_triplets),
+            "shape": tuple(self.g3.shape),
+            "r_max": float(self.r_max),
+            "r_step": float(self.r_step),
+            "phi_num_bins": int(self.phi_num_bins),
+        }
+        self.history.append(
+            {
+                "event": "measure_g3",
+                "shape": tuple(self.g3.shape),
+                "phi_num_bins": int(self.phi_num_bins),
+            }
+        )
+        if plot_g3:
+            self.plot_g3()
+        return self.g3
 
     def target_g3(
         self,
@@ -393,13 +485,18 @@ class G3Distribution:
         cmap: str = "viridis",
         title: str | None = None,
     ) -> plt.Axes:
-        """Plot a single r12 slice of one pair channel."""
+        """Plot a single angular or radial slice of one channel."""
         self._ensure_plot_data()
 
         pair_index = self._resolve_pair_index(pair)
-        if slice_index is None:
-            slice_index = self.num_r // 2
-        slice_index = int(np.clip(slice_index, 0, self.num_r - 1))
+        if self.g3.ndim == 4 and getattr(self, "phi_num_bins", None) is not None:
+            if slice_index is None:
+                slice_index = self.phi_num_bins // 2
+            slice_index = int(np.clip(slice_index, 0, self.phi_num_bins - 1))
+        else:
+            if slice_index is None:
+                slice_index = self.num_r // 2
+            slice_index = int(np.clip(slice_index, 0, self.num_r - 1))
 
         if ax is None:
             _, ax = plt.subplots(figsize=(6, 5))
@@ -414,10 +511,11 @@ class G3Distribution:
         )
         ax.set_xlabel("r01")
         ax.set_ylabel("r02")
-        ax.set_title(
-            title
-            or f"{self.label}: {self.pair_labels[pair_index]} at r12={self.bin_centers[slice_index]:.2f}"
-        )
+        if self.g3.ndim == 4 and getattr(self, "phi_num_bins", None) is not None:
+            slice_label = f"phi={self.phi_deg[slice_index]:.1f} deg"
+        else:
+            slice_label = f"r12={self.bin_centers[slice_index]:.2f}"
+        ax.set_title(title or f"{self.label}: {self.pair_labels[pair_index]} at {slice_label}")
         ax.figure.colorbar(image, ax=ax, label="g3")
         return ax
 
@@ -433,17 +531,22 @@ class G3Distribution:
         self.measure_g3()
 
     def _resolve_pair_index(self, pair: int | str) -> int:
+        labels = getattr(self, "pair_labels", None)
+        if labels is None:
+            labels = []
         if isinstance(pair, int):
-            if pair < 0 or pair >= len(self.species_pairs):
+            if pair < 0 or pair >= len(labels):
                 raise IndexError("Pair index is out of range.")
             return pair
-        if pair not in self.pair_labels:
-            raise KeyError(f"Unknown pair label {pair!r}. Available labels: {self.pair_labels}")
-        return self.pair_labels.index(pair)
+        if pair not in labels:
+            raise KeyError(f"Unknown pair label {pair!r}. Available labels: {labels}")
+        return labels.index(pair)
 
     def __repr__(self) -> str:
         kind = "target" if self.is_target else "measured"
+        labels = getattr(self, "pair_labels", [])
+        bin_count = getattr(self, "num_r", getattr(self, "r_num", None))
         return (
             f"G3Distribution(label={self.label!r}, kind={kind!r}, "
-            f"pairs={len(self.species_pairs)}, bins={self.num_r})"
+            f"pairs={len(labels)}, bins={bin_count})"
         )
