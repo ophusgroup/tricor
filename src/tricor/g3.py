@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 import numpy as np
@@ -10,6 +11,39 @@ from ase.data import chemical_symbols
 
 
 _EPS = 1e-12
+
+
+class _TextProgressBar:
+    """Minimal text progress bar for long-running measurements."""
+
+    def __init__(self, total: int, *, label: str = "Progress", width: int = 28) -> None:
+        self.total = max(int(total), 1)
+        self.label = label
+        self.width = max(int(width), 10)
+        self.current = 0
+        self._last_units = -1
+
+    def update(self, current: int) -> None:
+        """Advance the bar to the requested current step."""
+        self.current = int(np.clip(current, 0, self.total))
+        filled = int(round(self.width * self.current / self.total))
+        if filled == self._last_units and self.current < self.total:
+            return
+        self._last_units = filled
+        bar = "#" * filled + "-" * (self.width - filled)
+        percent = 100.0 * self.current / self.total
+        print(
+            f"\r{self.label}: [{bar}] {self.current}/{self.total} ({percent:5.1f}%)",
+            end="",
+            file=sys.stdout,
+            flush=True,
+        )
+
+    def close(self) -> None:
+        """Finish the bar and move to the next line."""
+        if self.current < self.total:
+            self.update(self.total)
+        print(file=sys.stdout, flush=True)
 
 
 def _resolve_optional_alias(
@@ -493,6 +527,8 @@ class G3Distribution:
         phi_num_bins: int = 90,
         plot_g3: bool = False,
         return_g3: bool = False,
+        show_progress: bool = False,
+        progress_label: str | None = None,
     ) -> np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Measure the raw rooted three-body distribution.
 
@@ -510,6 +546,11 @@ class G3Distribution:
         return_g3
             If `True`, also return the radial and angular bin centers along with the
             measured raw histogram.
+        show_progress
+            If `True`, display a simple text progress bar while the origin-centered
+            triplet histograms are accumulated.
+        progress_label
+            Optional label shown next to the progress bar.
 
         Returns
         -------
@@ -675,6 +716,14 @@ class G3Distribution:
             np.where(self.g3_index[:, 0] == ind0)[0]
             for ind0 in range(self.num_species)
         ]
+        progress = None
+        processed_origins = 0
+        if show_progress:
+            progress = _TextProgressBar(
+                self.num_sites,
+                label=progress_label or f"Measuring {self.label}",
+            )
+            progress.update(0)
 
         # calculate g3 as the sum over all unit-cell origins, grouped by center species
         for ind0 in range(self.num_species):
@@ -744,6 +793,12 @@ class G3Distribution:
                             self.r_num,
                             self.phi_num_bins,
                         )
+                processed_origins += 1
+                if progress is not None:
+                    progress.update(processed_origins)
+
+        if progress is not None:
+            progress.close()
 
         self.g3 = self.g3count
         self.g2 = self.g2count
