@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import matplotlib.pyplot as plt
 import numpy as np
 from ase.atoms import Atoms
 from ase.data import chemical_symbols
@@ -65,29 +64,24 @@ class G3Distribution:
         r_step: float | None,
         r_max: float | None,
     ) -> None:
-        if r_step is None or r_max is None:
-            raise ValueError("r_step and r_max are required when initializing from Atoms.")
-        if r_step <= 0 or r_max <= 0:
-            raise ValueError("r_step and r_max must be positive.")
-
-        num_r_float = r_max / r_step
-        num_r = int(round(num_r_float))
-        if not np.isclose(num_r_float, num_r):
-            raise ValueError("r_max must be divisible by r_step.")
-
         self.atoms = atoms.copy()
-        self.r_step = float(r_step)
-        self.r_max = float(r_max)
-        self.num_r = num_r
-        self.bin_edges = np.linspace(0.0, self.r_max, self.num_r + 1)
-        self.bin_centers = self.bin_edges[:-1] + 0.5 * self.r_step
-        self.species = sorted(set(self.atoms.get_chemical_symbols()))
-        self.species_pairs = [
-            (left, right)
-            for index, left in enumerate(self.species)
-            for right in self.species[index:]
-        ]
-        self.pair_labels = [f"{left}-{right}" for left, right in self.species_pairs]
+        self.r_step = None if r_step is None else float(r_step)
+        self.r_max = None if r_max is None else float(r_max)
+        self.num_r = None
+        self.r = None
+        self.r_num = None
+        self.bin_edges = None
+        self.bin_centers = None
+        self.phi_num_bins = None
+        self.phi_edges = None
+        self.phi_step = None
+        self.phi = None
+        self.phi_deg = None
+        self.species = np.unique(self.atoms.numbers)
+        self.species_pairs: list[Any] = []
+        self.pair_labels: list[str] = []
+        self.num_sites = len(self.atoms)
+        self.num_species = int(self.species.size)
         self.history.append(
             {
                 "event": "initialized",
@@ -107,22 +101,40 @@ class G3Distribution:
         self.atoms = distribution.atoms.copy() if distribution.atoms is not None else None
         self.r_step = distribution.r_step if r_step is None else float(r_step)
         self.r_max = distribution.r_max if r_max is None else float(r_max)
-        self.num_r = distribution.num_r
-        self.bin_edges = distribution.bin_edges.copy()
-        self.bin_centers = distribution.bin_centers.copy()
-        self.species = list(distribution.species)
+        self.num_r = getattr(distribution, "num_r", None)
+        self.bin_edges = (
+            None if getattr(distribution, "bin_edges", None) is None
+            else distribution.bin_edges.copy()
+        )
+        self.bin_centers = (
+            None if getattr(distribution, "bin_centers", None) is None
+            else distribution.bin_centers.copy()
+        )
+        self.species = np.array(distribution.species, copy=True)
         self.species_pairs = list(distribution.species_pairs)
         self.pair_labels = list(distribution.pair_labels)
-        self.r = distribution.r.copy() if hasattr(distribution, "r") else self.bin_centers.copy()
+        self.r = None if getattr(distribution, "r", None) is None else distribution.r.copy()
         self.r_num = getattr(distribution, "r_num", self.num_r)
-        if hasattr(distribution, "phi_num_bins"):
+        if getattr(distribution, "phi_num_bins", None) is not None:
             self.phi_num_bins = distribution.phi_num_bins
             self.phi_edges = distribution.phi_edges.copy()
             self.phi_step = distribution.phi_step
             self.phi = distribution.phi.copy()
             self.phi_deg = distribution.phi_deg.copy()
+        else:
+            self.phi_num_bins = None
+            self.phi_edges = None
+            self.phi_step = None
+            self.phi = None
+            self.phi_deg = None
+        if hasattr(distribution, "g3_index"):
+            self.g3_index = np.array(distribution.g3_index, copy=True)
+        if hasattr(distribution, "g3_lookup"):
+            self.g3_lookup = np.array(distribution.g3_lookup, copy=True)
         self.is_target = True
 
+        if self.r_step is None or self.r_max is None:
+            raise ValueError("Source distribution must define r_step and r_max before targeting.")
         if not np.isclose(self.r_step, distribution.r_step):
             raise ValueError("Target distributions must currently reuse the source r_step.")
         if not np.isclose(self.r_max, distribution.r_max):
@@ -153,6 +165,10 @@ class G3Distribution:
     def _ensure_source_g3(self) -> None:
         if self.source_distribution is None or self.source_distribution.g3 is not None:
             return
+        if self.source_distribution.r_step is None or self.source_distribution.r_max is None:
+            raise ValueError(
+                "Measure the source distribution before constructing a target distribution."
+            )
         self.source_distribution.measure_g3()
 
     def _make_target_array(self, source_g3: np.ndarray) -> np.ndarray:
@@ -230,7 +246,8 @@ class G3Distribution:
         r_max: float | None = None,
         r_step: float | None = None,
         phi_num_bins: int = 90,
-        plot_g3: bool = True,
+        plot_g3: bool = False,
+        return_g3: bool = False
     ) -> np.ndarray:
         """
         Measure 3 body distribution
@@ -243,12 +260,19 @@ class G3Distribution:
             r_step = getattr(self, "r_step", None)
         if r_max is None or r_step is None:
             raise ValueError("r_max and r_step must be provided at least once.")
+        if r_step <= 0 or r_max <= 0:
+            raise ValueError("r_step and r_max must be positive.")
+
+        num_r_float = r_max / r_step
+        num_r = int(round(num_r_float))
+        if not np.isclose(num_r_float, num_r):
+            raise ValueError("r_max must be divisible by r_step.")
 
         self.r_max = r_max
         self.r_step = r_step
-        self.r = np.arange(0.0, r_max, r_step) + r_step / 2
-        self.r_num = self.r.size
-        self.num_r = self.r_num
+        self.r = np.arange(num_r, dtype=float) * r_step + 0.5 * r_step
+        self.r_num = num_r
+        self.num_r = num_r
         self.bin_centers = self.r
         self.bin_edges = np.arange(self.r_num + 1, dtype=float) * self.r_step
         self.phi_num_bins = int(phi_num_bins)
@@ -268,8 +292,9 @@ class G3Distribution:
         self.species = np.unique(numbers)
         self.num_sites = scaled_positions.shape[0]
         self.num_species = self.species.size
-        self.num_triplets = (self.num_species**2)*(self.num_species+1)//2
-        self.g3_index = np.zeros((self.num_triplets,3),dtype='int')
+        self.num_triplets = (self.num_species**2) * (self.num_species + 1) // 2
+        self.g3_index = np.zeros((self.num_triplets, 3), dtype=np.intp)
+        origin_species_index = np.searchsorted(self.species, numbers)
 
         # Make rooted triplet index with unordered neighbors:
         # [center, neigh_1, neigh_2] with neigh_1 <= neigh_2
@@ -295,10 +320,10 @@ class G3Distribution:
             self.g3_lookup[center_ind, neigh2_ind, neigh1_ind] = triplet_ind
         species_labels = [chemical_symbols[int(spec)] for spec in self.species]
         self.pair_labels = [
-            f"{species_labels[ind0]}{species_labels[ind1]}{species_labels[ind2]}"
+            f"{species_labels[ind1]}-{species_labels[ind0]}-{species_labels[ind2]}"
             for ind0, ind1, ind2 in self.g3_index
         ]
-        self.species_pairs = list(self.g3_index)
+        self.species_pairs = [tuple(int(v) for v in triplet) for triplet in self.g3_index]
 
         # determine required cell tiling
         dists = np.sum(
@@ -339,20 +364,24 @@ class G3Distribution:
         self.tile_species = tile_species[keep]
         self.tile_xyz = tile_xyz[keep,:]
 
-        # subsets of coordinates by type
+        # subsets of tiled coordinates and origin coordinates by species
         xyz_all = []
         for spec in self.species:
-            sub = self.tile_species==spec
-            xyz_all.append(self.tile_xyz[sub,:])
+            sub = self.tile_species == spec
+            xyz_all.append(self.tile_xyz[sub, :])
 
-        # origin coordinates
-        xyz0 = np.zeros((self.num_species,3))
-        for ind,xyz_spec in enumerate(xyz_all):
-            ind_min = np.argmin(
-                np.sum(xyz_spec**2,axis=1)
-            )
-            xyz0[ind,:] = xyz_spec[ind_min,:]
-        self.xyz0 = xyz0
+        origin_xyz = (
+            scaled_positions[:, 0][:, None] * u[None, :]
+            + scaled_positions[:, 1][:, None] * v[None, :]
+            + scaled_positions[:, 2][:, None] * w[None, :]
+        )
+        origin_xyz_by_species = []
+        for ind0 in range(self.num_species):
+            origin_xyz_by_species.append(origin_xyz[origin_species_index == ind0, :])
+
+        self.origin_xyz = origin_xyz
+        self.origin_species_index = origin_species_index
+        self.origin_xyz_by_species = origin_xyz_by_species
         self.xyz_all = xyz_all
 
         # init g3
@@ -363,77 +392,77 @@ class G3Distribution:
 
         r_max_sq = float(self.r_max * self.r_max)
         zero_tol = max(1e-12, (1e-9 * self.r_step) ** 2)
-        vector_table: list[list[np.ndarray]] = []
-        radius_sq_table: list[list[np.ndarray]] = []
-        radius_bin_table: list[list[np.ndarray]] = []
-
-        # Precompute neighbors for each center-species / neighbor-species combination.
-        for ind0 in range(self.num_species):
-            vectors_by_species: list[np.ndarray] = []
-            radius_sq_by_species: list[np.ndarray] = []
-            radius_bin_by_species: list[np.ndarray] = []
-            for indn in range(self.num_species):
-                vectors = xyz_all[indn] - xyz0[ind0]
-                radius_sq = np.einsum("ij,ij->i", vectors, vectors)
-                keep = (radius_sq > zero_tol) & (radius_sq < r_max_sq)
-                vectors = vectors[keep]
-                radius_sq = radius_sq[keep]
-                radius_bin = np.floor(np.sqrt(radius_sq) / self.r_step).astype(np.intp)
-                keep_bin = radius_bin < self.r_num
-                vectors_by_species.append(vectors[keep_bin])
-                radius_sq_by_species.append(radius_sq[keep_bin])
-                radius_bin_by_species.append(radius_bin[keep_bin])
-            vector_table.append(vectors_by_species)
-            radius_sq_table.append(radius_sq_by_species)
-            radius_bin_table.append(radius_bin_by_species)
-
         flat_size = self.r_num * self.r_num * self.phi_num_bins
+        triplets_by_center = [
+            np.where(self.g3_index[:, 0] == ind0)[0]
+            for ind0 in range(self.num_species)
+        ]
 
-        # calculate g3
-        for ind in range(self.num_triplets):
-            ind0, ind1, ind2 = self.g3_index[ind]
-            v01 = vector_table[ind0][ind1]
-            v02 = vector_table[ind0][ind2]
-            r01_sq = radius_sq_table[ind0][ind1]
-            r02_sq = radius_sq_table[ind0][ind2]
-            r01_bin = radius_bin_table[ind0][ind1]
-            r02_bin = radius_bin_table[ind0][ind2]
+        # calculate g3 as the sum over all unit-cell origins, grouped by center species
+        for ind0 in range(self.num_species):
+            for xyz0 in origin_xyz_by_species[ind0]:
+                vector_table: list[np.ndarray] = []
+                radius_sq_table: list[np.ndarray] = []
+                radius_bin_table: list[np.ndarray] = []
 
-            if v01.size == 0 or v02.size == 0:
-                continue
+                for indn in range(self.num_species):
+                    vectors = xyz_all[indn] - xyz0
+                    radius_sq = np.einsum("ij,ij->i", vectors, vectors)
+                    keep = (radius_sq > zero_tol) & (radius_sq < r_max_sq)
+                    vectors = vectors[keep]
+                    radius_sq = radius_sq[keep]
+                    radius_bin = np.floor(np.sqrt(radius_sq) / self.r_step).astype(np.intp)
+                    keep_bin = radius_bin < self.r_num
+                    vector_table.append(vectors[keep_bin])
+                    radius_sq_table.append(radius_sq[keep_bin])
+                    radius_bin_table.append(radius_bin[keep_bin])
 
-            dot = v01 @ v02.T
-            denom = np.sqrt(r01_sq[:, None] * r02_sq[None, :])
-            cos_phi = np.clip(dot / denom, -1.0, 1.0)
-            phi_bin = np.floor(np.arccos(cos_phi) / self.phi_step).astype(np.intp)
-            np.clip(phi_bin, 0, self.phi_num_bins - 1, out=phi_bin)
+                for ind in triplets_by_center[ind0]:
+                    _, ind1, ind2 = self.g3_index[ind]
+                    v01 = vector_table[ind1]
+                    v02 = vector_table[ind2]
+                    r01_sq = radius_sq_table[ind1]
+                    r02_sq = radius_sq_table[ind2]
+                    r01_bin = radius_bin_table[ind1]
+                    r02_bin = radius_bin_table[ind2]
 
-            rr_index = (
-                (r01_bin[:, None] * self.r_num + r02_bin[None, :]) * self.phi_num_bins
-            )
-            linear = rr_index + phi_bin
+                    if v01.size == 0 or v02.size == 0:
+                        continue
 
-            if ind1 == ind2:
-                valid = np.ones(linear.shape, dtype=bool)
-                np.fill_diagonal(valid, False)
-                linear = linear[valid]
+                    dot = v01 @ v02.T
+                    denom = np.sqrt(r01_sq[:, None] * r02_sq[None, :])
+                    cos_phi = np.clip(dot / denom, -1.0, 1.0)
+                    phi_bin = np.floor(np.arccos(cos_phi) / self.phi_step).astype(np.intp)
+                    np.clip(phi_bin, 0, self.phi_num_bins - 1, out=phi_bin)
 
-            counts = np.bincount(linear.ravel(), minlength=flat_size)
-            self.g3count[ind] += counts.reshape(self.r_num, self.r_num, self.phi_num_bins)
+                    rr_index = (
+                        (r01_bin[:, None] * self.r_num + r02_bin[None, :]) * self.phi_num_bins
+                    )
+                    linear = rr_index + phi_bin
 
-            # Explicitly mirror mixed-species neighbor channels so the stored array is
-            # symmetric in the two radial axes.
-            if ind1 != ind2:
-                rr_index_sym = (
-                    (r02_bin[None, :] * self.r_num + r01_bin[:, None]) * self.phi_num_bins
-                )
-                linear_sym = rr_index_sym + phi_bin
-                counts_sym = np.bincount(linear_sym.ravel(), minlength=flat_size)
-                self.g3count[ind] += counts_sym.reshape(
-                    self.r_num,
-                    self.r_num,
-                    self.phi_num_bins,
-                )
+                    if ind1 == ind2:
+                        valid = np.ones(linear.shape, dtype=bool)
+                        np.fill_diagonal(valid, False)
+                        linear = linear[valid]
+
+                    counts = np.bincount(linear.ravel(), minlength=flat_size)
+                    self.g3count[ind] += counts.reshape(
+                        self.r_num,
+                        self.r_num,
+                        self.phi_num_bins,
+                    )
+
+                    if ind1 != ind2:
+                        rr_index_sym = (
+                            (r02_bin[None, :] * self.r_num + r01_bin[:, None]) * self.phi_num_bins
+                        )
+                        linear_sym = rr_index_sym + phi_bin
+                        counts_sym = np.bincount(linear_sym.ravel(), minlength=flat_size)
+                        self.g3count[ind] += counts_sym.reshape(
+                            self.r_num,
+                            self.r_num,
+                            self.phi_num_bins,
+                        )
 
         self.g3 = self.g3count
         self.summary = {
@@ -441,6 +470,7 @@ class G3Distribution:
             "num_atoms": len(self.atoms),
             "num_species": int(self.num_species),
             "num_triplets": int(self.num_triplets),
+            "num_origins": int(self.num_sites),
             "shape": tuple(self.g3.shape),
             "r_max": float(self.r_max),
             "r_step": float(self.r_step),
@@ -455,12 +485,15 @@ class G3Distribution:
         )
         if plot_g3:
             self.plot_g3()
-        return self.g3
+
+        if return_g3:
+            return self.g3, self.r,self.phi
 
     def target_g3(
         self,
         *,
         r_min: float,
+        r_max: float
         blur_sigma: float | None = None,
         r_sigma: float | None = None,
         label: str | None = None,
@@ -480,44 +513,20 @@ class G3Distribution:
         self,
         pair: int | str = 0,
         *,
-        slice_index: int | None = None,
-        ax: plt.Axes | None = None,
-        cmap: str = "viridis",
-        title: str | None = None,
-    ) -> plt.Axes:
-        """Plot a single angular or radial slice of one channel."""
+        normalize: bool = True,
+    ):
+        """Return an interactive anywidget explorer for one triplet channel."""
         self._ensure_plot_data()
-
         pair_index = self._resolve_pair_index(pair)
-        if self.g3.ndim == 4 and getattr(self, "phi_num_bins", None) is not None:
-            if slice_index is None:
-                slice_index = self.phi_num_bins // 2
-            slice_index = int(np.clip(slice_index, 0, self.phi_num_bins - 1))
-        else:
-            if slice_index is None:
-                slice_index = self.num_r // 2
-            slice_index = int(np.clip(slice_index, 0, self.num_r - 1))
+        if self.g3.ndim != 4 or getattr(self, "phi_num_bins", None) is None:
+            raise ValueError("Interactive plotting currently expects angle-binned g3 data.")
+        from .g3_widget import G3PlotWidget
 
-        if ax is None:
-            _, ax = plt.subplots(figsize=(6, 5))
-
-        plane = self.g3[pair_index, :, :, slice_index]
-        image = ax.imshow(
-            plane,
-            origin="lower",
-            extent=(0.0, self.r_max, 0.0, self.r_max),
-            aspect="equal",
-            cmap=cmap,
+        return G3PlotWidget(
+            self,
+            triplet_index=pair_index,
+            normalize=normalize,
         )
-        ax.set_xlabel("r01")
-        ax.set_ylabel("r02")
-        if self.g3.ndim == 4 and getattr(self, "phi_num_bins", None) is not None:
-            slice_label = f"phi={self.phi_deg[slice_index]:.1f} deg"
-        else:
-            slice_label = f"r12={self.bin_centers[slice_index]:.2f}"
-        ax.set_title(title or f"{self.label}: {self.pair_labels[pair_index]} at {slice_label}")
-        ax.figure.colorbar(image, ax=ax, label="g3")
-        return ax
 
     def _ensure_plot_data(self) -> None:
         if self.g3 is not None:

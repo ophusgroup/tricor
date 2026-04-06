@@ -12,6 +12,13 @@ dependencies = [
     "numpy",
     "matplotlib",
     "ase",
+    "anywidget",
+]
+
+[tool.hatch.build]
+include = [
+    "src/tricor/static/*.js",
+    "src/tricor/static/*.css",
 ]
 
 [tool.hatch.build.targets.wheel]
