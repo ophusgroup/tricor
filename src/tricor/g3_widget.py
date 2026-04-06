@@ -95,8 +95,29 @@ class G3PlotWidget(anywidget.AnyWidget):
     def _triplet_data(self) -> np.ndarray:
         return np.asarray(self._distribution.g3[self.triplet_index], dtype=np.float64)
 
-    def _pair_profile_raw(self, triplet_data: np.ndarray) -> np.ndarray:
+    def _pair_profile_raw_from_distribution(self, distribution: "G3Distribution") -> np.ndarray:
+        g2 = getattr(distribution, "g2", None)
+        if g2 is not None and hasattr(distribution, "g3_index"):
+            center_ind, neigh1_ind, neigh2_ind = distribution.g3_index[self.triplet_index]
+            profile = np.asarray(g2[center_ind, neigh1_ind], dtype=np.float64)
+            profile += np.asarray(g2[center_ind, neigh2_ind], dtype=np.float64)
+            return profile
+        triplet_data = np.asarray(distribution.g3[self.triplet_index], dtype=np.float64)
         return triplet_data.sum(axis=(1, 2)) + triplet_data.sum(axis=(0, 2))
+
+    def _default_shell_profile_raw(self) -> np.ndarray:
+        distribution = self._distribution
+        g2 = getattr(distribution, "g2", None)
+        if g2 is not None:
+            return self._pair_profile_raw_from_distribution(distribution)
+
+        source = getattr(distribution, "source_distribution", None)
+        if source is not None and source.g3 is not None:
+            return self._pair_profile_raw_from_distribution(source)
+        return self._pair_profile_raw_from_distribution(distribution)
+
+    def _pair_profile_raw(self, triplet_data: np.ndarray) -> np.ndarray:
+        return self._pair_profile_raw_from_distribution(self._distribution)
 
     def _pair_profile_for_display(self, triplet_data: np.ndarray) -> np.ndarray:
         profile = self._pair_profile_raw(triplet_data)
@@ -140,7 +161,11 @@ class G3PlotWidget(anywidget.AnyWidget):
     def _tail_mask(self, radius: np.ndarray) -> np.ndarray:
         if radius.size == 0:
             return np.zeros(0, dtype=bool)
-        start = 0.7 * float(radius[-1] + self._distribution.r_step / 2.0)
+        target_r_max = getattr(self._distribution, "target_r_max", None)
+        if target_r_max is not None:
+            start = float(target_r_max)
+        else:
+            start = 0.7 * float(radius[-1] + self._distribution.r_step / 2.0)
         mask = radius >= start
         if not np.any(mask):
             mask[-max(1, radius.size // 4):] = True
@@ -200,33 +225,46 @@ class G3PlotWidget(anywidget.AnyWidget):
         return image
 
     def _set_default_shell(self) -> None:
-        triplet_data = self._triplet_data()
-        profile = self._pair_profile_for_display(triplet_data)
+        raw_profile = self._default_shell_profile_raw()
+        profile = raw_profile.copy()
+        if self.normalize:
+            radius = np.asarray(self._distribution.r, dtype=np.float64)
+            profile = profile / np.maximum(radius * radius, _EPS)
+            profile = self._smooth_profile_for_display(profile)
+            tail = profile[self._tail_mask(radius)]
+            finite = tail[np.isfinite(tail)]
+            scale = float(np.mean(finite)) if finite.size else 1.0
+            if scale <= _EPS:
+                scale = 1.0
+            profile = profile / scale
+        else:
+            profile = self._smooth_profile_for_display(profile)
         smooth = self._smooth_profile(profile)
-
-        nonzero = np.flatnonzero(smooth > 0)
-        if nonzero.size == 0:
+        finite = np.nan_to_num(smooth, nan=0.0, posinf=0.0, neginf=0.0)
+        positive = np.flatnonzero(finite > 0)
+        if positive.size == 0:
             left_bin = 0
             right_bin = min(1, len(self.r) - 1)
         else:
-            start = int(nonzero[0])
+            start = int(positive[0])
             peak_bin = None
-            for idx in range(max(start + 1, 1), smooth.size - 1):
-                if smooth[idx] >= smooth[idx - 1] and smooth[idx] > smooth[idx + 1]:
+            for idx in range(max(start, 1), finite.size - 1):
+                if finite[idx] >= finite[idx - 1] and finite[idx] > finite[idx + 1]:
                     peak_bin = idx
                     break
             if peak_bin is None:
-                peak_bin = int(start + np.argmax(smooth[start:]))
+                peak_bin = int(start + np.argmax(finite[start:]))
 
-            left_bin = start
-            for idx in range(peak_bin - 1, start, -1):
-                if smooth[idx] <= smooth[idx - 1] and smooth[idx] < smooth[idx + 1]:
-                    left_bin = idx
-                    break
+            threshold = max(1e-12, 0.01 * float(finite[peak_bin]))
+            leading = np.flatnonzero(finite[:peak_bin + 1] > threshold)
+            if leading.size:
+                left_bin = int(leading[0])
+            else:
+                left_bin = start
 
-            right_bin = min(smooth.size - 1, peak_bin + 1)
-            for idx in range(peak_bin + 1, smooth.size - 1):
-                if smooth[idx] <= smooth[idx - 1] and smooth[idx] < smooth[idx + 1]:
+            right_bin = min(finite.size - 1, peak_bin + 1)
+            for idx in range(peak_bin + 1, finite.size - 1):
+                if finite[idx] <= finite[idx - 1] and finite[idx] <= finite[idx + 1]:
                     right_bin = idx
                     break
 

@@ -141,7 +141,10 @@ function drawHeatmap(canvas, imageValues, shape, rEdges, phiEdgesDeg, title, nor
   const phiCount = shape[0];
   const rCount = shape[1];
   const finiteValues = imageValues.filter((value) => Number.isFinite(value));
-  const autoVmax = Math.max(percentile(finiteValues, 0.995) || 1, normalize ? 1.0 : 1e-6);
+  const autoVmax = Math.max(
+    percentile(finiteValues, 0.995) || 1,
+    normalize ? 1.001 : 1e-6
+  );
   const manualVmax = sliceMax > 0 ? sliceMax : null;
   const vmax = manualVmax ?? autoVmax;
   const vmin = 0;
