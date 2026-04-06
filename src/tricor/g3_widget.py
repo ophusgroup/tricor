@@ -116,11 +116,11 @@ class G3PlotWidget(anywidget.AnyWidget):
             return self._pair_profile_raw_from_distribution(source)
         return self._pair_profile_raw_from_distribution(distribution)
 
-    def _pair_profile_raw(self, triplet_data: np.ndarray) -> np.ndarray:
+    def _pair_profile_raw(self) -> np.ndarray:
         return self._pair_profile_raw_from_distribution(self._distribution)
 
     def _pair_profile_for_display(self, triplet_data: np.ndarray) -> np.ndarray:
-        profile = self._pair_profile_raw(triplet_data)
+        profile = self._pair_profile_raw()
         if not self.normalize:
             return self._smooth_profile_for_display(profile)
 
@@ -170,13 +170,6 @@ class G3PlotWidget(anywidget.AnyWidget):
         if not np.any(mask):
             mask[-max(1, radius.size // 4):] = True
         return mask
-
-    def _safe_scale(self, values: np.ndarray) -> float:
-        finite = values[np.isfinite(values)]
-        positive = finite[finite > 0]
-        if positive.size == 0:
-            return 1.0
-        return float(np.mean(positive))
 
     def _smooth_profile(self, profile: np.ndarray) -> np.ndarray:
         kernel = np.array([1.0, 2.0, 3.0, 2.0, 1.0], dtype=np.float64)

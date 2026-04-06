@@ -24,6 +24,23 @@ class Supercell:
         rng_seed: int | None = None,
         **kwargs: Any,
     ) -> None:
+        """Initialize a prototype supercell optimizer.
+
+        Parameters
+        ----------
+        distribution
+            Target distribution that the eventual Monte Carlo engine will try to
+            match.
+        cell_dims, cell_dim
+            Supercell replication factors. A single integer produces a cubic
+            replication, while a length-3 sequence specifies `(na, nb, nc)`.
+        label
+            Human-readable label for summaries and repr output.
+        rng_seed
+            Optional random seed used by the placeholder Monte Carlo driver.
+        **kwargs
+            Extra metadata stored for future Monte Carlo options.
+        """
         if cell_dims is None:
             cell_dims = cell_dim
         if cell_dims is None:
@@ -40,6 +57,7 @@ class Supercell:
         self.last_temperature: float | None = None
 
     def _normalize_cell_dims(self, cell_dims: int | Sequence[int]) -> tuple[int, int, int]:
+        """Validate and normalize the requested supercell dimensions."""
         if isinstance(cell_dims, int):
             if cell_dims <= 0:
                 raise ValueError("cell_dims must be positive.")
@@ -51,6 +69,7 @@ class Supercell:
         return dims
 
     def _build_initial_atoms(self) -> Atoms | None:
+        """Construct the repeated starting structure used by the prototype engine."""
         if self.distribution.atoms is None:
             return None
         return self.distribution.atoms.repeat(self.cell_dims)
@@ -63,7 +82,27 @@ class Supercell:
         swap_fraction: float = 0.1,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Run a synthetic Monte Carlo history for API prototyping."""
+        """Run a synthetic Monte Carlo history for API prototyping.
+
+        Parameters
+        ----------
+        num_steps
+            Number of Monte Carlo steps to simulate in the placeholder history.
+        temperature
+            Effective temperature controlling the decay rate of the synthetic
+            score trace.
+        swap_fraction
+            Fraction of steps treated as attempted atom swaps when reporting
+            summary statistics.
+        **kwargs
+            Additional Monte Carlo options preserved in the returned summary.
+
+        Returns
+        -------
+        dict[str, Any]
+            Summary of the synthetic run, including score statistics and swap
+            counts.
+        """
         num_steps = int(num_steps)
         if num_steps <= 0:
             raise ValueError("num_steps must be positive.")

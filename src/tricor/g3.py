@@ -47,6 +47,29 @@ class G3Distribution:
         blur_sigma: float | None = None,
         **kwargs: Any,
     ) -> None:
+        """Create a measured distribution from atoms or a target from another distribution.
+
+        Parameters
+        ----------
+        source
+            Either the reference `ase.Atoms` object to measure, or an existing
+            `G3Distribution` that will be transformed into a target.
+        r_step, r_max
+            Optional measurement grid settings. These are typically supplied to
+            `measure_g3()`, but are accepted here for convenience and backward
+            compatibility.
+        target_r_min, target_r_max
+            Transition window used when constructing a target distribution.
+        r_sigma, r_sigma_at, phi_sigma_deg
+            Optional blur settings used only when constructing a target
+            distribution.
+        label
+            Human-readable label used in reprs and interactive plots.
+        r_min, blur_sigma
+            Legacy aliases retained for compatibility with older notebooks.
+        **kwargs
+            Additional metadata stored on the distribution for future use.
+        """
         self.label = label or "g3"
         self.metadata: dict[str, Any] = dict(kwargs)
         self.source_distribution: G3Distribution | None = None
@@ -143,7 +166,11 @@ class G3Distribution:
         self.g2_labels = list(getattr(distribution, "g2_labels", []))
         self.r = None if getattr(distribution, "r", None) is None else distribution.r.copy()
         self.r_num = getattr(distribution, "r_num", self.num_r)
-        self.g2 = None if getattr(distribution, "g2", None) is None else np.array(distribution.g2, copy=True)
+        self.g2 = (
+            None
+            if getattr(distribution, "g2", None) is None
+            else np.array(distribution.g2, copy=True)
+        )
         if getattr(distribution, "phi_num_bins", None) is not None:
             self.phi_num_bins = distribution.phi_num_bins
             self.phi_edges = distribution.phi_edges.copy()
@@ -553,7 +580,7 @@ class G3Distribution:
         # Neighbor order is symmetrized so (i, j) and (j, i) map to the same channel.
         self.g3_lookup = -np.ones(
             (self.num_species, self.num_species, self.num_species),
-            dtype='int',
+            dtype=np.intp,
         )
         for triplet_ind, (center_ind, neigh1_ind, neigh2_ind) in enumerate(self.g3_index):
             self.g3_lookup[center_ind, neigh1_ind, neigh2_ind] = triplet_ind
@@ -592,22 +619,24 @@ class G3Distribution:
         )
         dist_min = np.sqrt(np.min(dists))
         dist_max = np.sqrt(np.max(dists))
-        self.num_tile = (np.ceil(self.r_max / dist_min) + 1).astype('int')
+        self.num_tile = int(np.ceil(self.r_max / dist_min) + 1)
 
         # tile and crop unit cells
-        a,b,c,index = np.meshgrid(
-            np.arange(-self.num_tile,self.num_tile+1,dtype='int'),
-            np.arange(-self.num_tile,self.num_tile+1,dtype='int'),
-            np.arange(-self.num_tile,self.num_tile+1,dtype='int'),
-            np.arange(self.num_sites,dtype='int'),
+        a, b, c, index = np.meshgrid(
+            np.arange(-self.num_tile, self.num_tile + 1, dtype=np.intp),
+            np.arange(-self.num_tile, self.num_tile + 1, dtype=np.intp),
+            np.arange(-self.num_tile, self.num_tile + 1, dtype=np.intp),
+            np.arange(self.num_sites, dtype=np.intp),
         )
         tile_species = numbers[index.ravel()]
-        tile_xyz = (a.ravel()[:,None]+scaled_positions[index.ravel(),0][:,None])*u[None,:] \
-            + (b.ravel()[:,None]+scaled_positions[index.ravel(),1][:,None])*v[None,:] \
-            + (c.ravel()[:,None]+scaled_positions[index.ravel(),2][:,None])*w[None,:]
-        keep = np.sum(tile_xyz**2,axis=1) < (self.r_max + dist_max)**2
+        tile_xyz = (
+            (a.ravel()[:, None] + scaled_positions[index.ravel(), 0][:, None]) * u[None, :]
+            + (b.ravel()[:, None] + scaled_positions[index.ravel(), 1][:, None]) * v[None, :]
+            + (c.ravel()[:, None] + scaled_positions[index.ravel(), 2][:, None]) * w[None, :]
+        )
+        keep = np.sum(tile_xyz**2, axis=1) < (self.r_max + dist_max) ** 2
         self.tile_species = tile_species[keep]
-        self.tile_xyz = tile_xyz[keep,:]
+        self.tile_xyz = tile_xyz[keep, :]
 
         # subsets of tiled coordinates and origin coordinates by species
         xyz_all = []
@@ -810,7 +839,23 @@ class G3Distribution:
         *,
         normalize: bool = True,
     ):
-        """Return an interactive anywidget explorer for one triplet channel."""
+        """Return an interactive anywidget explorer for a rooted triplet channel.
+
+        Parameters
+        ----------
+        pair
+            Either the integer triplet index or a triplet label such as
+            `"Si-Si-C"`, where the center atom is shown in the middle.
+        normalize
+            If `True`, display reduced-density views that approach `1.0` in the
+            random long-range limit.
+
+        Returns
+        -------
+        G3PlotWidget
+            Interactive widget with a `(phi, r)` slice view and a linked rooted
+            two-body shell selector.
+        """
         self._ensure_plot_data()
         pair_index = self._resolve_pair_index(pair)
         if self.g3.ndim != 4 or getattr(self, "phi_num_bins", None) is None:
