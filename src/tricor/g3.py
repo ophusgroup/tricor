@@ -185,6 +185,7 @@ class G3Distribution:
         self, 
         r_max,
         r_step,
+        phi_num_bins = 90,
         plot_g3 = True,
     ):
         """
@@ -196,6 +197,10 @@ class G3Distribution:
         self.r_step = r_step
         self.r = np.arange(0.0,r_max,r_step) + r_step/2
         self.r_num = self.r.size
+        self.phi_num_bins = phi_num_bins
+        self.phi = np.linspace(0,np.pi,self.phi_num_bins,endpoint=False)
+        self.phi += (self.phi[1]-self.phi[0])/2
+        self.phi_deg = np.rad2deg(self.phi)
 
         # lattice parameters
         u = self.atoms.cell[0]
@@ -210,6 +215,29 @@ class G3Distribution:
         self.num_species = self.species.size
         self.num_triplets = (self.num_species**2)*(self.num_species+1)//2
         self.g3_index = np.zeros((self.num_triplets,3),dtype='int')
+
+        # Make rooted triplet index with unordered neighbors:
+        # [center, neigh_1, neigh_2] with neigh_1 <= neigh_2
+        # For a binary system this gives:
+        # [0,0,0], [0,0,1], [0,1,1], [1,0,0], [1,0,1], [1,1,1]
+        triplet_ind = 0
+        for center_ind in range(self.num_species):
+            for neigh1_ind in range(self.num_species):
+                for neigh2_ind in range(neigh1_ind, self.num_species):
+                    self.g3_index[triplet_ind, 0] = center_ind
+                    self.g3_index[triplet_ind, 1] = neigh1_ind
+                    self.g3_index[triplet_ind, 2] = neigh2_ind
+                    triplet_ind += 1
+
+        # Fast lookup from (center, neigh1, neigh2) to the flattened g3 channel.
+        # Neighbor order is symmetrized so (i, j) and (j, i) map to the same channel.
+        self.g3_lookup = -np.ones(
+            (self.num_species, self.num_species, self.num_species),
+            dtype='int',
+        )
+        for triplet_ind, (center_ind, neigh1_ind, neigh2_ind) in enumerate(self.g3_index):
+            self.g3_lookup[center_ind, neigh1_ind, neigh2_ind] = triplet_ind
+            self.g3_lookup[center_ind, neigh2_ind, neigh1_ind] = triplet_ind
 
         # determine required cell tiling
         dists = np.sum(
@@ -237,9 +265,9 @@ class G3Distribution:
 
         # tile and crop unit cells
         a,b,c,index = np.meshgrid(
-            np.arange(self.num_tile,dtype='int'),
-            np.arange(self.num_tile,dtype='int'),
-            np.arange(self.num_tile,dtype='int'),
+            np.arange(-self.num_tile,self.num_tile+1,dtype='int'),
+            np.arange(-self.num_tile,self.num_tile+1,dtype='int'),
+            np.arange(-self.num_tile,self.num_tile+1,dtype='int'),
             np.arange(self.num_sites,dtype='int'),
         )
         tile_species = numbers[index.ravel()]
@@ -250,7 +278,42 @@ class G3Distribution:
         self.tile_species = tile_species[keep]
         self.tile_xyz = tile_xyz[keep,:]
 
+        # subsets of coordinates by type
+        xyz_all = []
+        for spec in self.species:
+            sub = self.tile_species==spec
+            xyz_all.append(self.tile_xyz[sub,:])
+
+        # origin coordinates
+        xyz0 = np.zeros((self.num_species,3))
+        for ind,xyz_spec in enumerate(xyz_all):
+            ind_min = np.argmin(
+                np.sum(xyz_spec**2,axis=1)
+            )
+            xyz0[ind,:] = xyz_spec[ind_min,:]
+
+        # init g3
+        self.g3count = np.zeros(
+            (self.num_triplets,self.phi_num_bins,self.r_num,self.r_num),
+            dtype='int',
+        )
+
         # calculate g3
+        # for ind in np.arange(self.num_triplets):
+        for ind in np.arange(1):
+            ind0 = self.g3_index[ind,0]
+            ind1 = self.g3_index[ind,1]
+            ind2 = self.g3_index[ind,2]
+            
+            r01 = xyz_all[ind1] - xyz0[ind0]
+            r02 = xyz_all[ind2] - xyz0[ind0]
+            # r12 = 
+
+
+
+
+            
+
 
 
 
