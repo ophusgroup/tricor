@@ -117,6 +117,11 @@ function updateSelect(select, labels, index) {
   });
 }
 
+function phiToNormalized(phiDeg) {
+  const radians = (phiDeg * Math.PI) / 180.0;
+  return 0.5 * (1.0 - Math.cos(radians));
+}
+
 function drawHeatmap(canvas, imageValues, shape, rEdges, phiEdgesDeg, title, normalize, sliceMax) {
   const ctx = canvas.getContext("2d");
   const dpr = window.devicePixelRatio || 1;
@@ -148,8 +153,14 @@ function drawHeatmap(canvas, imageValues, shape, rEdges, phiEdgesDeg, title, nor
   const manualVmax = sliceMax > 0 ? sliceMax : null;
   const vmax = manualVmax ?? autoVmax;
   const vmin = 0;
-  const midpoint = normalize ? 1.0 : 0.5 * (vmin + vmax);
-  const cellHeight = plotHeight / Math.max(phiCount, 1);
+  const autoSpikeContrast = normalize && manualVmax === null;
+  const midpoint = autoSpikeContrast
+    ? vmax
+    : normalize
+      ? 1.0
+      : 0.5 * (vmin + vmax);
+  const phiToY = (phiDeg) =>
+    margin.top + plotHeight - phiToNormalized(phiDeg) * plotHeight;
 
   for (let phiIdx = 0; phiIdx < phiCount; phiIdx++) {
     for (let rIdx = 0; rIdx < rCount; rIdx++) {
@@ -159,10 +170,43 @@ function drawHeatmap(canvas, imageValues, shape, rEdges, phiEdgesDeg, title, nor
       const x1 = rEdges[rIdx + 1] ?? x0;
       const x = margin.left + (x0 / xMax) * plotWidth;
       const cellWidth = ((x1 - x0) / xMax) * plotWidth;
-      const y = margin.top + plotHeight - (phiIdx + 1) * cellHeight;
+      const phi0 = phiEdgesDeg[phiIdx] ?? 0;
+      const phi1 = phiEdgesDeg[phiIdx + 1] ?? phi0;
+      const y0 = phiToY(phi0);
+      const y1 = phiToY(phi1);
+      const y = Math.min(y0, y1);
+      const cellHeight = Math.abs(y1 - y0);
       ctx.fillRect(x, y, cellWidth + 0.5, cellHeight + 0.5);
     }
   }
+
+  const phiMax = phiEdgesDeg[phiEdgesDeg.length - 1] || 180;
+  const majorTicks = [0, 45, 90, 135, 180].filter((value) => value <= phiMax);
+  const minorTicks = [];
+  for (let value = 15; value < phiMax; value += 15) {
+    if (!majorTicks.includes(value)) {
+      minorTicks.push(value);
+    }
+  }
+
+  ctx.strokeStyle = "rgba(64, 89, 104, 0.18)";
+  ctx.lineWidth = 1;
+  minorTicks.forEach((value) => {
+    const y = phiToY(value);
+    ctx.beginPath();
+    ctx.moveTo(margin.left, y);
+    ctx.lineTo(margin.left + plotWidth, y);
+    ctx.stroke();
+  });
+
+  ctx.strokeStyle = "rgba(64, 89, 104, 0.34)";
+  majorTicks.forEach((value) => {
+    const y = phiToY(value);
+    ctx.beginPath();
+    ctx.moveTo(margin.left, y);
+    ctx.lineTo(margin.left + plotWidth, y);
+    ctx.stroke();
+  });
 
   ctx.strokeStyle = "#3a506b";
   ctx.lineWidth = 1;
@@ -189,11 +233,9 @@ function drawHeatmap(canvas, imageValues, shape, rEdges, phiEdgesDeg, title, nor
     ctx.fillText(formatTick(value), x, margin.top + plotHeight + 18);
   });
 
-  const phiMax = phiEdgesDeg[phiEdgesDeg.length - 1] || 180;
-  const yTickValues = [0, 45, 90, 135, 180].filter((value) => value <= phiMax);
   ctx.textAlign = "right";
-  yTickValues.forEach((value) => {
-    const y = margin.top + plotHeight - (value / phiMax) * plotHeight;
+  majorTicks.forEach((value) => {
+    const y = phiToY(value);
     ctx.beginPath();
     ctx.moveTo(margin.left - 5, y);
     ctx.lineTo(margin.left, y);
@@ -219,7 +261,9 @@ function drawHeatmap(canvas, imageValues, shape, rEdges, phiEdgesDeg, title, nor
   ctx.strokeRect(bar.x, bar.y, bar.width, bar.height);
 
   const legendTicks =
-    normalize && vmax >= 1.0
+    autoSpikeContrast
+      ? uniqueTicks([0, 0.4 * vmax, 0.7 * vmax, vmax])
+      : normalize && vmax >= 1.0
       ? uniqueTicks([0, 1, vmax > 1.5 ? 0.5 * (1 + vmax) : NaN, vmax])
       : uniqueTicks([0, 0.5 * vmax, vmax]);
 
