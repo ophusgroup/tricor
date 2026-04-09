@@ -13,6 +13,7 @@ dependencies = [
     "matplotlib",
     "ase",
     "anywidget",
+    "torch",
 ]
 
 [tool.hatch.build]
