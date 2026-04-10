@@ -4709,7 +4709,7 @@ class Supercell:
         fps: int = 60,
         duration: float = 6.0,
         elevation: float = 15.0,
-        atom_size: float = 4.0,
+        atom_size: float = 10.0,
         bond_cutoff: float | None = None,
         show_cell: bool = True,
         show_atoms: bool = True,
@@ -4929,17 +4929,18 @@ class Supercell:
                 )
                 ax.add_collection3d(lc_b)
 
-            # --- crystalline bonds: depth-coloured ---
-            # With view_init(elev, azim=0) matplotlib camera is at +x.
-            # Depth into screen = negative x after rotation.
-            # Larger rotated-x = closer to camera = brighter.
+            # --- crystalline bonds: depth-coloured + depth-width ---
+            # Camera at +x (azim=0): larger rotated-x = closer = brighter + thicker
             if np.any(cryst_mask):
                 segs_cr = list(zip(bs_r[cryst_mask], be_r[cryst_mask]))
                 mid_x_rot = 0.5 * (bs_r[cryst_mask, 0] + be_r[cryst_mask, 0])
                 norm_depth = (mid_x_rot + extent) / max(2.0 * extent, _EPS)
-                cryst_colors = cmap(np.clip(norm_depth, 0, 1))
+                norm_depth = np.clip(norm_depth, 0, 1)
+                cryst_colors = cmap(norm_depth)
+                # Linewidth: 0.4 at back, 1.8 at front
+                cryst_lw = 0.4 + 1.4 * norm_depth
                 lc_c = Line3DCollection(
-                    segs_cr, linewidths=1.2, colors=cryst_colors,
+                    segs_cr, linewidths=cryst_lw, colors=cryst_colors,
                 )
                 ax.add_collection3d(lc_c)
 
@@ -4964,15 +4965,15 @@ class Supercell:
                     edgecolors="none", depthshade=False,
                 )
 
-            # Zoom: tighter limits to reduce whitespace
-            zoom = extent * 0.85
+            # Zoom: moderate tightening to reduce whitespace
+            zoom = extent * 0.92
             ax.set_xlim(-zoom, zoom)
             ax.set_ylim(-zoom, zoom)
             ax.set_zlim(-zoom, zoom)
             ax.set_box_aspect([1, 1, 1])
             ax.view_init(elev=elevation, azim=0)  # azim fixed; we rotate data
             ax.axis("off")
-            fig.subplots_adjust(left=-0.15, right=1.15, bottom=-0.15, top=1.15)
+            fig.subplots_adjust(left=-0.08, right=1.08, bottom=-0.08, top=1.08)
             return fig
 
         # --- static display or animation ---
