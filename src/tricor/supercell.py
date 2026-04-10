@@ -119,11 +119,13 @@ class Supercell:
             raise ValueError("spatial_bin_size must be positive.")
 
         self.reference_atoms = self.target_distribution.atoms.copy()
+        self._raw_distribution: G3Distribution = self.target_distribution
         self.atoms = self._build_random_atoms()
         self.current_distribution: G3Distribution | None = None
         self.mc_history: dict[str, np.ndarray] | None = None
         self.shell_history: dict[str, np.ndarray] | None = None
         self.shell_relax_history: dict[str, np.ndarray] | None = None
+        self._grain_ids: np.ndarray | None = None
         self.motif_history: dict[str, np.ndarray] | None = None
         self.motif_graph: dict[str, Any] | None = None
         self.best_score: float | None = None
@@ -175,7 +177,8 @@ class Supercell:
 
         This is a convenience constructor that measures the reference g3
         distribution internally, avoiding the need to create a
-        :class:`G3Distribution` manually.
+        :class:`G3Distribution` manually.  Use :meth:`generate` to build
+        the desired structure (amorphous, nanocrystalline, etc.).
 
         Parameters
         ----------
@@ -202,8 +205,8 @@ class Supercell:
         Returns
         -------
         Supercell
-            A new random supercell ready for :meth:`shell_relax` or
-            other optimization workflows.
+            A new random supercell ready for :meth:`generate` or
+            :meth:`shell_relax`.
         """
         dist = G3Distribution(atoms, label=label or "reference")
         dist.measure_g3(
@@ -282,6 +285,348 @@ class Supercell:
         atoms.info["relative_density"] = self.relative_density
         atoms.info["cell_dim_angstroms"] = self.cell_dim_angstroms
         return atoms
+
+    def _build_grain_atoms(
+        self,
+        shell_target: "CoordinationShellTarget",
+        grain_size: float,
+        crystalline_fraction: float = 1.0,
+        displacement_sigma: float = 0.0,
+    ) -> Atoms:
+        """Build a supercell with crystalline grains via Voronoi construction.
+
+        The box is Voronoi-tessellated into cells of diameter
+        *grain_size*.  A fraction *crystalline_fraction* of cells are
+        filled with randomly rotated copies of the reference crystal;
+        the remaining cells are filled with random atom positions
+        (amorphous, tagged with ``grain_id = -1``).
+
+        Parameters
+        ----------
+        shell_target
+            First-shell coordination targets from the reference crystal.
+        grain_size
+            Diameter of crystalline grains in Angstrom.
+        crystalline_fraction
+            Fraction of Voronoi cells filled with crystal (0.0 to 1.0).
+            The rest are filled with random (amorphous) positions.
+        displacement_sigma
+            Gaussian displacement sigma (Angstrom) applied to atoms
+            within crystalline grains.  Defaults to 0.
+        """
+        cell = self._build_supercell_cell()
+        cell_mat = np.asarray(cell, dtype=np.float64)
+        cell_inv = np.linalg.inv(cell_mat)
+        box_volume = float(abs(np.linalg.det(cell_mat)))
+        species, counts = self._target_species_counts(box_volume)
+        total_target = int(np.sum(counts))
+
+        crystalline_fraction = float(np.clip(crystalline_fraction, 0.0, 1.0))
+
+        # --- grain parameters ---
+        grain_radius = max(float(grain_size) * 0.5, 2.0)
+        grain_volume = (4.0 / 3.0) * np.pi * grain_radius ** 3
+        n_seeds = max(1, int(np.ceil(box_volume / grain_volume)))
+
+        # Decide which Voronoi cells are crystalline vs amorphous
+        n_crystalline = max(0, min(n_seeds, int(np.round(n_seeds * crystalline_fraction))))
+        is_crystalline_cell = np.zeros(n_seeds, dtype=bool)
+        if n_crystalline > 0:
+            chosen = self.rng.choice(n_seeds, size=n_crystalline, replace=False)
+            is_crystalline_cell[chosen] = True
+
+        # --- place Voronoi seeds randomly ---
+        seed_frac = self.rng.random((n_seeds, 3))
+        seed_cart = seed_frac @ cell_mat  # (n_seeds, 3)
+
+        # --- random rotation for each crystalline grain ---
+        rotations = np.empty((n_seeds, 3, 3), dtype=np.float64)
+        for ig in range(n_seeds):
+            if is_crystalline_cell[ig]:
+                M = self.rng.standard_normal((3, 3))
+                Q, R = np.linalg.qr(M)
+                Q *= np.sign(np.linalg.det(Q))
+                rotations[ig] = Q
+            else:
+                rotations[ig] = np.eye(3)  # unused
+
+        # --- tile reference crystal to fill the supercell ---
+        ref_cell = np.asarray(self.reference_atoms.cell.array, dtype=np.float64)
+        ref_pos = self.reference_atoms.positions.copy()
+        ref_numbers = self.reference_atoms.numbers.copy()
+        n_ref = len(ref_numbers)
+
+        box_lengths = np.array(self.cell_dim_angstroms, dtype=np.float64)
+        ref_lengths = np.linalg.norm(ref_cell, axis=1)
+        ref_lengths = np.maximum(ref_lengths, _EPS)
+        n_reps = np.ceil((box_lengths + 2.0 * grain_radius) / ref_lengths).astype(int)
+        n_reps = np.maximum(n_reps, 1)
+
+        shifts = []
+        for ix in range(-n_reps[0], n_reps[0] + 1):
+            for iy in range(-n_reps[1], n_reps[1] + 1):
+                for iz in range(-n_reps[2], n_reps[2] + 1):
+                    shifts.append([ix, iy, iz])
+        shifts = np.array(shifts, dtype=np.float64)
+        shift_cart = shifts @ ref_cell
+
+        tiled_pos = (ref_pos[None, :, :] + shift_cart[:, None, :]).reshape(-1, 3)
+        tiled_numbers = np.tile(ref_numbers, len(shifts))
+        tiled_center = 0.5 * np.sum(ref_cell * n_reps[:, None], axis=0)
+        tiled_pos -= tiled_center
+
+        # --- fill crystalline Voronoi cells ---
+        all_positions: list[np.ndarray] = []
+        all_numbers: list[np.ndarray] = []
+        all_grain_ids: list[np.ndarray] = []
+
+        for ig in range(n_seeds):
+            if not is_crystalline_cell[ig]:
+                continue
+
+            # Rotate tiled block and translate to grain seed
+            rotated = tiled_pos @ rotations[ig].T
+            grain_pos = rotated + seed_cart[ig]
+
+            # Wrap into periodic box
+            frac = grain_pos @ cell_inv
+            frac %= 1.0
+            grain_pos = frac @ cell_mat
+
+            # Voronoi assignment: keep atoms nearest to this seed
+            delta_all = grain_pos[:, None, :] - seed_cart[None, :, :]
+            frac_delta = delta_all @ cell_inv
+            frac_delta -= np.rint(frac_delta)
+            cart_delta = frac_delta @ cell_mat
+            dist_sq = np.sum(cart_delta ** 2, axis=2)
+            nearest_seed = np.argmin(dist_sq, axis=1)
+
+            mask = nearest_seed == ig
+            if not np.any(mask):
+                continue
+
+            all_positions.append(grain_pos[mask])
+            all_numbers.append(tiled_numbers[mask])
+            all_grain_ids.append(np.full(int(np.sum(mask)), ig, dtype=np.intp))
+
+        # --- fill amorphous Voronoi cells with random positions ---
+        if n_crystalline < n_seeds:
+            # Use volume fraction to determine amorphous atom count.
+            # (The raw grain atom count is inflated by tiling overshoot
+            # and will be trimmed by stoichiometry adjustment later.)
+            amorphous_volume_fraction = (n_seeds - n_crystalline) / max(n_seeds, 1)
+            n_amorphous_target = int(np.round(total_target * amorphous_volume_fraction))
+
+            if n_amorphous_target > 0:
+                # Generate random positions, keep those in amorphous cells
+                # Over-sample to account for Voronoi filtering
+                oversample = max(2, int(np.ceil(n_seeds / max(n_seeds - n_crystalline, 1))))
+                n_candidates = n_amorphous_target * oversample
+                cand_frac = self.rng.random((n_candidates, 3))
+                cand_pos = cand_frac @ cell_mat
+
+                # Assign candidates to nearest seed
+                delta_cand = cand_pos[:, None, :] - seed_cart[None, :, :]
+                frac_delta_c = delta_cand @ cell_inv
+                frac_delta_c -= np.rint(frac_delta_c)
+                cart_delta_c = frac_delta_c @ cell_mat
+                dist_sq_c = np.sum(cart_delta_c ** 2, axis=2)
+                nearest_c = np.argmin(dist_sq_c, axis=1)
+
+                # Keep candidates in amorphous cells
+                in_amorphous = ~is_crystalline_cell[nearest_c]
+                amorphous_pos = cand_pos[in_amorphous]
+
+                # Trim to target count
+                if len(amorphous_pos) > n_amorphous_target:
+                    amorphous_pos = amorphous_pos[:n_amorphous_target]
+
+                # Assign species proportionally
+                species_frac = counts.astype(float) / max(total_target, 1)
+                amorphous_numbers = np.repeat(
+                    species,
+                    np.round(species_frac * len(amorphous_pos)).astype(int),
+                )
+                # Trim/pad to match positions
+                if len(amorphous_numbers) < len(amorphous_pos):
+                    extra = np.repeat(species[0:1], len(amorphous_pos) - len(amorphous_numbers))
+                    amorphous_numbers = np.concatenate([amorphous_numbers, extra])
+                amorphous_numbers = amorphous_numbers[:len(amorphous_pos)]
+                self.rng.shuffle(amorphous_numbers)
+
+                all_positions.append(amorphous_pos)
+                all_numbers.append(amorphous_numbers)
+                all_grain_ids.append(np.full(len(amorphous_pos), -1, dtype=np.intp))
+
+        if not all_positions:
+            return self._build_random_atoms()
+
+        positions = np.concatenate(all_positions, axis=0)
+        numbers = np.concatenate(all_numbers, axis=0)
+        grain_ids = np.concatenate(all_grain_ids, axis=0)
+
+        # --- remove duplicate/overlapping atoms ---
+        # Use a hard minimum distance to detect overlaps
+        pair_hard_min = np.asarray(shell_target.pair_hard_min, dtype=np.float64)
+        global_hard_min = float(np.min(pair_hard_min[pair_hard_min > _EPS])) if np.any(pair_hard_min > _EPS) else 0.5
+        # Use 80% of hard min as overlap threshold
+        overlap_thresh = global_hard_min * 0.8
+
+        # Build a temporary Atoms to use neighbor_list
+        temp_atoms = Atoms(
+            numbers=numbers,
+            positions=positions,
+            cell=cell,
+            pbc=self.reference_atoms.pbc,
+        )
+        ov_i, ov_j, ov_d = neighbor_list("ijd", temp_atoms, overlap_thresh)
+
+        # Mark atoms to remove: for each overlapping pair, remove the one
+        # with the higher index (arbitrary but consistent)
+        remove = set()
+        for k in range(len(ov_i)):
+            if ov_i[k] < ov_j[k] and ov_i[k] not in remove:
+                remove.add(int(ov_j[k]))
+
+        if remove:
+            keep_mask = np.ones(len(numbers), dtype=bool)
+            keep_mask[list(remove)] = False
+            positions = positions[keep_mask]
+            numbers = numbers[keep_mask]
+            grain_ids = grain_ids[keep_mask]
+
+        # --- apply thermal displacements ---
+        if displacement_sigma > _EPS:
+            displacements = self.rng.normal(
+                0.0, displacement_sigma, size=positions.shape,
+            )
+            positions += displacements
+            # Re-wrap
+            frac = positions @ cell_inv
+            frac %= 1.0
+            positions = frac @ cell_mat
+
+        # --- adjust to target stoichiometry ---
+        # Count current species
+        unique_nums, current_counts = np.unique(numbers, return_counts=True)
+        species_map = {int(s): int(c) for s, c in zip(species, counts)}
+
+        # For each species, randomly keep/add to match target count
+        final_positions: list[np.ndarray] = []
+        final_numbers: list[int] = []
+        final_grain_ids: list[int] = []
+
+        for sp_num in species:
+            sp_num = int(sp_num)
+            target_count = species_map.get(sp_num, 0)
+            sp_mask = numbers == sp_num
+            sp_pos = positions[sp_mask]
+            sp_gids = grain_ids[sp_mask]
+            current_count = len(sp_pos)
+
+            if current_count > target_count:
+                # Remove excess atoms, preferring to remove grain atoms
+                # over fill atoms to preserve crystalline_fraction
+                excess = current_count - target_count
+                grain_idx = np.where(sp_gids >= 0)[0]
+                fill_idx = np.where(sp_gids < 0)[0]
+                remove_idx: list[int] = []
+                # Remove from grain atoms first if we have too many
+                if len(grain_idx) > 0:
+                    n_remove_grain = min(excess, len(grain_idx))
+                    remove_idx.extend(
+                        self.rng.choice(grain_idx, size=n_remove_grain, replace=False).tolist()
+                    )
+                if len(remove_idx) < excess and len(fill_idx) > 0:
+                    n_more = min(excess - len(remove_idx), len(fill_idx))
+                    remove_idx.extend(
+                        self.rng.choice(fill_idx, size=n_more, replace=False).tolist()
+                    )
+                keep_mask_sp = np.ones(current_count, dtype=bool)
+                keep_mask_sp[remove_idx] = False
+                sp_pos = sp_pos[keep_mask_sp]
+                sp_gids = sp_gids[keep_mask_sp]
+            elif current_count < target_count:
+                # Add random atoms to fill deficit
+                deficit = target_count - current_count
+                extra_frac = self.rng.random((deficit, 3))
+                extra_pos = extra_frac @ cell_mat
+                extra_gids = np.full(deficit, -1, dtype=np.intp)  # -1 = boundary fill
+                sp_pos = np.concatenate([sp_pos, extra_pos], axis=0)
+                sp_gids = np.concatenate([sp_gids, extra_gids], axis=0)
+
+            for p, g in zip(sp_pos, sp_gids):
+                final_positions.append(p)
+                final_numbers.append(sp_num)
+                final_grain_ids.append(int(g))
+
+        final_positions_arr = np.array(final_positions, dtype=np.float64)
+        final_numbers_arr = np.array(final_numbers, dtype=np.intp)
+        final_grain_ids_arr = np.array(final_grain_ids, dtype=np.intp)
+
+        # Shuffle to mix species (consistent with _build_random_atoms)
+        shuffle_idx = self.rng.permutation(len(final_numbers_arr))
+        final_positions_arr = final_positions_arr[shuffle_idx]
+        final_numbers_arr = final_numbers_arr[shuffle_idx]
+        final_grain_ids_arr = final_grain_ids_arr[shuffle_idx]
+
+        atoms = Atoms(
+            numbers=final_numbers_arr,
+            positions=final_positions_arr,
+            cell=cell,
+            pbc=self.reference_atoms.pbc,
+        )
+        atoms.info["relative_density"] = self.relative_density
+        atoms.info["cell_dim_angstroms"] = self.cell_dim_angstroms
+        atoms.info["n_grains"] = n_crystalline
+        atoms.info["grain_size"] = float(grain_size)
+        atoms.info["crystalline_fraction"] = crystalline_fraction
+
+        self._grain_ids = final_grain_ids_arr
+        return atoms
+
+    @staticmethod
+    def _broadening_to_weights(
+        pair_peak_max: float,
+        r_broadening: float | None = None,
+        phi_broadening: float | None = None,
+    ) -> dict[str, float]:
+        """Map broadening parameters to shell_relax force weights.
+
+        Parameters
+        ----------
+        pair_peak_max
+            Maximum first-shell distance across all species pairs (Å).
+        r_broadening
+            Radial disorder σ in Å at the NN distance.  ``None`` uses a
+            default bond_weight of 1.0.
+        phi_broadening
+            Angular disorder σ in degrees.  ``None`` uses a default
+            angle_weight of 0.5.  180 effectively disables angle forces.
+
+        Returns
+        -------
+        dict with ``bond_weight`` and ``angle_weight`` keys.
+        """
+        # --- radial broadening → bond_weight ---
+        if r_broadening is not None and r_broadening > _EPS:
+            r_norm = float(r_broadening) / max(pair_peak_max, _EPS)
+            bond_weight = float(np.clip(0.3 / max(r_norm, 0.01), 0.3, 3.0))
+        else:
+            bond_weight = 1.0
+
+        # --- angular broadening → angle_weight ---
+        if phi_broadening is not None and phi_broadening > _EPS:
+            angle_weight = float(np.clip(
+                3.0 / max(float(phi_broadening), 1.0), 0.05, 2.0,
+            ))
+        else:
+            angle_weight = 0.5
+
+        return {
+            "bond_weight": bond_weight,
+            "angle_weight": angle_weight,
+        }
 
     def _distribution_scale(self, *, order: int) -> float:
         """Scale target raw histograms onto the current supercell density basis."""
@@ -3888,6 +4233,43 @@ class Supercell:
         nonbond_push = pair_peak * 1.25
         nonbond_push[nonbond_push < _EPS] = float(np.max(pair_peak)) * 1.25
 
+        # --- grain-aware force scaling ---
+        # When _grain_ids is set, interior atoms get reduced forces to
+        # preserve crystalline order; boundary atoms get full forces.
+        grain_ids = self._grain_ids
+        if grain_ids is not None and len(grain_ids) == num_atoms:
+            # Boundary atoms: those near atoms from a different grain,
+            # or fill atoms (grain_id == -1).  We'll compute this during
+            # the first topology rebuild.
+            is_boundary = np.ones(num_atoms, dtype=bool)  # start all boundary
+            _grain_boundary_detected = [False]
+
+            def _detect_boundary_atoms() -> None:
+                """Mark atoms as boundary if they have neighbors in other grains."""
+                if _grain_boundary_detected[0]:
+                    return
+                _grain_boundary_detected[0] = True
+                boundary_cutoff = float(np.max(pair_peak)) * 2.0
+                bi, bj = neighbor_list("ij", self.atoms, boundary_cutoff)
+                # An atom is interior if all its neighbors share its grain
+                is_boundary[:] = grain_ids < 0  # fill atoms are always boundary
+                for k in range(len(bi)):
+                    if grain_ids[bi[k]] != grain_ids[bj[k]]:
+                        is_boundary[bi[k]] = True
+                        is_boundary[bj[k]] = True
+
+            # Force scale: 1.0 for boundary, small value for interior
+            interior_force_scale = 0.05
+        else:
+            grain_ids = None
+            is_boundary = None
+            _grain_boundary_detected = None
+
+            def _detect_boundary_atoms() -> None:
+                pass
+
+            interior_force_scale = 1.0
+
         # --- vectorized minimum-image helper for paired arrays ---
         def min_image(delta: np.ndarray) -> np.ndarray:
             frac = delta @ cell_inv
@@ -4065,6 +4447,8 @@ class Supercell:
             # Rebuild bond topology periodically
             if step % neighbor_update_interval == 0:
                 rebuild_topology()
+                if step == 0:
+                    _detect_boundary_atoms()
 
             # ---------- compute forces ----------
             force = np.zeros((num_atoms, 3), dtype=np.float64)
@@ -4170,6 +4554,12 @@ class Supercell:
 
             # ---------- integrate (skip on last step) ----------
             if step < num_steps:
+                # Scale down forces on interior (non-boundary) grain atoms
+                if is_boundary is not None:
+                    interior_mask = ~is_boundary
+                    if np.any(interior_mask):
+                        force[interior_mask] *= interior_force_scale
+
                 force_mag = np.linalg.norm(force, axis=1)
                 clip_mask = force_mag > max_force_clip
                 if np.any(clip_mask):
@@ -4268,6 +4658,151 @@ class Supercell:
         ax.grid(alpha=0.25)
         fig.tight_layout()
         return fig, ax
+
+    def generate(
+        self,
+        shell_target: "CoordinationShellTarget",
+        num_steps: int = 200,
+        *,
+        grain_size: float | None = None,
+        crystalline_fraction: float = 1.0,
+        r_broadening: float | None = None,
+        phi_broadening: float | None = None,
+        show_progress: bool = True,
+        **shell_relax_kwargs: Any,
+    ) -> dict[str, Any]:
+        """Generate a disordered supercell from liquid to nanocrystalline.
+
+        Covers the full spectrum of disorder:
+
+        * **Liquid** — ``grain_size=None, phi_broadening=180``:
+          only nearest-neighbor distances enforced, angles free.
+        * **Amorphous** — ``grain_size=None, r_broadening=0.1,
+          phi_broadening=10``: short-range order with tunable
+          distance and angle sharpness.
+        * **Short-range order** — ``grain_size=5, crystalline_fraction=0.3``:
+          small crystalline clusters in an amorphous matrix.
+        * **Mixed** — ``grain_size=15, crystalline_fraction=0.5``:
+          50 % crystalline grains, 50 % amorphous fill.
+        * **Nanocrystalline** — ``grain_size=15, crystalline_fraction=1.0``:
+          grains fill the entire box with thin disordered boundaries.
+
+        Also builds a matching *target_g3* distribution (auto-derived
+        from the construction parameters) and stores it on
+        :attr:`target_distribution` for use with :meth:`plot_g3_compare`.
+
+        Parameters
+        ----------
+        shell_target
+            First-shell coordination targets from the reference crystal.
+        num_steps
+            Number of relaxation sweeps.
+        grain_size
+            Diameter of crystalline grains in Angstrom.  ``None`` means
+            no grains — start from random positions (amorphous/liquid).
+        crystalline_fraction
+            Volume fraction filled by crystalline grains (0–1).  Only
+            used when *grain_size* is set.  The remaining volume is
+            filled with random (amorphous) positions.
+        r_broadening
+            Radial disorder σ in Angstrom at the nearest-neighbor
+            distance.  Controls how tightly bond lengths are enforced.
+            ``None`` uses a default.  Larger values → more distance
+            freedom.  Also sets the radial blur for the target g3.
+        phi_broadening
+            Angular disorder σ in degrees.  Controls how tightly bond
+            angles are enforced.  ``None`` uses a default.  180 means
+            angles are essentially free (liquid-like).  Small values
+            (e.g. 3) enforce sharp tetrahedral angles (diamond-like).
+            Also sets the angular blur for the target g3.
+        show_progress
+            Display a text progress bar.
+        **shell_relax_kwargs
+            Additional keyword arguments forwarded to :meth:`shell_relax`.
+            Explicit ``bond_weight`` / ``angle_weight`` override the
+            auto-derived values from broadening parameters.
+
+        Returns
+        -------
+        dict[str, Any]
+            Summary dict with regime, loss values, and construction
+            parameters.
+        """
+        pair_peak = np.asarray(shell_target.pair_peak, dtype=np.float64)
+        pair_peak_max = float(np.max(pair_peak[pair_peak > _EPS])) if np.any(pair_peak > _EPS) else 2.5
+        max_pair_outer = float(shell_target.max_pair_outer)
+
+        # --- auto-derive target_g3 from construction params ---
+        if grain_size is not None:
+            target_r_min = float(grain_size) * 0.5
+            target_r_max = target_r_min + float(grain_size) * 0.25
+        else:
+            target_r_min = max_pair_outer
+            target_r_max = target_r_min + 4.0
+
+        # Clamp to g3 grid range
+        g3_r_max = float(self.measure_r_max)
+        target_r_max = min(target_r_max, g3_r_max - float(self.measure_r_step))
+        target_r_min = min(target_r_min, target_r_max - float(self.measure_r_step))
+
+        # Build target distribution from the raw measured g3
+        self.target_distribution = self._raw_distribution.target_g3(
+            target_r_min=target_r_min,
+            target_r_max=target_r_max,
+            r_sigma=r_broadening,
+            r_sigma_at=pair_peak_max,
+            phi_sigma_deg=phi_broadening,
+            label="target",
+        )
+
+        # --- compute force weights from broadening ---
+        auto_weights = self._broadening_to_weights(
+            pair_peak_max, r_broadening, phi_broadening,
+        )
+        for key, val in auto_weights.items():
+            shell_relax_kwargs.setdefault(key, val)
+
+        # --- construct atoms ---
+        use_grains = grain_size is not None and float(grain_size) > 0.0
+
+        if use_grains:
+            disp_sigma = float(r_broadening) if (r_broadening is not None and r_broadening > _EPS) else 0.0
+
+            self.atoms = self._build_grain_atoms(
+                shell_target,
+                grain_size=float(grain_size),
+                crystalline_fraction=crystalline_fraction,
+                displacement_sigma=disp_sigma,
+            )
+
+            # Refresh cached arrays after rebuilding atoms
+            self._cell_matrix = np.asarray(self.atoms.cell.array, dtype=np.float64)
+            self._cell_inverse = np.linalg.inv(self._cell_matrix)
+            self._atom_species_index = np.searchsorted(
+                self._species, self.atoms.numbers,
+            )
+            self._rebuild_spatial_index()
+
+        # --- relax ---
+        summary = self.shell_relax(
+            shell_target,
+            num_steps=num_steps,
+            show_progress=show_progress,
+            **shell_relax_kwargs,
+        )
+
+        # --- summary ---
+        if use_grains:
+            summary["regime"] = "nanocrystalline" if crystalline_fraction >= 0.9 else "mixed"
+            summary["n_grains"] = int(self.atoms.info.get("n_grains", 0))
+            summary["grain_size"] = float(grain_size)
+            summary["crystalline_fraction"] = crystalline_fraction
+        else:
+            summary["regime"] = "amorphous"
+        summary["r_broadening"] = r_broadening
+        summary["phi_broadening"] = phi_broadening
+
+        return summary
 
     def plot_motif_training(
         self,
