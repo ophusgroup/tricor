@@ -4774,10 +4774,14 @@ class Supercell:
         cell_inv = np.linalg.inv(cell_mat)
         num_atoms = len(self.atoms)
 
-        # --- bond cutoff and coordination number ---
+        # --- bond cutoff ---
         if bond_cutoff is None:
             if shell_target is not None:
-                bond_cutoff = float(shell_target.max_pair_outer)
+                # Use a generous cutoff (pair_peak + 3*sigma or 1.2x)
+                pair_peak_max = float(np.max(
+                    np.asarray(shell_target.pair_peak, dtype=np.float64),
+                ))
+                bond_cutoff = pair_peak_max * 1.2
             else:
                 bond_cutoff = 3.0
 
@@ -4791,29 +4795,61 @@ class Supercell:
         else:
             k_per_atom = np.full(num_atoms, 4, dtype=np.intp)
 
-        # --- find bonds & classify atoms (MATLAB plotAtoms02 style) ---
-        bi_all, bj_all, bd_all, bD_all = neighbor_list(
-            "ijdD", self.atoms, bond_cutoff,
-        )
+        # --- find bonds ---
+        bi_all, bj_all, bd_all = neighbor_list("ijd", self.atoms, bond_cutoff)
 
         def _min_image(delta: np.ndarray) -> np.ndarray:
             frac = delta @ cell_inv
             frac -= np.rint(frac)
             return frac @ cell_mat
 
-        # Per-atom: check coordination count and mean displacement
+        # --- classify atoms as crystalline ---
+        # Two criteria (either makes an atom crystalline):
+        # 1) Tetrahedral check (MATLAB style): K NN within cutoff and
+        #    symmetric coordination (mean displacement < thresh).
+        #    Allow K-1 to K+1 neighbors for tolerance.
+        # 2) Grain interior: deep inside a crystalline Voronoi cell.
         is_crystalline_atom = np.zeros(num_atoms, dtype=bool)
+
+        # Criterion 1: tetrahedral / symmetric coordination
         for a in range(num_atoms):
             mask = bi_all == a
             nn_count = int(np.sum(mask))
-            if nn_count == k_per_atom[a] and nn_count > 0:
-                # Minimum-image displacement vectors
-                dxyz = _min_image(
-                    self.atoms.positions[bj_all[mask]] - self.atoms.positions[a],
-                )
-                mean_disp = np.linalg.norm(np.mean(dxyz, axis=0))
-                if mean_disp < tetrahedral_thresh:
-                    is_crystalline_atom[a] = True
+            k_target = int(k_per_atom[a])
+            if nn_count < max(k_target - 1, 1) or nn_count > k_target + 1:
+                continue
+            # Use K nearest for the displacement check
+            dists_a = bd_all[mask]
+            js_a = bj_all[mask]
+            order = np.argsort(dists_a)[:k_target]
+            dxyz = _min_image(pos[js_a[order]] - pos[a])
+            mean_disp = np.linalg.norm(np.mean(dxyz, axis=0))
+            if mean_disp < tetrahedral_thresh:
+                is_crystalline_atom[a] = True
+
+        # Criterion 2: grain interior atoms (always crystalline)
+        grain_ids = self._grain_ids
+        grain_seeds = self._grain_seeds
+        if grain_ids is not None and grain_seeds is not None:
+            pp_max = float(np.max(
+                np.asarray(shell_target.pair_peak, dtype=np.float64),
+            )) if shell_target is not None else 2.5
+            bw = pp_max * 0.5
+            delta_seeds = pos[:, None, :] - grain_seeds[None, :, :]
+            frac_ds = delta_seeds @ cell_inv
+            frac_ds -= np.rint(frac_ds)
+            cart_ds = frac_ds @ cell_mat
+            dist_to_seeds = np.sqrt(np.sum(cart_ds ** 2, axis=2))
+            for ia in range(num_atoms):
+                gid = grain_ids[ia]
+                if gid < 0:
+                    continue
+                d_own = dist_to_seeds[ia, gid]
+                dists_copy = dist_to_seeds[ia].copy()
+                dists_copy[gid] = np.inf
+                d_other = float(np.min(dists_copy))
+                if (d_other - d_own) * 0.5 > bw:
+                    is_crystalline_atom[ia] = True
 
         # Keep i < j for unique bonds
         mask_ij = bi_all < bj_all
@@ -4884,6 +4920,12 @@ class Supercell:
             ax.set_facecolor(background)
             fig.patch.set_facecolor(background)
 
+            # Perspective projection (like MATLAB camproj('perspective'))
+            try:
+                ax.set_proj_type("persp", focal_length=0.25)
+            except (TypeError, AttributeError):
+                pass  # older matplotlib
+
             # Rotate bond endpoints in x-y plane (like MATLAB)
             bs_r = _rotate_2d(bstart_c, theta_rad)
             be_r = _rotate_2d(bend_c, theta_rad)
@@ -4893,19 +4935,20 @@ class Supercell:
                 segs_b = list(zip(bs_r[bnd_mask], be_r[bnd_mask]))
                 lc_b = Line3DCollection(
                     segs_b, linewidths=0.5,
-                    colors=(0.0, 0.0, 0.0, 0.04),
+                    colors=(0.0, 0.0, 0.0, 0.05),
                 )
                 ax.add_collection3d(lc_b)
 
             # --- crystalline bonds: thick, depth-coloured ---
+            # Colour by rotated y (depth): closer to viewer = brighter
             if np.any(cryst_mask):
                 segs_cr = list(zip(bs_r[cryst_mask], be_r[cryst_mask]))
-                # Colour by rotated y (depth)
                 mid_y_rot = 0.5 * (bs_r[cryst_mask, 1] + be_r[cryst_mask, 1])
-                norm_y = (mid_y_rot - y_min) / max(y_max - y_min, _EPS)
+                # Flip: large y = far = dark, small y = close = bright
+                norm_y = 1.0 - (mid_y_rot - y_min) / max(y_max - y_min, _EPS)
                 cryst_colors = cmap(np.clip(norm_y, 0, 1))
                 lc_c = Line3DCollection(
-                    segs_cr, linewidths=1.5, colors=cryst_colors,
+                    segs_cr, linewidths=2.0, colors=cryst_colors,
                 )
                 ax.add_collection3d(lc_c)
 
