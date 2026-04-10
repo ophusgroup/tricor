@@ -14,6 +14,10 @@ dependencies = [
     "ase",
     "anywidget",
     "torch",
+    "torch-geometric",
+    "lightning",
+    "pandas",
+    "scikit-learn",
 ]
 
 [tool.hatch.build]

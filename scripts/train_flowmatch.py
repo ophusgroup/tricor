@@ -1,14 +1,14 @@
-"""Train the GLASS score model on a directory of structure files.
+"""Train the conditional flow matching model on a directory of structure files.
 
 Edit the CONFIG section below, then run:
-    python train_score_model.py
+    python train_flowmatch.py
 """
 
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, TQDMProgressBar
 from lightning.pytorch.loggers import TensorBoardLogger
 
-from tricor.glass import LitScoreNet, StructureDataModule
+from tricor.flowmatch import LitFlowMatch, FlowMatchDataModule
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG — edit these
@@ -17,57 +17,76 @@ from tricor.glass import LitScoreNet, StructureDataModule
 # Data
 DATA_DIR = "/path/to/25A_xyz_files/"   # directory of xyz/extxyz/vasp/cif files
 SPECIES = [7, 14]                       # atomic numbers (N, Si for Si3N4)
-CUTOFF = 5.0                            # neighbor cutoff for graph construction (A)
-K = 0.8                                 # VE-SDE max noise level (A)
+CUTOFF = 5.0                            # graph construction cutoff (A)
 DUP = 128                               # noise replicas per structure
-VAL_FRACTION = 0.1                      # fraction of structures for validation
+USE_OT = True                           # per-species optimal transport assignment
+VAL_FRACTION = 0.1
 
-# Model (GLASS defaults from Sec. S1.4)
-NUM_CONVS = 5                           # message-passing layers
-DIM = 200                               # hidden dimension
-EMA_DECAY = 0.9999                      # EMA decay rate
-LR = 1e-3                               # learning rate
+# Spectral labels (must match what you use at inference)
+R_MAX = 10.0                            # PDF cutoff (A)
+R_STEP = 0.05                           # radial bin width (A)
+PHI_NUM_BINS = 90                       # angular bins
+SIGMA_R = 0.15                          # PDF Gaussian bandwidth (A)
+SIGMA_PHI = 0.1                         # ADF Gaussian bandwidth (rad)
+
+# Model
+NUM_CONVS = 6                           # message-passing layers
+DIM = 256                               # hidden dimension
+COND_DIM = 128                          # conditioning vector dimension
+EMA_DECAY = 0.9999
+LR = 5e-4
 
 # Training
-MAX_EPOCHS = 12000
-BATCH_SIZE = 32
-NUM_WORKERS = 0                          # 0 avoids pickle errors with Python 3.14 forkserver
+MAX_EPOCHS = 5000
+BATCH_SIZE = 16
+NUM_WORKERS = 0                          # 0 avoids pickle errors with Python 3.14
 GPUS = 1
 LOG_DIR = "./lightning_logs"
-RUN_NAME = "glass-si3n4"
-RESUME_CKPT = None                      # set to checkpoint path to resume
+RUN_NAME = "flowmatch-si3n4"
+RESUME_CKPT = None
 
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 def main():
     num_species = len(SPECIES)
-    print(f"Training GLASS score model")
+    num_r = int(round(R_MAX / R_STEP))
+
+    print(f"Training conditional flow matching model")
     print(f"  Data: {DATA_DIR}")
     print(f"  Species: {SPECIES} ({num_species} types)")
-    print(f"  Model: dim={DIM}, num_convs={NUM_CONVS}")
-    print(f"  Training: lr={LR}, batch_size={BATCH_SIZE}, max_epochs={MAX_EPOCHS}, k={K}")
+    print(f"  Model: dim={DIM}, cond_dim={COND_DIM}, num_convs={NUM_CONVS}")
+    print(f"  Training: lr={LR}, batch_size={BATCH_SIZE}, max_epochs={MAX_EPOCHS}")
+    print(f"  Spectral: r_max={R_MAX}, r_step={R_STEP}, phi_bins={PHI_NUM_BINS}")
 
-    datamodule = StructureDataModule(
+    datamodule = FlowMatchDataModule(
         structures=DATA_DIR,
         cutoff=CUTOFF,
-        k=K,
-        dup=DUP,
+        r_max=R_MAX,
+        r_step=R_STEP,
+        phi_num_bins=PHI_NUM_BINS,
+        sigma_r=SIGMA_R,
+        sigma_phi=SIGMA_PHI,
         species=SPECIES,
+        dup=DUP,
+        use_ot=USE_OT,
         batch_size=BATCH_SIZE,
         num_workers=NUM_WORKERS,
         val_fraction=VAL_FRACTION,
     )
 
-    score_net = LitScoreNet(
+    model = LitFlowMatch(
         num_species=num_species,
         num_convs=NUM_CONVS,
         dim=DIM,
+        cond_dim=COND_DIM,
+        num_r=num_r,
+        num_phi=PHI_NUM_BINS,
         ema_decay=EMA_DECAY,
         learn_rate=LR,
     )
 
-    print(f"  Parameters: {sum(p.numel() for p in score_net.parameters()):,}")
+    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     checkpoint_cb = ModelCheckpoint(
         monitor="val_loss",
@@ -86,7 +105,7 @@ def main():
         gradient_clip_val=1.0,
     )
 
-    trainer.fit(score_net, datamodule, ckpt_path=RESUME_CKPT)
+    trainer.fit(model, datamodule, ckpt_path=RESUME_CKPT)
     print(f"Training complete. Best checkpoint: {checkpoint_cb.best_model_path}")
 
 
