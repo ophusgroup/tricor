@@ -4708,48 +4708,65 @@ class Supercell:
         height: int = 600,
         fps: int = 60,
         duration: float = 6.0,
-        rotation_speed: float = 60.0,
         elevation: float = 15.0,
-        atom_size: float = 80.0,
+        atom_size: float = 4.0,
         bond_cutoff: float | None = None,
         show_cell: bool = True,
+        show_atoms: bool = True,
+        background: str = "white",
+        colormap: str = "copper",
+        tetrahedral_thresh: float = 0.4,
+        show_progress: bool = True,
     ):
-        """Render a rotating 3D view of the atomic structure.
+        """Render a bond-centric rotating 3D view of the atomic structure.
 
-        Draws atoms coloured by grain identity, nearest-neighbor bonds
-        (thin for amorphous/boundary, thick for crystalline interior),
-        and the periodic cell outline.
+        Bonds are the primary visual: crystalline (tetrahedral) bonds
+        are drawn thick and coloured by depth; boundary / amorphous
+        bonds are drawn faint.  Atoms are optional small dots.  The
+        animation performs a full periodic 360-degree rotation.
+
+        Classification follows the MATLAB ``plotAtoms02`` convention:
+        an atom is *crystalline* if it has exactly K nearest neighbours
+        within *bond_cutoff* **and** the mean displacement of those
+        neighbours is less than *tetrahedral_thresh* (i.e. the local
+        coordination is symmetric / tetrahedral).
 
         Parameters
         ----------
         shell_target
-            If provided, bonds are drawn up to ``pair_outer`` and
-            classified as crystalline (interior) vs amorphous.  Without
-            this, bonds are drawn up to *bond_cutoff* with uniform style.
+            First-shell targets.  Used to set *bond_cutoff* and the
+            coordination number K automatically.
         output
-            File path for a ``.gif`` animation.  If ``None``, displays
-            a static matplotlib figure instead.
+            File path for a ``.gif``.  ``None`` shows a static figure.
         width, height
             Frame size in pixels.
         fps
-            Frames per second for the GIF.
+            Frames per second (GIF only).
         duration
-            Total animation length in seconds.
-        rotation_speed
-            Degrees of azimuthal rotation per second.
+            Total GIF length in seconds.  Rotation is always exactly
+            360 degrees so the loop is seamless.
         elevation
-            Camera elevation angle in degrees.
+            Camera elevation in degrees.
         atom_size
-            Marker size for atoms (matplotlib scatter units).
+            Matplotlib scatter marker size.  Set to 0 to hide atoms.
         bond_cutoff
-            Maximum bond length in Angstrom.  Defaults to
-            ``shell_target.max_pair_outer`` or 3.0.
+            NN bond length cutoff in Angstrom.
         show_cell
             Draw the periodic cell outline.
+        show_atoms
+            Draw atom dots.
+        background
+            Figure background colour.
+        colormap
+            Matplotlib colormap for crystalline bonds (coloured by
+            depth / y-coordinate after rotation, like MATLAB ``bone``).
+        tetrahedral_thresh
+            Maximum norm of mean NN displacement vector for an atom to
+            be classified as crystalline.  Smaller = stricter.
+        show_progress
+            Print frame counter during GIF rendering.
         """
-        import matplotlib
         import matplotlib.pyplot as plt
-        from matplotlib.collections import LineCollection
         from mpl_toolkits.mplot3d.art3d import Line3DCollection
 
         pos = self.atoms.positions.copy()
@@ -4757,178 +4774,202 @@ class Supercell:
         cell_inv = np.linalg.inv(cell_mat)
         num_atoms = len(self.atoms)
 
-        # --- bond cutoff ---
+        # --- bond cutoff and coordination number ---
         if bond_cutoff is None:
             if shell_target is not None:
                 bond_cutoff = float(shell_target.max_pair_outer)
             else:
                 bond_cutoff = 3.0
 
-        # --- find bonds ---
-        bi, bj, bd = neighbor_list("ijd", self.atoms, bond_cutoff)
-        # Keep only i < j to avoid duplicates
-        mask_ij = bi < bj
-        bi, bj, bd = bi[mask_ij], bj[mask_ij], bd[mask_ij]
+        if shell_target is not None:
+            coord_target = np.asarray(shell_target.coordination_target, dtype=np.float64)
+            species_idx = self._atom_species_index
+            k_per_atom = np.array([
+                int(np.round(coord_target[species_idx[a]].sum()))
+                for a in range(num_atoms)
+            ], dtype=np.intp)
+        else:
+            k_per_atom = np.full(num_atoms, 4, dtype=np.intp)
 
-        # --- classify bonds: crystalline interior vs boundary/amorphous ---
-        grain_ids = self._grain_ids
-        grain_seeds = self._grain_seeds
-        is_interior = np.zeros(num_atoms, dtype=bool)
+        # --- find bonds & classify atoms (MATLAB plotAtoms02 style) ---
+        bi_all, bj_all, bd_all, bD_all = neighbor_list(
+            "ijdD", self.atoms, bond_cutoff,
+        )
 
-        if grain_ids is not None and grain_seeds is not None and shell_target is not None:
-            pair_peak_max = float(np.max(
-                np.asarray(shell_target.pair_peak, dtype=np.float64),
-            ))
-            boundary_width = pair_peak_max * 0.5
-
-            # Compute boundary depth per atom
-            delta = pos[:, None, :] - grain_seeds[None, :, :]
-            frac_d = delta @ cell_inv
-            frac_d -= np.rint(frac_d)
-            cart_d = frac_d @ cell_mat
-            dist_to_seeds = np.sqrt(np.sum(cart_d ** 2, axis=2))
-
-            for ia in range(num_atoms):
-                gid = grain_ids[ia]
-                if gid < 0:
-                    continue
-                dist_own = dist_to_seeds[ia, gid]
-                dists_copy = dist_to_seeds[ia].copy()
-                dists_copy[gid] = np.inf
-                dist_other = float(np.min(dists_copy))
-                if (dist_other - dist_own) * 0.5 > boundary_width:
-                    is_interior[ia] = True
-
-        bond_is_cryst = is_interior[bi] & is_interior[bj]
-
-        # --- bond segments (minimum-image midpoints) ---
         def _min_image(delta: np.ndarray) -> np.ndarray:
             frac = delta @ cell_inv
             frac -= np.rint(frac)
             return frac @ cell_mat
 
+        # Per-atom: check coordination count and mean displacement
+        is_crystalline_atom = np.zeros(num_atoms, dtype=bool)
+        for a in range(num_atoms):
+            mask = bi_all == a
+            nn_count = int(np.sum(mask))
+            if nn_count == k_per_atom[a] and nn_count > 0:
+                # Minimum-image displacement vectors
+                dxyz = _min_image(
+                    self.atoms.positions[bj_all[mask]] - self.atoms.positions[a],
+                )
+                mean_disp = np.linalg.norm(np.mean(dxyz, axis=0))
+                if mean_disp < tetrahedral_thresh:
+                    is_crystalline_atom[a] = True
+
+        # Keep i < j for unique bonds
+        mask_ij = bi_all < bj_all
+        bi, bj = bi_all[mask_ij], bj_all[mask_ij]
+
+        # Bond is crystalline if BOTH endpoints are crystalline
+        bond_is_cryst = is_crystalline_atom[bi] & is_crystalline_atom[bj]
+
+        # Bond segment endpoints (minimum-image)
         bond_vecs = _min_image(pos[bj] - pos[bi])
         bond_starts = pos[bi]
         bond_ends = bond_starts + bond_vecs
 
-        # --- atom colours by grain ---
-        if grain_ids is not None:
-            unique_grains = np.unique(grain_ids[grain_ids >= 0])
-            n_colors = max(len(unique_grains), 1)
-            cmap = plt.cm.tab20
-            atom_colors = np.zeros((num_atoms, 4))
-            for idx, gid in enumerate(unique_grains):
-                mask = grain_ids == gid
-                atom_colors[mask] = cmap(idx % 20)
-            atom_colors[grain_ids < 0] = (0.5, 0.5, 0.5, 0.6)  # grey for amorphous
-        else:
-            atom_colors = np.full((num_atoms, 4), [0.3, 0.55, 0.85, 0.8])
+        # --- center everything ---
+        a_vec, b_vec, c_vec = cell_mat[0], cell_mat[1], cell_mat[2]
+        center = 0.5 * (a_vec + b_vec + c_vec)
+        pos_c = pos - center
+        bstart_c = bond_starts - center
+        bend_c = bond_ends - center
 
-        # --- cell edges ---
-        o = np.zeros(3)
-        a, b, c = cell_mat[0], cell_mat[1], cell_mat[2]
-        cell_edges = [
-            (o, a), (o, b), (o, c),
-            (a, a + b), (a, a + c), (b, a + b), (b, b + c),
-            (c, a + c), (c, b + c),
-            (a + b, a + b + c), (a + c, a + b + c), (b + c, a + b + c),
+        # Cell outline edges
+        o = -center
+        cell_corners = [
+            o, o + a_vec, o + b_vec, o + c_vec,
+            o + a_vec + b_vec, o + a_vec + c_vec, o + b_vec + c_vec,
+            o + a_vec + b_vec + c_vec,
         ]
+        cell_edge_pairs = [
+            (0, 1), (0, 2), (0, 3), (1, 4), (1, 5), (2, 4),
+            (2, 6), (3, 5), (3, 6), (4, 7), (5, 7), (6, 7),
+        ]
+        cell_segs = [(cell_corners[i], cell_corners[j]) for i, j in cell_edge_pairs]
 
-        # --- center positions for better framing ---
-        center = 0.5 * (a + b + c)
-        pos_centered = pos - center
-        bond_starts_c = bond_starts - center
-        bond_ends_c = bond_ends - center
-        cell_edges_c = [(s - center, e - center) for s, e in cell_edges]
+        # --- colormap for crystalline bonds (depth-coloured) ---
+        cmap = plt.get_cmap(colormap)
+
+        # Pre-compute bond midpoint y-coordinate for colouring
+        # (y chosen to match MATLAB's depth axis after rotation)
+        cryst_mask = bond_is_cryst
+        bnd_mask = ~bond_is_cryst
+        cryst_mid_y = 0.5 * (bstart_c[cryst_mask, 1] + bend_c[cryst_mask, 1])
+        extent = float(np.max(np.abs(pos_c))) * 1.15
+
+        # Normalise colour range
+        if len(cryst_mid_y) > 0:
+            y_min, y_max = float(cryst_mid_y.min()), float(cryst_mid_y.max())
+            if y_max - y_min < _EPS:
+                y_min, y_max = -extent, extent
+        else:
+            y_min, y_max = -extent, extent
 
         dpi = 100
         figsize = (width / dpi, height / dpi)
 
-        def _draw_frame(azim: float) -> "plt.Figure":
+        def _rotate_2d(pts: np.ndarray, theta: float) -> np.ndarray:
+            """Rotate x-y columns by theta radians (in-place friendly)."""
+            c, s = np.cos(theta), np.sin(theta)
+            x_new = pts[:, 0] * c - pts[:, 1] * s
+            y_new = pts[:, 0] * s + pts[:, 1] * c
+            out = pts.copy()
+            out[:, 0] = x_new
+            out[:, 1] = y_new
+            return out
+
+        def _draw_frame(theta_rad: float) -> "plt.Figure":
             fig = plt.figure(figsize=figsize, dpi=dpi)
             ax = fig.add_subplot(111, projection="3d")
-            ax.set_facecolor("white")
-            fig.patch.set_facecolor("white")
+            ax.set_facecolor(background)
+            fig.patch.set_facecolor(background)
 
-            # Bonds: thin grey for boundary, thicker coloured for crystalline
-            if len(bi) > 0:
-                # Boundary bonds
-                bnd_mask = ~bond_is_cryst
-                if np.any(bnd_mask):
-                    segs_b = list(zip(
-                        bond_starts_c[bnd_mask],
-                        bond_ends_c[bnd_mask],
-                    ))
-                    lc_b = Line3DCollection(
-                        segs_b, linewidths=0.3, colors=(0.6, 0.6, 0.6, 0.3),
-                    )
-                    ax.add_collection3d(lc_b)
+            # Rotate bond endpoints in x-y plane (like MATLAB)
+            bs_r = _rotate_2d(bstart_c, theta_rad)
+            be_r = _rotate_2d(bend_c, theta_rad)
 
-                # Crystalline bonds
-                cry_mask = bond_is_cryst
-                if np.any(cry_mask):
-                    segs_c = list(zip(
-                        bond_starts_c[cry_mask],
-                        bond_ends_c[cry_mask],
-                    ))
-                    lc_c = Line3DCollection(
-                        segs_c, linewidths=1.0, colors=(0.15, 0.15, 0.15, 0.7),
-                    )
-                    ax.add_collection3d(lc_c)
+            # --- boundary bonds: very faint ---
+            if np.any(bnd_mask):
+                segs_b = list(zip(bs_r[bnd_mask], be_r[bnd_mask]))
+                lc_b = Line3DCollection(
+                    segs_b, linewidths=0.5,
+                    colors=(0.0, 0.0, 0.0, 0.04),
+                )
+                ax.add_collection3d(lc_b)
 
-            # Cell outline
+            # --- crystalline bonds: thick, depth-coloured ---
+            if np.any(cryst_mask):
+                segs_cr = list(zip(bs_r[cryst_mask], be_r[cryst_mask]))
+                # Colour by rotated y (depth)
+                mid_y_rot = 0.5 * (bs_r[cryst_mask, 1] + be_r[cryst_mask, 1])
+                norm_y = (mid_y_rot - y_min) / max(y_max - y_min, _EPS)
+                cryst_colors = cmap(np.clip(norm_y, 0, 1))
+                lc_c = Line3DCollection(
+                    segs_cr, linewidths=1.5, colors=cryst_colors,
+                )
+                ax.add_collection3d(lc_c)
+
+            # --- cell outline ---
             if show_cell:
-                cell_segs = [(s, e) for s, e in cell_edges_c]
+                cell_segs_r = []
+                for s, e in cell_segs:
+                    s_r = _rotate_2d(s.reshape(1, 3), theta_rad)[0]
+                    e_r = _rotate_2d(e.reshape(1, 3), theta_rad)[0]
+                    cell_segs_r.append((s_r, e_r))
                 lc_cell = Line3DCollection(
-                    cell_segs, linewidths=1.2, colors="k", linestyles="--",
-                    alpha=0.4,
+                    cell_segs_r, linewidths=1.5, colors="k", alpha=0.5,
                 )
                 ax.add_collection3d(lc_cell)
 
-            # Atoms
-            ax.scatter(
-                pos_centered[:, 0],
-                pos_centered[:, 1],
-                pos_centered[:, 2],
-                s=atom_size,
-                c=atom_colors,
-                edgecolors="none",
-                depthshade=True,
-            )
+            # --- atoms (tiny dots) ---
+            if show_atoms and atom_size > 0:
+                pos_r = _rotate_2d(pos_c, theta_rad)
+                ax.scatter(
+                    pos_r[:, 0], pos_r[:, 1], pos_r[:, 2],
+                    s=atom_size, c="k", alpha=0.15,
+                    edgecolors="none", depthshade=False,
+                )
 
-            # Axis limits
-            extent = float(np.max(np.abs(pos_centered))) * 1.15
             ax.set_xlim(-extent, extent)
             ax.set_ylim(-extent, extent)
             ax.set_zlim(-extent, extent)
             ax.set_box_aspect([1, 1, 1])
-            ax.view_init(elev=elevation, azim=azim)
+            ax.view_init(elev=elevation, azim=0)  # azim fixed; we rotate data
             ax.axis("off")
             fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
             return fig
 
         # --- static display or GIF ---
         if output is None:
-            fig = _draw_frame(azim=30.0)
-            return fig
+            return _draw_frame(theta_rad=np.deg2rad(45.0))
 
-        # GIF output
+        # GIF: full 360-degree periodic rotation
         n_frames = int(fps * duration)
-        azimuths = np.linspace(0, rotation_speed * duration, n_frames, endpoint=False)
+        thetas = np.linspace(0, 2 * np.pi, n_frames, endpoint=False)
 
         from PIL import Image
         import io
 
+        if show_progress:
+            progress = _TextProgressBar(n_frames, label="Rendering", width=28)
+        else:
+            progress = None
+
         frames: list[Image.Image] = []
-        for i, az in enumerate(azimuths):
-            fig = _draw_frame(az)
+        for i, th in enumerate(thetas):
+            fig = _draw_frame(th)
             buf = io.BytesIO()
-            fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight",
-                        pad_inches=0, facecolor="white")
+            fig.savefig(
+                buf, format="png", dpi=dpi,
+                bbox_inches="tight", pad_inches=0,
+                facecolor=background,
+            )
             plt.close(fig)
             buf.seek(0)
             frames.append(Image.open(buf).copy())
             buf.close()
+            if progress is not None:
+                progress.update(i + 1)
 
         frame_duration_ms = int(1000 / fps)
         frames[0].save(
@@ -4939,6 +4980,8 @@ class Supercell:
             loop=0,
             optimize=True,
         )
+        if progress is not None:
+            progress.update(n_frames)
         return output
 
     def generate(
