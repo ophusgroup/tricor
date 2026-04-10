@@ -20,6 +20,12 @@ dependencies = [
     "scikit-learn",
 ]
 
+[project.optional-dependencies]
+data = [
+    "h5py",
+    "zarr",
+]
+
 [tool.hatch.build]
 include = [
     "src/tricor/static/*.js",
