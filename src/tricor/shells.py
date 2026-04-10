@@ -1,0 +1,451 @@
+"""First-shell coordination targets extracted from crystalline reference cells."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from ase.atoms import Atoms
+from ase.data import chemical_symbols
+from ase.neighborlist import neighbor_list
+
+from .g3 import _EPS
+
+
+def _cell_face_spacings(cell_matrix: np.ndarray) -> np.ndarray:
+    """Return periodic face spacings for a cell spanned by row vectors."""
+    inverse = np.linalg.inv(np.asarray(cell_matrix, dtype=np.float64))
+    return 1.0 / np.maximum(np.linalg.norm(inverse, axis=0), _EPS)
+
+
+def _gaussian_kernel(sigma_bins: float) -> np.ndarray:
+    """Return a normalized 1D Gaussian kernel."""
+    sigma_bins = float(sigma_bins)
+    if sigma_bins <= _EPS:
+        return np.array([1.0], dtype=np.float64)
+    radius = max(1, int(np.ceil(3.0 * sigma_bins)))
+    x = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (x / max(sigma_bins, _EPS)) ** 2)
+    kernel /= max(np.sum(kernel), _EPS)
+    return kernel
+
+
+def _smooth_histogram(values: np.ndarray, sigma_bins: float) -> np.ndarray:
+    """Smooth a histogram using a small Gaussian kernel."""
+    kernel = _gaussian_kernel(sigma_bins)
+    return np.convolve(np.asarray(values, dtype=np.float64), kernel, mode="same")
+
+
+def _first_local_maximum(values: np.ndarray) -> int:
+    """Return the first prominent local maximum, falling back to the global one."""
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return 0
+    if values.size == 1:
+        return 0
+    peak_threshold = 0.25 * float(np.max(values))
+    for index in range(1, values.size - 1):
+        if values[index] >= peak_threshold and values[index] >= values[index - 1] and values[index] >= values[index + 1]:
+            return int(index)
+    return int(np.argmax(values))
+
+
+def _infer_shell_window(
+    distances: np.ndarray,
+    *,
+    hist_step: float,
+    smooth_sigma_bins: float,
+) -> tuple[float, float, float, float, float]:
+    """Infer a first-shell window from reference pair distances."""
+    distances = np.sort(np.asarray(distances, dtype=np.float64))
+    if distances.size == 0:
+        return 0.0, 0.0, 0.0, hist_step, 0.0
+
+    upper = float(np.max(distances) + hist_step)
+    edges = np.arange(0.0, upper + hist_step, hist_step, dtype=np.float64)
+    if edges.size < 3:
+        edges = np.array([0.0, hist_step, 2.0 * hist_step], dtype=np.float64)
+    hist, _ = np.histogram(distances, bins=edges)
+    occupied = np.flatnonzero(hist > 0)
+    if occupied.size == 0:
+        return 0.0, 0.0, 0.0, hist_step, 0.0
+
+    first_occ = int(occupied[0])
+    left_index = max(first_occ - 1, 0)
+    right_index = hist.size - 1
+    zero_run = 0
+    zero_right_index: int | None = None
+    for index in range(first_occ + 1, hist.size):
+        if hist[index] == 0:
+            zero_run += 1
+            if zero_run >= 2:
+                zero_right_index = index - zero_run + 1
+                break
+        else:
+            zero_run = 0
+    if zero_right_index is not None:
+        right_index = min(hist.size - 1, zero_right_index)
+    else:
+        smooth = _smooth_histogram(hist, sigma_bins=smooth_sigma_bins)
+        peak_index = _first_local_maximum(smooth[first_occ:]) + first_occ
+        peak_value = float(max(smooth[peak_index], _EPS))
+        cutoff_value = 0.12 * peak_value
+        right_index = peak_index
+        while right_index < smooth.size - 1 and smooth[right_index] > cutoff_value:
+            right_index += 1
+
+    r_inner = float(edges[max(left_index, 0)])
+    r_outer = float(edges[min(right_index + 1, edges.size - 1)])
+    in_shell = distances[(distances >= r_inner) & (distances <= r_outer)]
+    if in_shell.size == 0:
+        in_shell = distances
+
+    r_peak = float(np.mean(in_shell))
+    sigma_r = float(max(np.std(in_shell), hist_step))
+    hard_min = float(max(0.0, r_inner - 1.5 * sigma_r))
+    return hard_min, r_inner, r_peak, sigma_r, r_outer
+
+
+@dataclass(frozen=True)
+class CoordinationShellTarget:
+    """Species-aware first-shell coordination targets extracted from a crystal."""
+
+    atoms: Atoms
+    label: str
+    species: np.ndarray
+    species_labels: tuple[str, ...]
+    phi_num_bins: int
+    phi_edges: np.ndarray
+    phi: np.ndarray
+    phi_deg: np.ndarray
+    angle_index: np.ndarray
+    angle_lookup: np.ndarray
+    pair_hard_min: np.ndarray
+    pair_inner: np.ndarray
+    pair_peak: np.ndarray
+    pair_sigma: np.ndarray
+    pair_outer: np.ndarray
+    pair_mask: np.ndarray
+    coordination_target: np.ndarray
+    coordination_std: np.ndarray
+    angle_target: np.ndarray
+    angle_pair_mass_target: np.ndarray
+    angle_mode_deg: np.ndarray
+    motif_center_species: np.ndarray
+    motif_neighbor_species: tuple[np.ndarray, ...]
+    motif_neighbor_vectors: tuple[np.ndarray, ...]
+    max_pair_outer: float
+    max_pair_outer_by_center: np.ndarray
+    summary: dict[str, object]
+
+    @classmethod
+    def from_atoms(
+        cls,
+        atoms: Atoms,
+        *,
+        phi_num_bins: int = 72,
+        shell_hist_step: float = 0.05,
+        shell_smooth_sigma_bins: float = 1.2,
+        extract_cutoff: float | None = None,
+        label: str | None = None,
+    ) -> "CoordinationShellTarget":
+        """Extract first-shell count, radius, and angle targets from reference atoms."""
+        atoms = atoms.copy()
+        species = np.unique(np.asarray(atoms.numbers, dtype=np.int64))
+        num_species = int(species.size)
+        species_index = np.searchsorted(species, np.asarray(atoms.numbers, dtype=np.int64))
+        species_labels = tuple(chemical_symbols[int(spec)] for spec in species)
+
+        phi_num_bins = int(phi_num_bins)
+        if phi_num_bins <= 0:
+            raise ValueError("phi_num_bins must be positive.")
+        phi_edges = np.linspace(0.0, np.pi, phi_num_bins + 1, dtype=np.float64)
+        phi = 0.5 * (phi_edges[:-1] + phi_edges[1:])
+        phi_deg = np.rad2deg(phi)
+
+        angle_index = []
+        angle_lookup = -np.ones((num_species, num_species, num_species), dtype=np.intp)
+        for center_index in range(num_species):
+            for neigh1_index in range(num_species):
+                for neigh2_index in range(neigh1_index, num_species):
+                    triplet_index = len(angle_index)
+                    angle_index.append((center_index, neigh1_index, neigh2_index))
+                    angle_lookup[center_index, neigh1_index, neigh2_index] = triplet_index
+                    angle_lookup[center_index, neigh2_index, neigh1_index] = triplet_index
+        angle_index = np.asarray(angle_index, dtype=np.intp)
+
+        cell_matrix = np.asarray(atoms.cell.array, dtype=np.float64)
+        cell_face_spacings = _cell_face_spacings(cell_matrix)
+        cell_lengths = np.linalg.norm(cell_matrix, axis=1)
+        default_probe_cutoff = max(8.0, 1.5 * float(np.max(cell_lengths)), 1.2 * float(np.max(cell_face_spacings)))
+        if extract_cutoff is None:
+            probe_cutoff = default_probe_cutoff
+        else:
+            probe_cutoff = float(extract_cutoff)
+        if probe_cutoff <= 0:
+            raise ValueError("extract_cutoff must be positive when provided.")
+
+        i, j, d, D = neighbor_list(
+            "ijdD",
+            atoms,
+            probe_cutoff,
+            self_interaction=False,
+        )
+        if d.size == 0:
+            raise ValueError("Could not detect any periodic neighbors in the reference cell.")
+
+        nearest = np.full(len(atoms), np.inf, dtype=np.float64)
+        np.minimum.at(nearest, i.astype(np.intp), d.astype(np.float64))
+        finite_nearest = nearest[np.isfinite(nearest)]
+        if finite_nearest.size == 0:
+            raise ValueError("Failed to infer nearest-neighbor distances from the reference cell.")
+        nearest_reference = float(np.median(finite_nearest))
+        if extract_cutoff is None:
+            probe_cutoff = min(default_probe_cutoff, max(3.8 * nearest_reference, nearest_reference + 2.0))
+            i, j, d, D = neighbor_list(
+                "ijdD",
+                atoms,
+                probe_cutoff,
+                self_interaction=False,
+            )
+
+        center_species = species_index[np.asarray(i, dtype=np.intp)]
+        neighbor_species = species_index[np.asarray(j, dtype=np.intp)]
+        pair_hard_min = np.zeros((num_species, num_species), dtype=np.float64)
+        pair_inner = np.zeros((num_species, num_species), dtype=np.float64)
+        pair_peak = np.zeros((num_species, num_species), dtype=np.float64)
+        pair_sigma = np.full((num_species, num_species), float(shell_hist_step), dtype=np.float64)
+        pair_outer = np.zeros((num_species, num_species), dtype=np.float64)
+        pair_mask = np.zeros((num_species, num_species), dtype=bool)
+
+        for species_a in range(num_species):
+            for species_b in range(species_a, num_species):
+                mask = (
+                    ((center_species == species_a) & (neighbor_species == species_b))
+                    | ((center_species == species_b) & (neighbor_species == species_a))
+                )
+                distances = np.asarray(d[mask], dtype=np.float64)
+                if distances.size == 0:
+                    continue
+                hard_min, r_inner, r_peak, sigma_r, r_outer = _infer_shell_window(
+                    distances,
+                    hist_step=float(shell_hist_step),
+                    smooth_sigma_bins=float(shell_smooth_sigma_bins),
+                )
+                pair_hard_min[species_a, species_b] = hard_min
+                pair_hard_min[species_b, species_a] = hard_min
+                pair_inner[species_a, species_b] = r_inner
+                pair_inner[species_b, species_a] = r_inner
+                pair_peak[species_a, species_b] = r_peak
+                pair_peak[species_b, species_a] = r_peak
+                pair_sigma[species_a, species_b] = sigma_r
+                pair_sigma[species_b, species_a] = sigma_r
+                pair_outer[species_a, species_b] = r_outer
+                pair_outer[species_b, species_a] = r_outer
+                pair_mask[species_a, species_b] = True
+                pair_mask[species_b, species_a] = True
+
+        coordination_target = np.zeros((num_species, num_species), dtype=np.float64)
+        coordination_std = np.zeros((num_species, num_species), dtype=np.float64)
+        for center_ind in range(num_species):
+            centers = np.flatnonzero(species_index == center_ind)
+            if centers.size == 0:
+                continue
+            for neigh_ind in range(num_species):
+                if not pair_mask[center_ind, neigh_ind]:
+                    continue
+                r_inner = pair_inner[center_ind, neigh_ind]
+                r_outer = pair_outer[center_ind, neigh_ind]
+                mask = (
+                    (center_species == center_ind)
+                    & (neighbor_species == neigh_ind)
+                    & (d >= r_inner)
+                    & (d <= r_outer)
+                )
+                counts = np.bincount(np.asarray(i[mask], dtype=np.intp), minlength=len(atoms))
+                centered_counts = counts[centers]
+                coordination_target[center_ind, neigh_ind] = float(np.mean(centered_counts))
+                coordination_std[center_ind, neigh_ind] = float(np.std(centered_counts))
+
+        angle_target = np.zeros((angle_index.shape[0], phi_num_bins), dtype=np.float64)
+        angle_pair_mass_target = np.zeros(angle_index.shape[0], dtype=np.float64)
+        angle_mode_deg = np.zeros(angle_index.shape[0], dtype=np.float64)
+        motif_center_species: list[int] = []
+        motif_neighbor_species: list[np.ndarray] = []
+        motif_neighbor_vectors: list[np.ndarray] = []
+
+        neighbors_by_center: list[dict[str, np.ndarray]] = []
+        for atom_index in range(len(atoms)):
+            mask = np.asarray(i, dtype=np.intp) == int(atom_index)
+            neighbors_by_center.append(
+                {
+                    "neighbor_index": np.asarray(j[mask], dtype=np.intp),
+                    "neighbor_species": neighbor_species[mask].astype(np.intp, copy=False),
+                    "vectors": np.asarray(D[mask], dtype=np.float64),
+                    "distance": np.asarray(d[mask], dtype=np.float64),
+                }
+            )
+
+        for center_atom in range(len(atoms)):
+            center_species_index = int(species_index[center_atom])
+            local = neighbors_by_center[center_atom]
+            if local["neighbor_index"].size == 0:
+                motif_center_species.append(center_species_index)
+                motif_neighbor_species.append(np.empty(0, dtype=np.intp))
+                motif_neighbor_vectors.append(np.empty((0, 3), dtype=np.float64))
+                continue
+
+            keep = np.zeros(local["neighbor_index"].shape[0], dtype=bool)
+            for neighbor_ind, neighbor_species_index in enumerate(local["neighbor_species"]):
+                if not pair_mask[center_species_index, int(neighbor_species_index)]:
+                    continue
+                radius = float(local["distance"][neighbor_ind])
+                keep[neighbor_ind] = (
+                    radius >= float(pair_inner[center_species_index, int(neighbor_species_index)])
+                    and radius <= float(pair_outer[center_species_index, int(neighbor_species_index)])
+                )
+            local_species = local["neighbor_species"][keep].astype(np.intp, copy=False)
+            local_vectors = local["vectors"][keep].astype(np.float64, copy=False)
+            if local_species.size:
+                radius = np.linalg.norm(local_vectors, axis=1)
+                order = np.lexsort(
+                    (
+                        local_vectors[:, 2],
+                        local_vectors[:, 1],
+                        local_vectors[:, 0],
+                        radius,
+                        local_species,
+                    )
+                )
+                local_species = local_species[order]
+                local_vectors = local_vectors[order]
+            motif_center_species.append(center_species_index)
+            motif_neighbor_species.append(np.array(local_species, dtype=np.intp, copy=True))
+            motif_neighbor_vectors.append(np.array(local_vectors, dtype=np.float64, copy=True))
+
+        for center_atom in range(len(atoms)):
+            center_species_index = int(species_index[center_atom])
+            local = neighbors_by_center[center_atom]
+            if local["neighbor_index"].size == 0:
+                continue
+            for triplet_index, (_, species_1, species_2) in enumerate(angle_index):
+                if angle_index[triplet_index, 0] != center_species_index:
+                    continue
+                inner_1 = pair_inner[center_species_index, species_1]
+                outer_1 = pair_outer[center_species_index, species_1]
+                inner_2 = pair_inner[center_species_index, species_2]
+                outer_2 = pair_outer[center_species_index, species_2]
+
+                mask_1 = (
+                    (local["neighbor_species"] == species_1)
+                    & (local["distance"] >= inner_1)
+                    & (local["distance"] <= outer_1)
+                )
+                mask_2 = (
+                    (local["neighbor_species"] == species_2)
+                    & (local["distance"] >= inner_2)
+                    & (local["distance"] <= outer_2)
+                )
+                if not np.any(mask_1) or not np.any(mask_2):
+                    continue
+
+                v1 = local["vectors"][mask_1]
+                v2 = local["vectors"][mask_2]
+                r1_sq = np.einsum("ij,ij->i", v1, v1)
+                r2_sq = np.einsum("ij,ij->i", v2, v2)
+                if species_1 == species_2:
+                    if v1.shape[0] < 2:
+                        continue
+                    dot = v1 @ v2.T
+                    denom = np.sqrt(np.maximum(r1_sq[:, None] * r2_sq[None, :], _EPS))
+                    cos_phi = np.clip(dot / denom, -1.0, 1.0)
+                    phi_bin = np.floor(np.arccos(cos_phi) / (phi_edges[1] - phi_edges[0])).astype(np.intp)
+                    np.clip(phi_bin, 0, phi_num_bins - 1, out=phi_bin)
+                    upper = np.triu_indices(phi_bin.shape[0], k=1)
+                    bins = phi_bin[upper]
+                else:
+                    dot = v1 @ v2.T
+                    denom = np.sqrt(np.maximum(r1_sq[:, None] * r2_sq[None, :], _EPS))
+                    cos_phi = np.clip(dot / denom, -1.0, 1.0)
+                    phi_bin = np.floor(np.arccos(cos_phi) / (phi_edges[1] - phi_edges[0])).astype(np.intp)
+                    np.clip(phi_bin, 0, phi_num_bins - 1, out=phi_bin)
+                    bins = phi_bin.ravel()
+                if bins.size == 0:
+                    continue
+                angle_target[triplet_index] += np.bincount(bins, minlength=phi_num_bins)
+                angle_pair_mass_target[triplet_index] += float(bins.size)
+
+        centers_per_species = np.bincount(species_index, minlength=num_species).astype(np.float64)
+        for triplet_index, (center_ind, _, _) in enumerate(angle_index):
+            mass = float(angle_pair_mass_target[triplet_index])
+            if mass > 0.0:
+                angle_target[triplet_index] /= mass
+            angle_pair_mass_target[triplet_index] = mass / max(float(centers_per_species[center_ind]), 1.0)
+            angle_mode_deg[triplet_index] = float(phi_deg[int(np.argmax(angle_target[triplet_index]))])
+
+        max_pair_outer = float(np.max(pair_outer[pair_mask])) if np.any(pair_mask) else 0.0
+        max_pair_outer_by_center = np.zeros(num_species, dtype=np.float64)
+        for center_ind in range(num_species):
+            row = pair_outer[center_ind][pair_mask[center_ind]]
+            max_pair_outer_by_center[center_ind] = float(np.max(row)) if row.size else 0.0
+
+        summary = {
+            "num_atoms": len(atoms),
+            "num_species": num_species,
+            "phi_num_bins": phi_num_bins,
+            "extract_cutoff": float(probe_cutoff),
+            "nearest_reference": nearest_reference,
+            "max_pair_outer": max_pair_outer,
+            "num_triplets": int(angle_index.shape[0]),
+            "num_motifs": int(len(motif_center_species)),
+        }
+
+        return cls(
+            atoms=atoms,
+            label=label or "coordination-shell-target",
+            species=species.astype(np.int64, copy=False),
+            species_labels=species_labels,
+            phi_num_bins=phi_num_bins,
+            phi_edges=phi_edges,
+            phi=phi,
+            phi_deg=phi_deg,
+            angle_index=angle_index,
+            angle_lookup=angle_lookup,
+            pair_hard_min=pair_hard_min,
+            pair_inner=pair_inner,
+            pair_peak=pair_peak,
+            pair_sigma=pair_sigma,
+            pair_outer=pair_outer,
+            pair_mask=pair_mask,
+            coordination_target=coordination_target,
+            coordination_std=coordination_std,
+            angle_target=angle_target,
+            angle_pair_mass_target=angle_pair_mass_target,
+            angle_mode_deg=angle_mode_deg,
+            motif_center_species=np.asarray(motif_center_species, dtype=np.intp),
+            motif_neighbor_species=tuple(motif_neighbor_species),
+            motif_neighbor_vectors=tuple(motif_neighbor_vectors),
+            max_pair_outer=max_pair_outer,
+            max_pair_outer_by_center=max_pair_outer_by_center,
+            summary=summary,
+        )
+
+    @property
+    def pair_labels(self) -> list[str]:
+        """Return human-readable pair labels."""
+        labels = []
+        for center_ind, center_label in enumerate(self.species_labels):
+            for neigh_ind, neigh_label in enumerate(self.species_labels):
+                if self.pair_mask[center_ind, neigh_ind]:
+                    labels.append(f"{center_label}-{neigh_label}")
+        return labels
+
+    @property
+    def angle_labels(self) -> list[str]:
+        """Return human-readable rooted angle labels."""
+        labels = []
+        for center_ind, neigh1_ind, neigh2_ind in self.angle_index:
+            labels.append(
+                f"{self.species_labels[neigh1_ind]}-{self.species_labels[center_ind]}-{self.species_labels[neigh2_ind]}"
+            )
+        return labels
