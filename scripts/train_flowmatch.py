@@ -15,7 +15,7 @@ from tricor.flowmatch import LitFlowMatch, FlowMatchDataModule
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Data
-DATA_DIR = "/path/to/25A_xyz_files/"   # directory of xyz/extxyz/vasp/cif files
+DATA_DIR = "/pscratch/sd/e/ehrdt/mcstructgen/smallcell/"   # directory of xyz/extxyz/vasp/cif files
 SPECIES = [7, 14]                       # atomic numbers (N, Si for Si3N4)
 CUTOFF = 5.0                            # graph construction cutoff (A)
 DUP = 128                               # noise replicas per structure
@@ -37,7 +37,7 @@ EMA_DECAY = 0.9999
 LR = 5e-4
 
 # Training
-MAX_EPOCHS = 5000
+MAX_EPOCHS = 100
 BATCH_SIZE = 16
 NUM_WORKERS = 0                          # 0 avoids pickle errors with Python 3.14
 GPUS = 1
