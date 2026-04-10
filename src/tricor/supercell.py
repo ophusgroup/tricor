@@ -350,76 +350,79 @@ class Supercell:
             else:
                 rotations[ig] = np.eye(3)  # unused
 
-        # --- tile reference crystal to fill the supercell ---
+        # --- tile reference crystal to fill the supercell (once) ---
         ref_cell = np.asarray(self.reference_atoms.cell.array, dtype=np.float64)
         ref_pos = self.reference_atoms.positions.copy()
         ref_numbers = self.reference_atoms.numbers.copy()
-        n_ref = len(ref_numbers)
 
         box_lengths = np.array(self.cell_dim_angstroms, dtype=np.float64)
         ref_lengths = np.linalg.norm(ref_cell, axis=1)
         ref_lengths = np.maximum(ref_lengths, _EPS)
-        n_reps = np.ceil((box_lengths + 2.0 * grain_radius) / ref_lengths).astype(int)
+        n_reps = np.ceil(box_lengths / ref_lengths).astype(int)
         n_reps = np.maximum(n_reps, 1)
 
         shifts = []
-        for ix in range(-n_reps[0], n_reps[0] + 1):
-            for iy in range(-n_reps[1], n_reps[1] + 1):
-                for iz in range(-n_reps[2], n_reps[2] + 1):
+        for ix in range(n_reps[0]):
+            for iy in range(n_reps[1]):
+                for iz in range(n_reps[2]):
                     shifts.append([ix, iy, iz])
         shifts = np.array(shifts, dtype=np.float64)
         shift_cart = shifts @ ref_cell
 
         tiled_pos = (ref_pos[None, :, :] + shift_cart[:, None, :]).reshape(-1, 3)
         tiled_numbers = np.tile(ref_numbers, len(shifts))
-        tiled_center = 0.5 * np.sum(ref_cell * n_reps[:, None], axis=0)
-        tiled_pos -= tiled_center
 
-        # --- fill crystalline Voronoi cells ---
-        all_positions: list[np.ndarray] = []
-        all_numbers: list[np.ndarray] = []
-        all_grain_ids: list[np.ndarray] = []
+        # Wrap into the supercell box
+        frac_tiled = tiled_pos @ cell_inv
+        frac_tiled %= 1.0
+        tiled_pos = frac_tiled @ cell_mat
 
+        # --- Voronoi assignment: find nearest seed for each tiled atom (once) ---
+        delta_all = tiled_pos[:, None, :] - seed_cart[None, :, :]  # (N, n_seeds, 3)
+        frac_delta = delta_all @ cell_inv
+        frac_delta -= np.rint(frac_delta)
+        cart_delta = frac_delta @ cell_mat
+        dist_sq = np.sum(cart_delta ** 2, axis=2)  # (N, n_seeds)
+        nearest_seed = np.argmin(dist_sq, axis=1)  # (N,)
+
+        # --- rotate crystalline cells, discard amorphous ones ---
+        in_crystalline = is_crystalline_cell[nearest_seed]
+        cryst_pos = tiled_pos[in_crystalline].copy()
+        cryst_numbers = tiled_numbers[in_crystalline].copy()
+        cryst_seeds = nearest_seed[in_crystalline]
+
+        # Apply per-grain rotation around each seed center
         for ig in range(n_seeds):
             if not is_crystalline_cell[ig]:
                 continue
-
-            # Rotate tiled block and translate to grain seed
-            rotated = tiled_pos @ rotations[ig].T
-            grain_pos = rotated + seed_cart[ig]
-
-            # Wrap into periodic box
-            frac = grain_pos @ cell_inv
-            frac %= 1.0
-            grain_pos = frac @ cell_mat
-
-            # Voronoi assignment: keep atoms nearest to this seed
-            delta_all = grain_pos[:, None, :] - seed_cart[None, :, :]
-            frac_delta = delta_all @ cell_inv
-            frac_delta -= np.rint(frac_delta)
-            cart_delta = frac_delta @ cell_mat
-            dist_sq = np.sum(cart_delta ** 2, axis=2)
-            nearest_seed = np.argmin(dist_sq, axis=1)
-
-            mask = nearest_seed == ig
-            if not np.any(mask):
+            mask_ig = cryst_seeds == ig
+            if not np.any(mask_ig):
                 continue
+            # Minimum-image displacement from seed
+            delta = cryst_pos[mask_ig] - seed_cart[ig]
+            frac_d = delta @ cell_inv
+            frac_d -= np.rint(frac_d)
+            delta = frac_d @ cell_mat
+            # Rotate and translate back
+            rotated = delta @ rotations[ig].T
+            cryst_pos[mask_ig] = seed_cart[ig] + rotated
 
-            all_positions.append(grain_pos[mask])
-            all_numbers.append(tiled_numbers[mask])
-            all_grain_ids.append(np.full(int(np.sum(mask)), ig, dtype=np.intp))
+        # Wrap rotated positions back into box
+        frac_c = cryst_pos @ cell_inv
+        frac_c %= 1.0
+        cryst_pos = frac_c @ cell_mat
+
+        all_positions: list[np.ndarray] = [cryst_pos]
+        all_numbers: list[np.ndarray] = [cryst_numbers]
+        all_grain_ids: list[np.ndarray] = [cryst_seeds.astype(np.intp)]
 
         # --- fill amorphous Voronoi cells with random positions ---
         if n_crystalline < n_seeds:
-            # Use volume fraction to determine amorphous atom count.
-            # (The raw grain atom count is inflated by tiling overshoot
-            # and will be trimmed by stoichiometry adjustment later.)
             amorphous_volume_fraction = (n_seeds - n_crystalline) / max(n_seeds, 1)
             n_amorphous_target = int(np.round(total_target * amorphous_volume_fraction))
 
             if n_amorphous_target > 0:
-                # Generate random positions, keep those in amorphous cells
-                # Over-sample to account for Voronoi filtering
+                # Over-sample random positions, keep those in amorphous cells
                 oversample = max(2, int(np.ceil(n_seeds / max(n_seeds - n_crystalline, 1))))
                 n_candidates = n_amorphous_target * oversample
                 cand_frac = self.rng.random((n_candidates, 3))
@@ -433,11 +436,9 @@ class Supercell:
                 dist_sq_c = np.sum(cart_delta_c ** 2, axis=2)
                 nearest_c = np.argmin(dist_sq_c, axis=1)
 
-                # Keep candidates in amorphous cells
                 in_amorphous = ~is_crystalline_cell[nearest_c]
                 amorphous_pos = cand_pos[in_amorphous]
 
-                # Trim to target count
                 if len(amorphous_pos) > n_amorphous_target:
                     amorphous_pos = amorphous_pos[:n_amorphous_target]
 
@@ -447,7 +448,6 @@ class Supercell:
                     species,
                     np.round(species_frac * len(amorphous_pos)).astype(int),
                 )
-                # Trim/pad to match positions
                 if len(amorphous_numbers) < len(amorphous_pos):
                     extra = np.repeat(species[0:1], len(amorphous_pos) - len(amorphous_numbers))
                     amorphous_numbers = np.concatenate([amorphous_numbers, extra])
@@ -458,7 +458,7 @@ class Supercell:
                 all_numbers.append(amorphous_numbers)
                 all_grain_ids.append(np.full(len(amorphous_pos), -1, dtype=np.intp))
 
-        if not all_positions:
+        if len(all_positions) == 0 or sum(len(p) for p in all_positions) == 0:
             return self._build_random_atoms()
 
         positions = np.concatenate(all_positions, axis=0)
