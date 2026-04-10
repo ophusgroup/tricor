@@ -126,6 +126,7 @@ class Supercell:
         self.shell_history: dict[str, np.ndarray] | None = None
         self.shell_relax_history: dict[str, np.ndarray] | None = None
         self._grain_ids: np.ndarray | None = None
+        self._grain_seeds: np.ndarray | None = None
         self.motif_history: dict[str, np.ndarray] | None = None
         self.motif_graph: dict[str, Any] | None = None
         self.best_score: float | None = None
@@ -350,7 +351,12 @@ class Supercell:
             else:
                 rotations[ig] = np.eye(3)  # unused
 
-        # --- tile reference crystal to fill the supercell (once) ---
+        # --- build rotated crystal tiling per grain ---
+        # Each crystalline grain gets its own rotated copy of the
+        # reference crystal, tiled just enough to cover the grain's
+        # Voronoi cell.  All grains' atoms are then collected and a
+        # single batched Voronoi assignment keeps only the atoms
+        # belonging to each grain.
         ref_cell = np.asarray(self.reference_atoms.cell.array, dtype=np.float64)
         ref_pos = self.reference_atoms.positions.copy()
         ref_numbers = self.reference_atoms.numbers.copy()
@@ -358,63 +364,70 @@ class Supercell:
         box_lengths = np.array(self.cell_dim_angstroms, dtype=np.float64)
         ref_lengths = np.linalg.norm(ref_cell, axis=1)
         ref_lengths = np.maximum(ref_lengths, _EPS)
-        n_reps = np.ceil(box_lengths / ref_lengths).astype(int)
+
+        # Tile enough to cover the largest possible Voronoi cell
+        # (upper bound: the full box, but for many grains each cell
+        # is much smaller).  We tile to cover grain_radius + buffer.
+        tile_radius = grain_radius + float(np.max(ref_lengths))
+        n_reps = np.ceil(tile_radius / ref_lengths).astype(int)
         n_reps = np.maximum(n_reps, 1)
 
         shifts = []
-        for ix in range(n_reps[0]):
-            for iy in range(n_reps[1]):
-                for iz in range(n_reps[2]):
+        for ix in range(-n_reps[0], n_reps[0] + 1):
+            for iy in range(-n_reps[1], n_reps[1] + 1):
+                for iz in range(-n_reps[2], n_reps[2] + 1):
                     shifts.append([ix, iy, iz])
         shifts = np.array(shifts, dtype=np.float64)
         shift_cart = shifts @ ref_cell
 
-        tiled_pos = (ref_pos[None, :, :] + shift_cart[:, None, :]).reshape(-1, 3)
-        tiled_numbers = np.tile(ref_numbers, len(shifts))
+        # Base tiled block centered at origin
+        base_pos = (ref_pos[None, :, :] + shift_cart[:, None, :]).reshape(-1, 3)
+        base_center = np.mean(base_pos, axis=0)
+        base_pos -= base_center
+        base_numbers = np.tile(ref_numbers, len(shifts))
 
-        # Wrap into the supercell box
-        frac_tiled = tiled_pos @ cell_inv
-        frac_tiled %= 1.0
-        tiled_pos = frac_tiled @ cell_mat
+        # For each crystalline grain: rotate, translate, wrap, collect
+        all_raw_pos: list[np.ndarray] = []
+        all_raw_numbers: list[np.ndarray] = []
+        all_raw_grain_ids: list[np.ndarray] = []
 
-        # --- Voronoi assignment: find nearest seed for each tiled atom (once) ---
-        delta_all = tiled_pos[:, None, :] - seed_cart[None, :, :]  # (N, n_seeds, 3)
-        frac_delta = delta_all @ cell_inv
-        frac_delta -= np.rint(frac_delta)
-        cart_delta = frac_delta @ cell_mat
-        dist_sq = np.sum(cart_delta ** 2, axis=2)  # (N, n_seeds)
-        nearest_seed = np.argmin(dist_sq, axis=1)  # (N,)
-
-        # --- rotate crystalline cells, discard amorphous ones ---
-        in_crystalline = is_crystalline_cell[nearest_seed]
-        cryst_pos = tiled_pos[in_crystalline].copy()
-        cryst_numbers = tiled_numbers[in_crystalline].copy()
-        cryst_seeds = nearest_seed[in_crystalline]
-
-        # Apply per-grain rotation around each seed center
         for ig in range(n_seeds):
             if not is_crystalline_cell[ig]:
                 continue
-            mask_ig = cryst_seeds == ig
-            if not np.any(mask_ig):
-                continue
-            # Minimum-image displacement from seed
-            delta = cryst_pos[mask_ig] - seed_cart[ig]
-            frac_d = delta @ cell_inv
-            frac_d -= np.rint(frac_d)
-            delta = frac_d @ cell_mat
-            # Rotate and translate back
-            rotated = delta @ rotations[ig].T
-            cryst_pos[mask_ig] = seed_cart[ig] + rotated
+            # Rotate the base block and place at seed
+            rotated = base_pos @ rotations[ig].T
+            grain_pos = rotated + seed_cart[ig]
+            # Wrap into periodic box
+            frac = grain_pos @ cell_inv
+            frac %= 1.0
+            grain_pos = frac @ cell_mat
+            all_raw_pos.append(grain_pos)
+            all_raw_numbers.append(base_numbers.copy())
+            all_raw_grain_ids.append(np.full(len(grain_pos), ig, dtype=np.intp))
 
-        # Wrap rotated positions back into box
-        frac_c = cryst_pos @ cell_inv
-        frac_c %= 1.0
-        cryst_pos = frac_c @ cell_mat
+        if not all_raw_pos:
+            all_positions: list[np.ndarray] = []
+            all_numbers: list[np.ndarray] = []
+            all_grain_ids: list[np.ndarray] = []
+        else:
+            # Concatenate all grain candidates
+            raw_pos = np.concatenate(all_raw_pos, axis=0)
+            raw_numbers = np.concatenate(all_raw_numbers, axis=0)
+            raw_gids = np.concatenate(all_raw_grain_ids, axis=0)
 
-        all_positions: list[np.ndarray] = [cryst_pos]
-        all_numbers: list[np.ndarray] = [cryst_numbers]
-        all_grain_ids: list[np.ndarray] = [cryst_seeds.astype(np.intp)]
+            # Single batched Voronoi assignment: keep each atom only
+            # if its grain's seed is the nearest seed.
+            delta_all = raw_pos[:, None, :] - seed_cart[None, :, :]
+            frac_delta = delta_all @ cell_inv
+            frac_delta -= np.rint(frac_delta)
+            cart_delta = frac_delta @ cell_mat
+            dist_sq = np.sum(cart_delta ** 2, axis=2)
+            nearest_seed = np.argmin(dist_sq, axis=1)
+
+            keep = nearest_seed == raw_gids
+            all_positions = [raw_pos[keep]]
+            all_numbers = [raw_numbers[keep]]
+            all_grain_ids = [raw_gids[keep]]
 
         # --- fill amorphous Voronoi cells with random positions ---
         if n_crystalline < n_seeds:
@@ -583,6 +596,7 @@ class Supercell:
         atoms.info["crystalline_fraction"] = crystalline_fraction
 
         self._grain_ids = final_grain_ids_arr
+        self._grain_seeds = seed_cart.copy()
         return atoms
 
     @staticmethod
@@ -4234,32 +4248,57 @@ class Supercell:
         nonbond_push[nonbond_push < _EPS] = float(np.max(pair_peak)) * 1.25
 
         # --- grain-aware force scaling ---
-        # When _grain_ids is set, interior atoms get reduced forces to
-        # preserve crystalline order; boundary atoms get full forces.
+        # When _grain_ids is set, interior atoms are frozen to preserve
+        # crystalline order; boundary atoms get full relaxation forces.
         grain_ids = self._grain_ids
-        if grain_ids is not None and len(grain_ids) == num_atoms:
-            # Boundary atoms: those near atoms from a different grain,
-            # or fill atoms (grain_id == -1).  We'll compute this during
-            # the first topology rebuild.
+        grain_seeds = self._grain_seeds
+        if (
+            grain_ids is not None
+            and grain_seeds is not None
+            and len(grain_ids) == num_atoms
+        ):
             is_boundary = np.ones(num_atoms, dtype=bool)  # start all boundary
             _grain_boundary_detected = [False]
 
             def _detect_boundary_atoms() -> None:
-                """Mark atoms as boundary if they have neighbors in other grains."""
+                """Mark atoms as boundary using distance to grain boundary.
+
+                For each atom, boundary_depth = half the gap between the
+                distance to the nearest foreign seed and the distance to
+                its own seed.  Atoms deep inside a grain (boundary_depth
+                > threshold) are interior; the rest are boundary.
+                """
                 if _grain_boundary_detected[0]:
                     return
                 _grain_boundary_detected[0] = True
-                boundary_cutoff = float(np.max(pair_peak)) * 2.0
-                bi, bj = neighbor_list("ij", self.atoms, boundary_cutoff)
-                # An atom is interior if all its neighbors share its grain
-                is_boundary[:] = grain_ids < 0  # fill atoms are always boundary
-                for k in range(len(bi)):
-                    if grain_ids[bi[k]] != grain_ids[bj[k]]:
-                        is_boundary[bi[k]] = True
-                        is_boundary[bj[k]] = True
 
-            # Force scale: 1.0 for boundary, small value for interior
-            interior_force_scale = 0.05
+                pos = self.atoms.positions
+                n_seeds = len(grain_seeds)
+                boundary_width = float(np.max(pair_peak)) * 0.5
+
+                # PBC distances from each atom to every seed
+                delta = pos[:, None, :] - grain_seeds[None, :, :]  # (N, n_seeds, 3)
+                frac_d = delta @ cell_inv
+                frac_d -= np.rint(frac_d)
+                cart_d = frac_d @ cell_mat
+                dist_to_seeds = np.sqrt(np.sum(cart_d ** 2, axis=2))  # (N, n_seeds)
+
+                is_boundary[:] = True  # default boundary
+                for ia in range(num_atoms):
+                    gid = grain_ids[ia]
+                    if gid < 0:
+                        continue  # amorphous fill → always boundary
+                    dist_own = dist_to_seeds[ia, gid]
+                    # Distance to nearest OTHER seed
+                    dists_copy = dist_to_seeds[ia].copy()
+                    dists_copy[gid] = np.inf
+                    dist_other = np.min(dists_copy)
+                    boundary_depth = (dist_other - dist_own) * 0.5
+                    if boundary_depth > boundary_width:
+                        is_boundary[ia] = False
+
+            # Interior atoms: forces zeroed completely (frozen)
+            interior_force_scale = 0.0
         else:
             grain_ids = None
             is_boundary = None
@@ -4554,11 +4593,12 @@ class Supercell:
 
             # ---------- integrate (skip on last step) ----------
             if step < num_steps:
-                # Scale down forces on interior (non-boundary) grain atoms
+                # Freeze interior grain atoms: zero force and velocity
                 if is_boundary is not None:
                     interior_mask = ~is_boundary
                     if np.any(interior_mask):
-                        force[interior_mask] *= interior_force_scale
+                        force[interior_mask] = 0.0
+                        velocity[interior_mask] = 0.0
 
                 force_mag = np.linalg.norm(force, axis=1)
                 clip_mask = force_mag > max_force_clip
@@ -4731,29 +4771,8 @@ class Supercell:
         pair_peak = np.asarray(shell_target.pair_peak, dtype=np.float64)
         pair_peak_max = float(np.max(pair_peak[pair_peak > _EPS])) if np.any(pair_peak > _EPS) else 2.5
         max_pair_outer = float(shell_target.max_pair_outer)
-
-        # --- auto-derive target_g3 from construction params ---
-        if grain_size is not None:
-            target_r_min = float(grain_size) * 0.5
-            target_r_max = target_r_min + float(grain_size) * 0.25
-        else:
-            target_r_min = max_pair_outer
-            target_r_max = target_r_min + 4.0
-
-        # Clamp to g3 grid range
         g3_r_max = float(self.measure_r_max)
-        target_r_max = min(target_r_max, g3_r_max - float(self.measure_r_step))
-        target_r_min = min(target_r_min, target_r_max - float(self.measure_r_step))
-
-        # Build target distribution from the raw measured g3
-        self.target_distribution = self._raw_distribution.target_g3(
-            target_r_min=target_r_min,
-            target_r_max=target_r_max,
-            r_sigma=r_broadening,
-            r_sigma_at=pair_peak_max,
-            phi_sigma_deg=phi_broadening,
-            label="target",
-        )
+        r_step = float(self.measure_r_step)
 
         # --- compute force weights from broadening ---
         auto_weights = self._broadening_to_weights(
@@ -4783,6 +4802,42 @@ class Supercell:
             )
             self._rebuild_spatial_index()
 
+        # --- auto-derive target_g3 from construction params ---
+        # For grains: use actual Voronoi cell sizes, not the requested
+        # grain_size (which may differ due to packing).
+        if use_grains and self._grain_ids is not None:
+            gids = self._grain_ids
+            cryst_gids = gids[gids >= 0]
+            if len(cryst_gids) > 0:
+                vals, cnts = np.unique(cryst_gids, return_counts=True)
+                ref_density = len(self.reference_atoms) / max(
+                    float(self.reference_atoms.cell.volume), _EPS,
+                )
+                grain_diams = 2.0 * np.cbrt(3.0 * cnts / ref_density / (4.0 * np.pi))
+                median_diam = float(np.median(grain_diams))
+                target_r_min = median_diam * 0.4
+                target_r_max = median_diam * 0.7
+            else:
+                target_r_min = max_pair_outer
+                target_r_max = target_r_min + 4.0
+        else:
+            target_r_min = max_pair_outer
+            target_r_max = target_r_min + 4.0
+
+        # Clamp to g3 grid range
+        target_r_max = min(target_r_max, g3_r_max - r_step)
+        target_r_min = min(target_r_min, target_r_max - r_step)
+
+        # Build target distribution from the raw measured g3
+        self.target_distribution = self._raw_distribution.target_g3(
+            target_r_min=target_r_min,
+            target_r_max=target_r_max,
+            r_sigma=r_broadening,
+            r_sigma_at=pair_peak_max,
+            phi_sigma_deg=phi_broadening,
+            label="target",
+        )
+
         # --- relax ---
         summary = self.shell_relax(
             shell_target,
@@ -4801,6 +4856,8 @@ class Supercell:
             summary["regime"] = "amorphous"
         summary["r_broadening"] = r_broadening
         summary["phi_broadening"] = phi_broadening
+        summary["target_r_min"] = target_r_min
+        summary["target_r_max"] = target_r_max
 
         return summary
 
