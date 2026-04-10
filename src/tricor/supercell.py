@@ -4704,8 +4704,8 @@ class Supercell:
         shell_target: "CoordinationShellTarget | None" = None,
         *,
         output: str | None = None,
-        width: int = 800,
-        height: int = 600,
+        width: int = 1024,
+        height: int = 1024,
         fps: int = 60,
         duration: float = 6.0,
         elevation: float = 15.0,
@@ -4924,21 +4924,22 @@ class Supercell:
             if np.any(bnd_mask):
                 segs_b = list(zip(bs_r[bnd_mask], be_r[bnd_mask]))
                 lc_b = Line3DCollection(
-                    segs_b, linewidths=0.5,
+                    segs_b, linewidths=0.3,
                     colors=(0.0, 0.0, 0.0, 0.05),
                 )
                 ax.add_collection3d(lc_b)
 
-            # --- crystalline bonds: thick, depth-coloured ---
-            # With view_init(elev, azim=0) matplotlib looks from +y.
-            # Large rotated-y = closer to camera = should be brighter.
+            # --- crystalline bonds: depth-coloured ---
+            # With view_init(elev, azim=0) matplotlib camera is at +x.
+            # Depth into screen = negative x after rotation.
+            # Larger rotated-x = closer to camera = brighter.
             if np.any(cryst_mask):
                 segs_cr = list(zip(bs_r[cryst_mask], be_r[cryst_mask]))
-                mid_y_rot = 0.5 * (bs_r[cryst_mask, 1] + be_r[cryst_mask, 1])
-                norm_y = (mid_y_rot + extent) / max(2.0 * extent, _EPS)
-                cryst_colors = cmap(np.clip(norm_y, 0, 1))
+                mid_x_rot = 0.5 * (bs_r[cryst_mask, 0] + be_r[cryst_mask, 0])
+                norm_depth = (mid_x_rot + extent) / max(2.0 * extent, _EPS)
+                cryst_colors = cmap(np.clip(norm_depth, 0, 1))
                 lc_c = Line3DCollection(
-                    segs_cr, linewidths=2.0, colors=cryst_colors,
+                    segs_cr, linewidths=1.2, colors=cryst_colors,
                 )
                 ax.add_collection3d(lc_c)
 
@@ -4963,13 +4964,15 @@ class Supercell:
                     edgecolors="none", depthshade=False,
                 )
 
-            ax.set_xlim(-extent, extent)
-            ax.set_ylim(-extent, extent)
-            ax.set_zlim(-extent, extent)
+            # Zoom: tighter limits to reduce whitespace
+            zoom = extent * 0.85
+            ax.set_xlim(-zoom, zoom)
+            ax.set_ylim(-zoom, zoom)
+            ax.set_zlim(-zoom, zoom)
             ax.set_box_aspect([1, 1, 1])
             ax.view_init(elev=elevation, azim=0)  # azim fixed; we rotate data
             ax.axis("off")
-            fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
+            fig.subplots_adjust(left=-0.15, right=1.15, bottom=-0.15, top=1.15)
             return fig
 
         # --- static display or animation ---
