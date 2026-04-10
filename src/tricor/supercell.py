@@ -4737,7 +4737,8 @@ class Supercell:
             First-shell targets.  Used to set *bond_cutoff* and the
             coordination number K automatically.
         output
-            File path for a ``.gif``.  ``None`` shows a static figure.
+            File path for a ``.mp4`` (recommended) or ``.gif``.
+            ``None`` shows a static figure.
         width, height
             Frame size in pixels.
         fps
@@ -4886,20 +4887,9 @@ class Supercell:
         # --- colormap for crystalline bonds (depth-coloured) ---
         cmap = plt.get_cmap(colormap)
 
-        # Pre-compute bond midpoint y-coordinate for colouring
-        # (y chosen to match MATLAB's depth axis after rotation)
         cryst_mask = bond_is_cryst
         bnd_mask = ~bond_is_cryst
-        cryst_mid_y = 0.5 * (bstart_c[cryst_mask, 1] + bend_c[cryst_mask, 1])
         extent = float(np.max(np.abs(pos_c))) * 1.15
-
-        # Normalise colour range
-        if len(cryst_mid_y) > 0:
-            y_min, y_max = float(cryst_mid_y.min()), float(cryst_mid_y.max())
-            if y_max - y_min < _EPS:
-                y_min, y_max = -extent, extent
-        else:
-            y_min, y_max = -extent, extent
 
         dpi = 100
         figsize = (width / dpi, height / dpi)
@@ -4940,12 +4930,12 @@ class Supercell:
                 ax.add_collection3d(lc_b)
 
             # --- crystalline bonds: thick, depth-coloured ---
-            # Colour by rotated y (depth): closer to viewer = brighter
+            # With view_init(elev, azim=0) matplotlib looks from +y.
+            # Large rotated-y = closer to camera = should be brighter.
             if np.any(cryst_mask):
                 segs_cr = list(zip(bs_r[cryst_mask], be_r[cryst_mask]))
                 mid_y_rot = 0.5 * (bs_r[cryst_mask, 1] + be_r[cryst_mask, 1])
-                # Flip: large y = far = dark, small y = close = bright
-                norm_y = 1.0 - (mid_y_rot - y_min) / max(y_max - y_min, _EPS)
+                norm_y = (mid_y_rot + extent) / max(2.0 * extent, _EPS)
                 cryst_colors = cmap(np.clip(norm_y, 0, 1))
                 lc_c = Line3DCollection(
                     segs_cr, linewidths=2.0, colors=cryst_colors,
@@ -4982,47 +4972,93 @@ class Supercell:
             fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
             return fig
 
-        # --- static display or GIF ---
+        # --- static display or animation ---
         if output is None:
             return _draw_frame(theta_rad=np.deg2rad(45.0))
 
-        # GIF: full 360-degree periodic rotation
+        # Full 360-degree periodic rotation
         n_frames = int(fps * duration)
         thetas = np.linspace(0, 2 * np.pi, n_frames, endpoint=False)
-
-        from PIL import Image
-        import io
 
         if show_progress:
             progress = _TextProgressBar(n_frames, label="Rendering", width=28)
         else:
             progress = None
 
-        frames: list[Image.Image] = []
-        for i, th in enumerate(thetas):
-            fig = _draw_frame(th)
-            buf = io.BytesIO()
-            fig.savefig(
-                buf, format="png", dpi=dpi,
-                bbox_inches="tight", pad_inches=0,
-                facecolor=background,
-            )
-            plt.close(fig)
-            buf.seek(0)
-            frames.append(Image.open(buf).copy())
-            buf.close()
-            if progress is not None:
-                progress.update(i + 1)
+        is_mp4 = str(output).lower().endswith(".mp4")
 
-        frame_duration_ms = int(1000 / fps)
-        frames[0].save(
-            output,
-            save_all=True,
-            append_images=frames[1:],
-            duration=frame_duration_ms,
-            loop=0,
-            optimize=True,
-        )
+        if is_mp4:
+            # MP4 via ffmpeg subprocess — true 60fps
+            import subprocess
+            import io
+
+            # Frame dimensions from figure size (no bbox_inches="tight"
+            # for the raw pipe — keeps pixel count deterministic).
+            fw, fh = width, height
+
+            ffmpeg_cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "rawvideo",
+                "-pix_fmt", "rgba",
+                "-s", f"{fw}x{fh}",
+                "-r", str(fps),
+                "-i", "pipe:0",
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-preset", "fast",
+                "-crf", "18",
+                str(output),
+            ]
+            proc = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+
+            for i, th in enumerate(thetas):
+                fig_i = _draw_frame(th)
+                buf_i = io.BytesIO()
+                fig_i.savefig(buf_i, format="raw", dpi=dpi,
+                              facecolor=background)
+                plt.close(fig_i)
+                proc.stdin.write(buf_i.getvalue())
+                if progress is not None:
+                    progress.update(i + 1)
+
+            proc.stdin.close()
+            proc.wait()
+        else:
+            # GIF fallback via Pillow
+            from PIL import Image
+            import io
+
+            frames: list[Image.Image] = []
+            for i, th in enumerate(thetas):
+                fig = _draw_frame(th)
+                buf = io.BytesIO()
+                fig.savefig(
+                    buf, format="png", dpi=dpi,
+                    bbox_inches="tight", pad_inches=0,
+                    facecolor=background,
+                )
+                plt.close(fig)
+                buf.seek(0)
+                frames.append(Image.open(buf).copy())
+                buf.close()
+                if progress is not None:
+                    progress.update(i + 1)
+
+            frame_duration_ms = int(1000 / fps)
+            frames[0].save(
+                output,
+                save_all=True,
+                append_images=frames[1:],
+                duration=frame_duration_ms,
+                loop=0,
+                optimize=True,
+            )
+
         if progress is not None:
             progress.update(n_frames)
         return output
