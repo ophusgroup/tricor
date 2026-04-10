@@ -4699,6 +4699,248 @@ class Supercell:
         fig.tight_layout()
         return fig, ax
 
+    def plot_structure(
+        self,
+        shell_target: "CoordinationShellTarget | None" = None,
+        *,
+        output: str | None = None,
+        width: int = 800,
+        height: int = 600,
+        fps: int = 60,
+        duration: float = 6.0,
+        rotation_speed: float = 60.0,
+        elevation: float = 15.0,
+        atom_size: float = 80.0,
+        bond_cutoff: float | None = None,
+        show_cell: bool = True,
+    ):
+        """Render a rotating 3D view of the atomic structure.
+
+        Draws atoms coloured by grain identity, nearest-neighbor bonds
+        (thin for amorphous/boundary, thick for crystalline interior),
+        and the periodic cell outline.
+
+        Parameters
+        ----------
+        shell_target
+            If provided, bonds are drawn up to ``pair_outer`` and
+            classified as crystalline (interior) vs amorphous.  Without
+            this, bonds are drawn up to *bond_cutoff* with uniform style.
+        output
+            File path for a ``.gif`` animation.  If ``None``, displays
+            a static matplotlib figure instead.
+        width, height
+            Frame size in pixels.
+        fps
+            Frames per second for the GIF.
+        duration
+            Total animation length in seconds.
+        rotation_speed
+            Degrees of azimuthal rotation per second.
+        elevation
+            Camera elevation angle in degrees.
+        atom_size
+            Marker size for atoms (matplotlib scatter units).
+        bond_cutoff
+            Maximum bond length in Angstrom.  Defaults to
+            ``shell_target.max_pair_outer`` or 3.0.
+        show_cell
+            Draw the periodic cell outline.
+        """
+        import matplotlib
+        import matplotlib.pyplot as plt
+        from matplotlib.collections import LineCollection
+        from mpl_toolkits.mplot3d.art3d import Line3DCollection
+
+        pos = self.atoms.positions.copy()
+        cell_mat = np.asarray(self.atoms.cell.array, dtype=np.float64)
+        cell_inv = np.linalg.inv(cell_mat)
+        num_atoms = len(self.atoms)
+
+        # --- bond cutoff ---
+        if bond_cutoff is None:
+            if shell_target is not None:
+                bond_cutoff = float(shell_target.max_pair_outer)
+            else:
+                bond_cutoff = 3.0
+
+        # --- find bonds ---
+        bi, bj, bd = neighbor_list("ijd", self.atoms, bond_cutoff)
+        # Keep only i < j to avoid duplicates
+        mask_ij = bi < bj
+        bi, bj, bd = bi[mask_ij], bj[mask_ij], bd[mask_ij]
+
+        # --- classify bonds: crystalline interior vs boundary/amorphous ---
+        grain_ids = self._grain_ids
+        grain_seeds = self._grain_seeds
+        is_interior = np.zeros(num_atoms, dtype=bool)
+
+        if grain_ids is not None and grain_seeds is not None and shell_target is not None:
+            pair_peak_max = float(np.max(
+                np.asarray(shell_target.pair_peak, dtype=np.float64),
+            ))
+            boundary_width = pair_peak_max * 0.5
+
+            # Compute boundary depth per atom
+            delta = pos[:, None, :] - grain_seeds[None, :, :]
+            frac_d = delta @ cell_inv
+            frac_d -= np.rint(frac_d)
+            cart_d = frac_d @ cell_mat
+            dist_to_seeds = np.sqrt(np.sum(cart_d ** 2, axis=2))
+
+            for ia in range(num_atoms):
+                gid = grain_ids[ia]
+                if gid < 0:
+                    continue
+                dist_own = dist_to_seeds[ia, gid]
+                dists_copy = dist_to_seeds[ia].copy()
+                dists_copy[gid] = np.inf
+                dist_other = float(np.min(dists_copy))
+                if (dist_other - dist_own) * 0.5 > boundary_width:
+                    is_interior[ia] = True
+
+        bond_is_cryst = is_interior[bi] & is_interior[bj]
+
+        # --- bond segments (minimum-image midpoints) ---
+        def _min_image(delta: np.ndarray) -> np.ndarray:
+            frac = delta @ cell_inv
+            frac -= np.rint(frac)
+            return frac @ cell_mat
+
+        bond_vecs = _min_image(pos[bj] - pos[bi])
+        bond_starts = pos[bi]
+        bond_ends = bond_starts + bond_vecs
+
+        # --- atom colours by grain ---
+        if grain_ids is not None:
+            unique_grains = np.unique(grain_ids[grain_ids >= 0])
+            n_colors = max(len(unique_grains), 1)
+            cmap = plt.cm.tab20
+            atom_colors = np.zeros((num_atoms, 4))
+            for idx, gid in enumerate(unique_grains):
+                mask = grain_ids == gid
+                atom_colors[mask] = cmap(idx % 20)
+            atom_colors[grain_ids < 0] = (0.5, 0.5, 0.5, 0.6)  # grey for amorphous
+        else:
+            atom_colors = np.full((num_atoms, 4), [0.3, 0.55, 0.85, 0.8])
+
+        # --- cell edges ---
+        o = np.zeros(3)
+        a, b, c = cell_mat[0], cell_mat[1], cell_mat[2]
+        cell_edges = [
+            (o, a), (o, b), (o, c),
+            (a, a + b), (a, a + c), (b, a + b), (b, b + c),
+            (c, a + c), (c, b + c),
+            (a + b, a + b + c), (a + c, a + b + c), (b + c, a + b + c),
+        ]
+
+        # --- center positions for better framing ---
+        center = 0.5 * (a + b + c)
+        pos_centered = pos - center
+        bond_starts_c = bond_starts - center
+        bond_ends_c = bond_ends - center
+        cell_edges_c = [(s - center, e - center) for s, e in cell_edges]
+
+        dpi = 100
+        figsize = (width / dpi, height / dpi)
+
+        def _draw_frame(azim: float) -> "plt.Figure":
+            fig = plt.figure(figsize=figsize, dpi=dpi)
+            ax = fig.add_subplot(111, projection="3d")
+            ax.set_facecolor("white")
+            fig.patch.set_facecolor("white")
+
+            # Bonds: thin grey for boundary, thicker coloured for crystalline
+            if len(bi) > 0:
+                # Boundary bonds
+                bnd_mask = ~bond_is_cryst
+                if np.any(bnd_mask):
+                    segs_b = list(zip(
+                        bond_starts_c[bnd_mask],
+                        bond_ends_c[bnd_mask],
+                    ))
+                    lc_b = Line3DCollection(
+                        segs_b, linewidths=0.3, colors=(0.6, 0.6, 0.6, 0.3),
+                    )
+                    ax.add_collection3d(lc_b)
+
+                # Crystalline bonds
+                cry_mask = bond_is_cryst
+                if np.any(cry_mask):
+                    segs_c = list(zip(
+                        bond_starts_c[cry_mask],
+                        bond_ends_c[cry_mask],
+                    ))
+                    lc_c = Line3DCollection(
+                        segs_c, linewidths=1.0, colors=(0.15, 0.15, 0.15, 0.7),
+                    )
+                    ax.add_collection3d(lc_c)
+
+            # Cell outline
+            if show_cell:
+                cell_segs = [(s, e) for s, e in cell_edges_c]
+                lc_cell = Line3DCollection(
+                    cell_segs, linewidths=1.2, colors="k", linestyles="--",
+                    alpha=0.4,
+                )
+                ax.add_collection3d(lc_cell)
+
+            # Atoms
+            ax.scatter(
+                pos_centered[:, 0],
+                pos_centered[:, 1],
+                pos_centered[:, 2],
+                s=atom_size,
+                c=atom_colors,
+                edgecolors="none",
+                depthshade=True,
+            )
+
+            # Axis limits
+            extent = float(np.max(np.abs(pos_centered))) * 1.15
+            ax.set_xlim(-extent, extent)
+            ax.set_ylim(-extent, extent)
+            ax.set_zlim(-extent, extent)
+            ax.set_box_aspect([1, 1, 1])
+            ax.view_init(elev=elevation, azim=azim)
+            ax.axis("off")
+            fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
+            return fig
+
+        # --- static display or GIF ---
+        if output is None:
+            fig = _draw_frame(azim=30.0)
+            return fig
+
+        # GIF output
+        n_frames = int(fps * duration)
+        azimuths = np.linspace(0, rotation_speed * duration, n_frames, endpoint=False)
+
+        from PIL import Image
+        import io
+
+        frames: list[Image.Image] = []
+        for i, az in enumerate(azimuths):
+            fig = _draw_frame(az)
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight",
+                        pad_inches=0, facecolor="white")
+            plt.close(fig)
+            buf.seek(0)
+            frames.append(Image.open(buf).copy())
+            buf.close()
+
+        frame_duration_ms = int(1000 / fps)
+        frames[0].save(
+            output,
+            save_all=True,
+            append_images=frames[1:],
+            duration=frame_duration_ms,
+            loop=0,
+            optimize=True,
+        )
+        return output
+
     def generate(
         self,
         shell_target: "CoordinationShellTarget",
