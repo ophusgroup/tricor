@@ -3417,12 +3417,21 @@ class Supercell:
         target_r_min = min(target_r_min, target_r_max - r_step)
 
         # Build target distribution from the raw measured g3.
-        # The target blur is scaled down from the force broadening:
-        # r_broadening controls force weights (large = loose springs)
-        # but the target g3 should show what the structure looks like,
-        # not the force balance.  Use a moderate fraction.
-        target_r_sigma = float(r_broadening) * 0.3 if (r_broadening is not None and r_broadening > _EPS) else None
-        target_phi_sigma = float(phi_broadening) * 0.3 if (phi_broadening is not None and phi_broadening > _EPS) else None
+        # The target blur must account for grain boundary disorder
+        # (which is always present regardless of broadening params).
+        # Minimum blur: inversely proportional to grain size — smaller
+        # grains have more boundary fraction, so more blur.
+        if use_grains:
+            # Boundary disorder contributes ~pair_peak/grain_size blur
+            boundary_blur_r = pair_peak_max * pair_peak_max / max(user_grain_size, pair_peak_max)
+            boundary_blur_phi = 15.0 * pair_peak_max / max(user_grain_size, pair_peak_max)
+            user_r = float(r_broadening) * 0.3 if (r_broadening is not None and r_broadening > _EPS) else 0.0
+            user_phi = float(phi_broadening) * 0.3 if (phi_broadening is not None and phi_broadening > _EPS) else 0.0
+            target_r_sigma = max(user_r, boundary_blur_r)
+            target_phi_sigma = max(user_phi, boundary_blur_phi)
+        else:
+            target_r_sigma = float(r_broadening) * 0.3 if (r_broadening is not None and r_broadening > _EPS) else None
+            target_phi_sigma = float(phi_broadening) * 0.3 if (phi_broadening is not None and phi_broadening > _EPS) else None
         self.target_distribution = self._raw_distribution.target_g3(
             target_r_min=target_r_min,
             target_r_max=target_r_max,
