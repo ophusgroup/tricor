@@ -348,12 +348,7 @@ class Supercell:
             else:
                 rotations[ig] = np.eye(3)  # unused
 
-        # --- build rotated crystal tiling per grain ---
-        # Each crystalline grain gets its own rotated copy of the
-        # reference crystal, tiled just enough to cover the grain's
-        # Voronoi cell.  All grains' atoms are then collected and a
-        # single batched Voronoi assignment keeps only the atoms
-        # belonging to each grain.
+        # --- tile reference crystal once to fill the box ---
         ref_cell = np.asarray(self.reference_atoms.cell.array, dtype=np.float64)
         ref_pos = self.reference_atoms.positions.copy()
         ref_numbers = self.reference_atoms.numbers.copy()
@@ -361,70 +356,77 @@ class Supercell:
         box_lengths = np.array(self.cell_dim_angstroms, dtype=np.float64)
         ref_lengths = np.linalg.norm(ref_cell, axis=1)
         ref_lengths = np.maximum(ref_lengths, _EPS)
-
-        # Tile enough to cover the largest possible Voronoi cell
-        # (upper bound: the full box, but for many grains each cell
-        # is much smaller).  We tile to cover grain_radius + buffer.
-        tile_radius = grain_radius + float(np.max(ref_lengths))
-        n_reps = np.ceil(tile_radius / ref_lengths).astype(int)
+        n_reps = np.ceil(box_lengths / ref_lengths).astype(int)
         n_reps = np.maximum(n_reps, 1)
 
         shifts = []
-        for ix in range(-n_reps[0], n_reps[0] + 1):
-            for iy in range(-n_reps[1], n_reps[1] + 1):
-                for iz in range(-n_reps[2], n_reps[2] + 1):
+        for ix in range(n_reps[0]):
+            for iy in range(n_reps[1]):
+                for iz in range(n_reps[2]):
                     shifts.append([ix, iy, iz])
         shifts = np.array(shifts, dtype=np.float64)
         shift_cart = shifts @ ref_cell
 
-        # Base tiled block centered at origin
-        base_pos = (ref_pos[None, :, :] + shift_cart[:, None, :]).reshape(-1, 3)
-        base_center = np.mean(base_pos, axis=0)
-        base_pos -= base_center
-        base_numbers = np.tile(ref_numbers, len(shifts))
+        tiled_pos = (ref_pos[None, :, :] + shift_cart[:, None, :]).reshape(-1, 3)
+        tiled_numbers = np.tile(ref_numbers, len(shifts))
 
-        # For each crystalline grain: rotate, translate, wrap, collect
-        all_raw_pos: list[np.ndarray] = []
-        all_raw_numbers: list[np.ndarray] = []
-        all_raw_grain_ids: list[np.ndarray] = []
+        # Wrap into supercell box
+        frac_tiled = tiled_pos @ cell_inv
+        frac_tiled %= 1.0
+        tiled_pos = frac_tiled @ cell_mat
+        n_tiled = len(tiled_pos)
 
+        # --- chunked Voronoi assignment ---
+        # For many seeds, the (n_atoms, n_seeds, 3) array can be huge.
+        # Process atoms in chunks to bound memory at ~100 MB.
+        max_chunk_elements = 25_000_000  # ~100 MB for float64 × 3
+        chunk_size = max(1, max_chunk_elements // max(n_seeds, 1))
+
+        def _chunked_voronoi(positions: np.ndarray) -> np.ndarray:
+            """Return nearest-seed index for each position, PBC-aware."""
+            n = len(positions)
+            nearest = np.empty(n, dtype=np.intp)
+            for start in range(0, n, chunk_size):
+                end = min(start + chunk_size, n)
+                delta = positions[start:end, None, :] - seed_cart[None, :, :]
+                frac_d = delta @ cell_inv
+                frac_d -= np.rint(frac_d)
+                cart_d = frac_d @ cell_mat
+                nearest[start:end] = np.argmin(
+                    np.sum(cart_d ** 2, axis=2), axis=1,
+                )
+            return nearest
+
+        # Assign each tiled atom to its nearest seed
+        nearest_seed = _chunked_voronoi(tiled_pos)
+
+        # Keep only atoms in crystalline cells
+        in_crystalline = is_crystalline_cell[nearest_seed]
+        cryst_pos = tiled_pos[in_crystalline].copy()
+        cryst_numbers = tiled_numbers[in_crystalline].copy()
+        cryst_seeds = nearest_seed[in_crystalline]
+
+        # Rotate each grain's atoms around its seed center
         for ig in range(n_seeds):
             if not is_crystalline_cell[ig]:
                 continue
-            # Rotate the base block and place at seed
-            rotated = base_pos @ rotations[ig].T
-            grain_pos = rotated + seed_cart[ig]
-            # Wrap into periodic box
-            frac = grain_pos @ cell_inv
-            frac %= 1.0
-            grain_pos = frac @ cell_mat
-            all_raw_pos.append(grain_pos)
-            all_raw_numbers.append(base_numbers.copy())
-            all_raw_grain_ids.append(np.full(len(grain_pos), ig, dtype=np.intp))
+            mask_ig = cryst_seeds == ig
+            if not np.any(mask_ig):
+                continue
+            delta = cryst_pos[mask_ig] - seed_cart[ig]
+            frac_d = delta @ cell_inv
+            frac_d -= np.rint(frac_d)
+            delta = frac_d @ cell_mat
+            cryst_pos[mask_ig] = seed_cart[ig] + delta @ rotations[ig].T
 
-        if not all_raw_pos:
-            all_positions: list[np.ndarray] = []
-            all_numbers: list[np.ndarray] = []
-            all_grain_ids: list[np.ndarray] = []
-        else:
-            # Concatenate all grain candidates
-            raw_pos = np.concatenate(all_raw_pos, axis=0)
-            raw_numbers = np.concatenate(all_raw_numbers, axis=0)
-            raw_gids = np.concatenate(all_raw_grain_ids, axis=0)
+        # Wrap rotated positions
+        frac_c = cryst_pos @ cell_inv
+        frac_c %= 1.0
+        cryst_pos = frac_c @ cell_mat
 
-            # Single batched Voronoi assignment: keep each atom only
-            # if its grain's seed is the nearest seed.
-            delta_all = raw_pos[:, None, :] - seed_cart[None, :, :]
-            frac_delta = delta_all @ cell_inv
-            frac_delta -= np.rint(frac_delta)
-            cart_delta = frac_delta @ cell_mat
-            dist_sq = np.sum(cart_delta ** 2, axis=2)
-            nearest_seed = np.argmin(dist_sq, axis=1)
-
-            keep = nearest_seed == raw_gids
-            all_positions = [raw_pos[keep]]
-            all_numbers = [raw_numbers[keep]]
-            all_grain_ids = [raw_gids[keep]]
+        all_positions: list[np.ndarray] = [cryst_pos]
+        all_numbers: list[np.ndarray] = [cryst_numbers]
+        all_grain_ids: list[np.ndarray] = [cryst_seeds.astype(np.intp)]
 
         # --- fill amorphous Voronoi cells with random positions ---
         if n_crystalline < n_seeds:
@@ -432,20 +434,12 @@ class Supercell:
             n_amorphous_target = int(np.round(total_target * amorphous_volume_fraction))
 
             if n_amorphous_target > 0:
-                # Over-sample random positions, keep those in amorphous cells
                 oversample = max(2, int(np.ceil(n_seeds / max(n_seeds - n_crystalline, 1))))
                 n_candidates = n_amorphous_target * oversample
                 cand_frac = self.rng.random((n_candidates, 3))
                 cand_pos = cand_frac @ cell_mat
 
-                # Assign candidates to nearest seed
-                delta_cand = cand_pos[:, None, :] - seed_cart[None, :, :]
-                frac_delta_c = delta_cand @ cell_inv
-                frac_delta_c -= np.rint(frac_delta_c)
-                cart_delta_c = frac_delta_c @ cell_mat
-                dist_sq_c = np.sum(cart_delta_c ** 2, axis=2)
-                nearest_c = np.argmin(dist_sq_c, axis=1)
-
+                nearest_c = _chunked_voronoi(cand_pos)
                 in_amorphous = ~is_crystalline_cell[nearest_c]
                 amorphous_pos = cand_pos[in_amorphous]
 
@@ -2487,29 +2481,32 @@ class Supercell:
                 _grain_boundary_detected[0] = True
 
                 pos = self.atoms.positions
-                n_seeds = len(grain_seeds)
+                n_seeds_local = len(grain_seeds)
                 boundary_width = float(np.max(pair_peak)) * 0.5
 
-                # PBC distances from each atom to every seed
-                delta = pos[:, None, :] - grain_seeds[None, :, :]  # (N, n_seeds, 3)
-                frac_d = delta @ cell_inv
-                frac_d -= np.rint(frac_d)
-                cart_d = frac_d @ cell_mat
-                dist_to_seeds = np.sqrt(np.sum(cart_d ** 2, axis=2))  # (N, n_seeds)
-
                 is_boundary[:] = True  # default boundary
-                for ia in range(num_atoms):
-                    gid = grain_ids[ia]
-                    if gid < 0:
-                        continue  # amorphous fill → always boundary
-                    dist_own = dist_to_seeds[ia, gid]
-                    # Distance to nearest OTHER seed
-                    dists_copy = dist_to_seeds[ia].copy()
-                    dists_copy[gid] = np.inf
-                    dist_other = np.min(dists_copy)
-                    boundary_depth = (dist_other - dist_own) * 0.5
-                    if boundary_depth > boundary_width:
-                        is_boundary[ia] = False
+
+                # Process in chunks to bound memory
+                _bchunk = max(1, 25_000_000 // max(n_seeds_local, 1))
+                for start in range(0, num_atoms, _bchunk):
+                    end = min(start + _bchunk, num_atoms)
+                    delta = pos[start:end, None, :] - grain_seeds[None, :, :]
+                    frac_d = delta @ cell_inv
+                    frac_d -= np.rint(frac_d)
+                    cart_d = frac_d @ cell_mat
+                    dist_chunk = np.sqrt(np.sum(cart_d ** 2, axis=2))
+
+                    for ia_local in range(end - start):
+                        ia = start + ia_local
+                        gid = grain_ids[ia]
+                        if gid < 0:
+                            continue
+                        dist_own = dist_chunk[ia_local, gid]
+                        dists_row = dist_chunk[ia_local].copy()
+                        dists_row[gid] = np.inf
+                        dist_other = float(np.min(dists_row))
+                        if (dist_other - dist_own) * 0.5 > boundary_width:
+                            is_boundary[ia] = False
 
             # Interior atoms: forces zeroed completely (frozen)
             interior_force_scale = 0.0
