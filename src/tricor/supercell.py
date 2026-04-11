@@ -470,11 +470,11 @@ class Supercell:
         grain_ids = np.concatenate(all_grain_ids, axis=0)
 
         # --- remove duplicate/overlapping atoms ---
-        # Use a hard minimum distance to detect overlaps
+        # Use the shell inner boundary as overlap threshold to prevent
+        # any bonds shorter than the physical minimum.
+        pair_inner_arr = np.asarray(shell_target.pair_inner, dtype=np.float64)
         pair_hard_min = np.asarray(shell_target.pair_hard_min, dtype=np.float64)
-        global_hard_min = float(np.min(pair_hard_min[pair_hard_min > _EPS])) if np.any(pair_hard_min > _EPS) else 0.5
-        # Use 80% of hard min as overlap threshold
-        overlap_thresh = global_hard_min * 0.8
+        overlap_thresh = float(np.max(np.maximum(pair_inner_arr, pair_hard_min)))
 
         # Build a temporary Atoms to use neighbor_list
         temp_atoms = Atoms(
@@ -2442,10 +2442,13 @@ class Supercell:
         # Repulsion radii: hard core (overlap prevention) and non-bonded
         # shell clearance (eliminates close-packed background).
         pair_outer = np.asarray(shell_target.pair_outer, dtype=np.float64)
-        hard_core = pair_hard_min.copy()
+        # Hard core: use max of pair_hard_min and pair_inner to
+        # prevent any bonds shorter than the shell inner boundary.
+        pair_inner = np.asarray(shell_target.pair_inner, dtype=np.float64)
+        hard_core = np.maximum(pair_hard_min, pair_inner)
         mask_zero = hard_core < _EPS
         hard_core[mask_zero] = 0.4 * pair_peak[mask_zero]
-        global_floor = float(np.min(pair_peak[pair_peak > _EPS])) * 0.35 if np.any(pair_peak > _EPS) else 1.0
+        global_floor = float(np.min(pair_peak[pair_peak > _EPS])) * 0.4 if np.any(pair_peak > _EPS) else 1.0
         hard_core[hard_core < _EPS] = global_floor
         # Non-bonded atoms are pushed beyond this radius to create a
         # clean gap between the first and second coordination shells.
@@ -2764,7 +2767,9 @@ class Supercell:
                 hard_ratio = r_hard / r_safe
                 hard_mask = hard_ratio > 1.0
                 hard_mag = np.zeros_like(r_safe)
-                hard_mag[hard_mask] = repulsion_weight * 2.0 * (hard_ratio[hard_mask] - 1.0) ** 2
+                # Strong hard core: linear + quadratic for stiff wall
+                hr = hard_ratio[hard_mask] - 1.0
+                hard_mag[hard_mask] = repulsion_weight * 4.0 * (hr + hr ** 2)
 
                 # b) Non-bonded clearance
                 _pair_keys = rep_i_all.astype(np.int64) * num_atoms + rep_j_all.astype(np.int64)
