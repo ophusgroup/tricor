@@ -3402,13 +3402,16 @@ class Supercell:
             self._rebuild_spatial_index()
 
         # --- auto-derive target_g3 from construction params ---
+        # target_r_min: where crystalline→random transition STARTS
+        # target_r_max: where it's fully random
+        # Both must be > max_pair_outer (never blend within 1st shell).
         if use_grains:
-            # Use the user's requested grain_size for the target
-            # (not the inflated construction size)
-            target_r_min = user_grain_size * 0.4
-            target_r_max = user_grain_size * 0.7
+            # Crystalline order preserved out to ~half the grain diameter,
+            # then smooth transition. Floor at 1st shell boundary + buffer.
+            target_r_min = max(user_grain_size * 0.4, max_pair_outer + 1.0)
+            target_r_max = max(user_grain_size * 0.7, target_r_min + 2.0)
         else:
-            # No grains: only 1st shell is enforced, tight fade to random
+            # No grains: only 1st shell, tight fade
             target_r_min = max_pair_outer
             target_r_max = target_r_min + 1.5
 
