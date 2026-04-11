@@ -3363,15 +3363,27 @@ class Supercell:
         for key, val in auto_weights.items():
             shell_relax_kwargs.setdefault(key, val)
 
-        # --- construct atoms ---
+        # --- enforce minimum grain size ---
+        # Multi-shell order requires grains large enough to contain
+        # complete 2nd/3rd coordination shells plus a boundary buffer.
         use_grains = grain_size is not None and float(grain_size) > 0.0
+        user_grain_size = float(grain_size) if use_grains else 0.0
 
         if use_grains:
+            second_shell_est = max_pair_outer * 1.4
+            min_grain_size = 2.0 * (second_shell_est + pair_peak_max)
+            grain_size_clamped = max(float(grain_size), min_grain_size)
+
+            # Inflate to compensate for boundary disorder:
+            # effective crystalline core ≈ construction_size - 2*boundary_loss
+            boundary_loss = pair_peak_max * 1.5
+            construction_grain_size = grain_size_clamped + 2.0 * boundary_loss
+
             disp_sigma = float(r_broadening) if (r_broadening is not None and r_broadening > _EPS) else 0.0
 
             self.atoms = self._build_grain_atoms(
                 shell_target,
-                grain_size=float(grain_size),
+                grain_size=construction_grain_size,
                 crystalline_fraction=crystalline_fraction,
                 displacement_sigma=disp_sigma,
             )
@@ -3385,26 +3397,15 @@ class Supercell:
             self._rebuild_spatial_index()
 
         # --- auto-derive target_g3 from construction params ---
-        # For grains: use actual Voronoi cell sizes, not the requested
-        # grain_size (which may differ due to packing).
-        if use_grains and self._grain_ids is not None:
-            gids = self._grain_ids
-            cryst_gids = gids[gids >= 0]
-            if len(cryst_gids) > 0:
-                vals, cnts = np.unique(cryst_gids, return_counts=True)
-                ref_density = len(self.reference_atoms) / max(
-                    float(self.reference_atoms.cell.volume), _EPS,
-                )
-                grain_diams = 2.0 * np.cbrt(3.0 * cnts / ref_density / (4.0 * np.pi))
-                median_diam = float(np.median(grain_diams))
-                target_r_min = median_diam * 0.4
-                target_r_max = median_diam * 0.7
-            else:
-                target_r_min = max_pair_outer
-                target_r_max = target_r_min + 4.0
+        if use_grains:
+            # Use the user's requested grain_size for the target
+            # (not the inflated construction size)
+            target_r_min = user_grain_size * 0.4
+            target_r_max = user_grain_size * 0.7
         else:
+            # No grains: only 1st shell is enforced, tight fade to random
             target_r_min = max_pair_outer
-            target_r_max = target_r_min + 4.0
+            target_r_max = target_r_min + 1.5
 
         # Clamp to g3 grid range
         target_r_max = min(target_r_max, g3_r_max - r_step)
@@ -3432,7 +3433,8 @@ class Supercell:
         if use_grains:
             summary["regime"] = "nanocrystalline" if crystalline_fraction >= 0.9 else "mixed"
             summary["n_grains"] = int(self.atoms.info.get("n_grains", 0))
-            summary["grain_size"] = float(grain_size)
+            summary["grain_size"] = user_grain_size
+            summary["construction_grain_size"] = construction_grain_size
             summary["crystalline_fraction"] = crystalline_fraction
         else:
             summary["regime"] = "amorphous"
