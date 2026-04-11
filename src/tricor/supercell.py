@@ -2369,7 +2369,7 @@ class Supercell:
         *,
         bond_weight: float = 1.0,
         angle_weight: float = 0.5,
-        repulsion_weight: float = 2.0,
+        repulsion_weight: float = 3.0,
         step_size: float = 0.1,
         step_decay: float = 0.995,
         neighbor_update_interval: int = 10,
@@ -2448,12 +2448,12 @@ class Supercell:
         global_floor = float(np.min(pair_peak[pair_peak > _EPS])) * 0.35 if np.any(pair_peak > _EPS) else 1.0
         hard_core[hard_core < _EPS] = global_floor
         # Non-bonded atoms are pushed beyond this radius to create a
-        # gap between the first and second coordination shells.  The
-        # scale is modest (1.25x peak) to avoid fighting the density
-        # constraint — even a small gap eliminates the close-packed
-        # angular background in g3.
-        nonbond_push = pair_peak * 1.25
-        nonbond_push[nonbond_push < _EPS] = float(np.max(pair_peak)) * 1.25
+        # clean gap between the first and second coordination shells.
+        # For Si, 2nd shell is at ~3.84Å (sqrt(8/3) * pair_peak).
+        # Push non-bonded atoms to at least 1.5x pair_peak to
+        # eliminate close-packed triplets from nearby non-bonded pairs.
+        nonbond_push = pair_peak * 1.5
+        nonbond_push[nonbond_push < _EPS] = float(np.max(pair_peak)) * 1.5
 
         # --- grain-aware force scaling ---
         # When _grain_ids is set, interior atoms are frozen to preserve
@@ -2778,9 +2778,9 @@ class Supercell:
                 push_ratio = r_push / r_safe
                 nonbond_mask = (~is_bonded) & (push_ratio > 1.0)
                 nonbond_mag = np.zeros_like(r_safe)
-                nonbond_mag[nonbond_mask] = (
-                    repulsion_weight * (push_ratio[nonbond_mask] - 1.0) ** 2
-                )
+                # Linear + quadratic: strong near boundary, stronger close in
+                pr = push_ratio[nonbond_mask] - 1.0
+                nonbond_mag[nonbond_mask] = repulsion_weight * (pr + pr ** 2)
 
                 total_rep_mag = hard_mag + nonbond_mag
                 active = total_rep_mag > 0.0
@@ -3411,13 +3411,19 @@ class Supercell:
         target_r_max = min(target_r_max, g3_r_max - r_step)
         target_r_min = min(target_r_min, target_r_max - r_step)
 
-        # Build target distribution from the raw measured g3
+        # Build target distribution from the raw measured g3.
+        # The target blur is scaled down from the force broadening:
+        # r_broadening controls force weights (large = loose springs)
+        # but the target g3 should show what the structure looks like,
+        # not the force balance.  Use a moderate fraction.
+        target_r_sigma = float(r_broadening) * 0.3 if (r_broadening is not None and r_broadening > _EPS) else None
+        target_phi_sigma = float(phi_broadening) * 0.3 if (phi_broadening is not None and phi_broadening > _EPS) else None
         self.target_distribution = self._raw_distribution.target_g3(
             target_r_min=target_r_min,
             target_r_max=target_r_max,
-            r_sigma=r_broadening,
+            r_sigma=target_r_sigma,
             r_sigma_at=pair_peak_max,
-            phi_sigma_deg=phi_broadening,
+            phi_sigma_deg=target_phi_sigma,
             label="target",
         )
 
