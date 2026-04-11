@@ -3422,9 +3422,9 @@ class Supercell:
         # Minimum blur: inversely proportional to grain size — smaller
         # grains have more boundary fraction, so more blur.
         if use_grains:
-            # Boundary disorder contributes ~pair_peak/grain_size blur
-            boundary_blur_r = pair_peak_max * pair_peak_max / max(user_grain_size, pair_peak_max)
-            boundary_blur_phi = 15.0 * pair_peak_max / max(user_grain_size, pair_peak_max)
+            # Boundary disorder: gentle minimum blur, mostly angular
+            boundary_blur_r = 0.15 * pair_peak_max / max(user_grain_size, pair_peak_max)
+            boundary_blur_phi = 10.0 * pair_peak_max / max(user_grain_size, pair_peak_max)
             user_r = float(r_broadening) * 0.3 if (r_broadening is not None and r_broadening > _EPS) else 0.0
             user_phi = float(phi_broadening) * 0.3 if (phi_broadening is not None and phi_broadening > _EPS) else 0.0
             target_r_sigma = max(user_r, boundary_blur_r)
