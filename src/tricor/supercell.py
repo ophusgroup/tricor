@@ -3375,13 +3375,12 @@ class Supercell:
         user_grain_size = float(grain_size) if use_grains else 0.0
 
         if use_grains:
-            second_shell_est = max_pair_outer * 1.4
-            min_grain_size = 2.0 * (second_shell_est + pair_peak_max)
+            # Minimum grain size: must fit at least 1st NN shell
+            min_grain_size = pair_peak_max * 3.0
             grain_size_clamped = max(float(grain_size), min_grain_size)
 
-            # Inflate to compensate for boundary disorder:
-            # effective crystalline core ≈ construction_size - 2*boundary_loss
-            boundary_loss = pair_peak_max * 1.5
+            # Modest inflation to compensate for boundary disorder
+            boundary_loss = pair_peak_max * 0.75
             construction_grain_size = grain_size_clamped + 2.0 * boundary_loss
 
             disp_sigma = float(r_broadening) if (r_broadening is not None and r_broadening > _EPS) else 0.0
