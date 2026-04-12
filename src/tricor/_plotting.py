@@ -15,6 +15,27 @@ if TYPE_CHECKING:
 class _PlottingMixin:
     """Plotting methods extracted from Supercell."""
 
+    def plot_g3(
+        self: "Supercell",
+        pair: int | str = 0,
+        *,
+        normalize: bool = True,
+    ):
+        """Return an interactive explorer for the supercell's measured g3.
+
+        Measures the current supercell (if not already cached) and
+        displays the result using :meth:`G3Distribution.plot_g3`.
+
+        Parameters
+        ----------
+        pair
+            Triplet index or label (e.g. ``0`` or ``"Si-Si-Si"``).
+        normalize
+            If ``True``, display the reduced (density-normalised) g3.
+        """
+        dist = self.measure_g3(show_progress=True)
+        return dist.plot_g3(pair=pair, normalize=normalize)
+
     def plot_g3_compare(
         self: "Supercell",
         pair: int | str = 0,

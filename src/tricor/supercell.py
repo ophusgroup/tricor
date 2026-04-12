@@ -123,7 +123,6 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
             raise ValueError("spatial_bin_size must be positive.")
 
         self.reference_atoms = self.target_distribution.atoms.copy()
-        self._raw_distribution: G3Distribution = self.target_distribution
         self.atoms = self._build_random_atoms()
         self.current_distribution: G3Distribution | None = None
         self.mc_history: dict[str, np.ndarray] | None = None
@@ -296,6 +295,39 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
     # generate: unified structure generation
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Recommended presets for Si (diamond cubic)
+    # ------------------------------------------------------------------
+
+    PRESETS: dict[str, dict[str, Any]] = {
+        "liquid": dict(
+            grain_size=None, bond_weight=1.0, angle_weight=0.12,
+            relative_density=0.86, num_steps=80,
+        ),
+        "amorphous": dict(
+            grain_size=4.0, bond_weight=1.5, angle_weight=0.3,
+            relative_density=0.88,
+        ),
+        "diamond_glass": dict(
+            grain_size=8.0, bond_weight=2.0, angle_weight=1.0,
+            relative_density=0.90,
+        ),
+        "SRO": dict(
+            grain_size=12.0, crystalline_fraction=0.5,
+            bond_weight=2.0, angle_weight=0.6,
+            relative_density=0.92,
+        ),
+        "mixed": dict(
+            grain_size=18.0, crystalline_fraction=0.5,
+            bond_weight=2.5, angle_weight=1.0,
+            relative_density=0.94,
+        ),
+        "nanocrystalline": dict(
+            grain_size=25.0, bond_weight=3.0, angle_weight=1.5,
+            relative_density=0.96,
+        ),
+    }
+
     def generate(
         self,
         shell_target: "CoordinationShellTarget",
@@ -303,29 +335,17 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         *,
         grain_size: float | None = None,
         crystalline_fraction: float = 1.0,
-        r_broadening: float | None = None,
-        phi_broadening: float | None = None,
+        bond_weight: float = 1.0,
+        angle_weight: float = 0.5,
+        displacement_sigma: float = 0.0,
         show_progress: bool = True,
         **shell_relax_kwargs: Any,
     ) -> dict[str, Any]:
         """Generate a disordered supercell from liquid to nanocrystalline.
 
-        Covers the full spectrum of disorder:
-
-        * **Liquid** — ``grain_size=None, phi_broadening=25``:
-          only nearest-neighbor distances enforced, angles loosely constrained.
-        * **Amorphous** — ``grain_size=4, r_broadening=0.2, phi_broadening=12``:
-          short-range order with tunable distance and angle sharpness.
-        * **Short-range order** — ``grain_size=12, crystalline_fraction=0.5``:
-          small crystalline clusters in an amorphous matrix.
-        * **Mixed** — ``grain_size=18, crystalline_fraction=0.5``:
-          50 % crystalline grains, 50 % amorphous fill.
-        * **Nanocrystalline** — ``grain_size=25, crystalline_fraction=1.0``:
-          grains fill the entire box with thin disordered boundaries.
-
-        Also builds a matching *target_g3* distribution (auto-derived
-        from the construction parameters) and stores it on
-        :attr:`target_distribution` for use with :meth:`plot_g3_compare`.
+        Covers the full spectrum of disorder by combining Voronoi grain
+        construction with spring-network relaxation.  See
+        :attr:`PRESETS` for recommended parameter sets for Si.
 
         Parameters
         ----------
@@ -335,51 +355,37 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
             Number of relaxation sweeps.
         grain_size
             Diameter of crystalline grains in Angstrom.  ``None`` means
-            no grains — start from random positions (amorphous/liquid).
+            no grains — start from random positions (liquid/amorphous).
         crystalline_fraction
             Volume fraction filled by crystalline grains (0–1).  Only
             used when *grain_size* is set.  The remaining volume is
             filled with random (amorphous) positions.
-        r_broadening
-            Radial disorder σ in Angstrom at the nearest-neighbor
-            distance.  Controls how tightly bond lengths are enforced.
-            ``None`` uses a default.  Larger values → more distance
-            freedom.  Also sets the radial blur for the target g3.
-        phi_broadening
-            Angular disorder σ in degrees.  Controls how tightly bond
-            angles are enforced.  ``None`` uses a default.  180 means
-            angles are essentially free (liquid-like).  Small values
-            (e.g. 3) enforce sharp tetrahedral angles (diamond-like).
-            Also sets the angular blur for the target g3.
+        bond_weight
+            Harmonic spring strength pulling bonded neighbours toward
+            the target bond distance.  Larger = tighter distances.
+        angle_weight
+            Spring strength pushing bond angles toward the target angle.
+            Larger = tighter angles.  Near-zero = liquid-like freedom.
+        displacement_sigma
+            Gaussian displacement (Angstrom) applied to atoms within
+            crystalline grains as thermal broadening.  0 = no jitter.
         show_progress
             Display a text progress bar.
         **shell_relax_kwargs
-            Additional keyword arguments forwarded to :meth:`shell_relax`.
-            Explicit ``bond_weight`` / ``angle_weight`` override the
-            auto-derived values from broadening parameters.
+            Additional keyword arguments forwarded to :meth:`shell_relax`
+            (e.g. ``repulsion_weight``, ``step_size``, ``num_steps``).
 
         Returns
         -------
         dict[str, Any]
-            Summary dict with regime, loss values, and construction
-            parameters.
+            Summary dict with regime, construction parameters, and
+            relaxation loss values.
         """
         pair_peak = np.asarray(shell_target.pair_peak, dtype=np.float64)
         pair_peak_max = float(np.max(pair_peak[pair_peak > _EPS])) if np.any(pair_peak > _EPS) else 2.5
-        max_pair_outer = float(shell_target.max_pair_outer)
-        g3_r_max = float(self.measure_r_max)
-        r_step = float(self.measure_r_step)
 
-        # --- compute force weights from broadening ---
-        auto_weights = self._broadening_to_weights(
-            pair_peak_max, r_broadening, phi_broadening,
-        )
-        for key, val in auto_weights.items():
-            shell_relax_kwargs.setdefault(key, val)
-
-        # --- enforce minimum grain size ---
+        # --- construct atoms ---
         use_grains = grain_size is not None and float(grain_size) > 0.0
-        user_grain_size = float(grain_size) if use_grains else 0.0
 
         if use_grains:
             min_grain_size = pair_peak_max * 3.0
@@ -388,13 +394,11 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
             boundary_loss = pair_peak_max * 0.75
             construction_grain_size = grain_size_clamped + 2.0 * boundary_loss
 
-            disp_sigma = float(r_broadening) if (r_broadening is not None and r_broadening > _EPS) else 0.0
-
             self.atoms = self._build_grain_atoms(
                 shell_target,
                 grain_size=construction_grain_size,
                 crystalline_fraction=crystalline_fraction,
-                displacement_sigma=disp_sigma,
+                displacement_sigma=displacement_sigma,
             )
 
             # Refresh cached arrays after rebuilding atoms
@@ -405,42 +409,12 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
             )
             self._rebuild_spatial_index()
 
-        # --- auto-derive target_g3 from construction params ---
-        if use_grains:
-            target_r_min = max(user_grain_size * 0.4, max_pair_outer + 1.0)
-            target_r_max = max(user_grain_size * 0.7, target_r_min + 2.0)
-        else:
-            target_r_min = max_pair_outer
-            target_r_max = target_r_min + 1.5
-
-        # Clamp to g3 grid range
-        target_r_max = min(target_r_max, g3_r_max - r_step)
-        target_r_min = min(target_r_min, target_r_max - r_step)
-
-        # Build target distribution with boundary-aware blur
-        if use_grains:
-            boundary_blur_r = 0.15 * pair_peak_max / max(user_grain_size, pair_peak_max)
-            boundary_blur_phi = 10.0 * pair_peak_max / max(user_grain_size, pair_peak_max)
-            user_r = float(r_broadening) * 0.3 if (r_broadening is not None and r_broadening > _EPS) else 0.0
-            user_phi = float(phi_broadening) * 0.3 if (phi_broadening is not None and phi_broadening > _EPS) else 0.0
-            target_r_sigma = max(user_r, boundary_blur_r)
-            target_phi_sigma = max(user_phi, boundary_blur_phi)
-        else:
-            target_r_sigma = float(r_broadening) * 0.3 if (r_broadening is not None and r_broadening > _EPS) else None
-            target_phi_sigma = float(phi_broadening) * 0.3 if (phi_broadening is not None and phi_broadening > _EPS) else None
-        self.target_distribution = self._raw_distribution.target_g3(
-            target_r_min=target_r_min,
-            target_r_max=target_r_max,
-            r_sigma=target_r_sigma,
-            r_sigma_at=pair_peak_max,
-            phi_sigma_deg=target_phi_sigma,
-            label="target",
-        )
-
         # --- relax ---
         summary = self.shell_relax(
             shell_target,
             num_steps=num_steps,
+            bond_weight=bond_weight,
+            angle_weight=angle_weight,
             show_progress=show_progress,
             **shell_relax_kwargs,
         )
@@ -449,15 +423,11 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         if use_grains:
             summary["regime"] = "nanocrystalline" if crystalline_fraction >= 0.9 else "mixed"
             summary["n_grains"] = int(self.atoms.info.get("n_grains", 0))
-            summary["grain_size"] = user_grain_size
+            summary["grain_size"] = float(grain_size)
             summary["construction_grain_size"] = construction_grain_size
             summary["crystalline_fraction"] = crystalline_fraction
         else:
             summary["regime"] = "amorphous"
-        summary["r_broadening"] = r_broadening
-        summary["phi_broadening"] = phi_broadening
-        summary["target_r_min"] = target_r_min
-        summary["target_r_max"] = target_r_max
 
         return summary
 
