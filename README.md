@@ -8,7 +8,7 @@ Generate disordered atomic supercells guided by three-body (g3) distributions, s
 uv sync
 ```
 
-## Quick start
+## Quick start — Si (single species)
 
 ```python
 from ase.build import bulk
@@ -18,7 +18,37 @@ import tricor as tc
 atoms = bulk('Si', 'diamond', a=5.431)
 shell_target = tc.CoordinationShellTarget.from_atoms(atoms, phi_num_bins=90)
 
-# Create supercell and generate structure
+# Create supercell and generate nanocrystalline structure
+cell = tc.Supercell.from_atoms(
+    atoms,
+    cell_dim_angstroms=(40, 40, 40),
+    r_max=10,
+    r_step=0.1,
+    phi_num_bins=90,
+    relative_density=0.96,
+    rng_seed=42,
+)
+cell.generate(
+    shell_target,
+    grain_size=25.0,
+    bond_weight=3.0,
+    angle_weight=1.5,
+)
+
+# Measure and view the g3 distribution
+cell.measure_g3()
+cell.plot_g3()
+
+# 3D rotating movie
+cell.plot_structure(shell_target, output='structure.mp4')
+```
+
+## Quick start — SiC (binary)
+
+```python
+atoms = bulk('SiC', 'zincblende', a=4.36)
+shell_target = tc.CoordinationShellTarget.from_atoms(atoms, phi_num_bins=90)
+
 cell = tc.Supercell.from_atoms(
     atoms,
     cell_dim_angstroms=(40, 40, 40),
@@ -36,11 +66,8 @@ cell.generate(
     angle_weight=0.6,
 )
 
-# View the g3 distribution
-cell.plot_g3()
-
-# 3D rotating movie
-cell.plot_structure(shell_target, output='structure.mp4')
+cell.measure_g3()
+cell.plot_g3()  # browse Si-Si-Si, Si-C-Si, C-C-C, ... triplets
 ```
 
 ## Structure generation
@@ -62,13 +89,9 @@ by physical parameters:
 Available as `Supercell.PRESETS`:
 
 ```python
-# Use a preset:
-preset = tc.Supercell.PRESETS["SRO"]
-cell = tc.Supercell.from_atoms(
-    atoms, (40, 40, 40),
-    relative_density=preset.pop("relative_density", 1.0),
-    rng_seed=42,
-)
+preset = tc.Supercell.PRESETS["MRO"].copy()
+density = preset.pop("relative_density", 1.0)
+cell = tc.Supercell.from_atoms(atoms, (40, 40, 40), relative_density=density, rng_seed=42)
 cell.generate(shell_target, **preset)
 ```
 
@@ -83,8 +106,8 @@ cell.generate(shell_target, **preset)
 
 ### Optional: target g3 for comparison
 
-To compare against a target distribution, create one explicitly and pass
-it as the initial distribution:
+To compare the supercell against a target distribution, create one
+explicitly and pass it as the initial distribution:
 
 ```python
 dist = tc.G3Distribution(atoms)
@@ -98,6 +121,7 @@ target = dist.target_g3(
 
 cell = tc.Supercell(target, cell_dim_angstroms=(40, 40, 40), relative_density=0.92)
 cell.generate(shell_target, grain_size=12.0, crystalline_fraction=0.5)
+cell.measure_g3()
 cell.plot_g3_compare()  # side-by-side comparison
 ```
 
