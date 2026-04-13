@@ -1,8 +1,66 @@
-import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js";
-import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/controls/OrbitControls.js";
+// Load Three.js + OrbitControls via import map injection.
+// OrbitControls ESM does `import { ... } from "three"` which
+// requires the browser to resolve the bare specifier "three".
+let THREE = null;
+let OrbitControls = null;
 
-function render({ model, el }) {
-  // ── container ──
+async function ensureThree() {
+  if (THREE) return;
+
+  // Inject import map so "three" resolves to the CDN URL
+  if (!document.querySelector('script[type="importmap"][data-tricor]')) {
+    const map = document.createElement("script");
+    map.type = "importmap";
+    map.setAttribute("data-tricor", "1");
+    map.textContent = JSON.stringify({
+      imports: {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+      }
+    });
+    document.head.appendChild(map);
+    // Import maps must be added before any module imports, but
+    // in Jupyter the page is already loaded. Fall back to manual
+    // patching if the import map doesn't take effect.
+  }
+
+  // Try ESM import first
+  try {
+    THREE = await import("https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js");
+    // Patch globalThis so OrbitControls can find "three"
+    const threeKeys = Object.keys(THREE);
+    if (!globalThis.__three_module_cache) {
+      globalThis.__three_module_cache = THREE;
+    }
+  } catch (e) {
+    throw new Error("Failed to load Three.js: " + e.message);
+  }
+
+  // OrbitControls needs "three" as bare specifier. Fetch source
+  // and rewrite the import to use the full URL.
+  try {
+    const resp = await fetch("https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/controls/OrbitControls.js");
+    let src = await resp.text();
+    // Rewrite bare "three" import to absolute URL
+    src = src.replace(
+      /from\s+['"]three['"]/g,
+      'from "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js"'
+    );
+    const blob = new Blob([src], { type: "application/javascript" });
+    const url = URL.createObjectURL(blob);
+    const mod = await import(url);
+    URL.revokeObjectURL(url);
+    OrbitControls = mod.OrbitControls;
+  } catch (e) {
+    throw new Error("Failed to load OrbitControls: " + e.message);
+  }
+}
+
+async function render({ model, el }) {
+  try {
+  await ensureThree();
+
+  // -- container --
   const root = document.createElement("div");
   root.classList.add("tricor-structure-widget");
   el.appendChild(root);
@@ -15,7 +73,7 @@ function render({ model, el }) {
   controlsPanel.classList.add("tricor-structure-controls");
   root.appendChild(controlsPanel);
 
-  // ── Three.js setup ──
+  // -- Three.js setup --
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(model.get("background_color"));
 
@@ -39,7 +97,7 @@ function render({ model, el }) {
   const sphereGeo = new THREE.SphereGeometry(1, 16, 12);
   const cylinderGeo = new THREE.CylinderGeometry(1, 1, 1, 8, 1);
 
-  // ── meshes ──
+  // -- meshes --
   let atomMesh = null;
   let bondMesh = null;
   let cellLine = null;
@@ -160,7 +218,7 @@ function render({ model, el }) {
     scene.add(cellLine);
   }
 
-  // ── camera framing ──
+  // -- camera framing --
   function frameCamera() {
     const verts = model.get("cell_vertices");
     let maxDist = 0;
@@ -174,7 +232,7 @@ function render({ model, el }) {
     controls.update();
   }
 
-  // ── controls panel ──
+  // -- controls panel --
   function buildControls() {
     controlsPanel.innerHTML = "";
 
@@ -268,7 +326,7 @@ function render({ model, el }) {
     });
   }
 
-  // ── UI helpers ──
+  // -- UI helpers --
   function makeSliderGroup(label, min, max, value, step, onChange) {
     const group = document.createElement("div");
     group.classList.add("tricor-control-group");
@@ -315,13 +373,13 @@ function render({ model, el }) {
 
     const valText = document.createElement("span");
     valText.classList.add("tricor-dual-value");
-    valText.textContent = `${valueLo.toFixed(2)} – ${valueHi.toFixed(2)}`;
+    valText.textContent = `${valueLo.toFixed(2)} - ${valueHi.toFixed(2)}`;
 
     function update() {
       let lo = parseFloat(loSlider.value);
       let hi = parseFloat(hiSlider.value);
       if (lo > hi) { const tmp = lo; lo = hi; hi = tmp; }
-      valText.textContent = `${lo.toFixed(2)} – ${hi.toFixed(2)}`;
+      valText.textContent = `${lo.toFixed(2)} - ${hi.toFixed(2)}`;
       onChange(lo, hi);
     }
     loSlider.addEventListener("input", update);
@@ -347,7 +405,7 @@ function render({ model, el }) {
     return group;
   }
 
-  // ── resize ──
+  // -- resize --
   function resize() {
     const w = canvasWrap.clientWidth || 600;
     const h = canvasWrap.clientHeight || 600;
@@ -358,20 +416,20 @@ function render({ model, el }) {
   const resizeObs = new ResizeObserver(resize);
   resizeObs.observe(canvasWrap);
 
-  // ── animation loop ──
+  // -- animation loop --
   function animate() {
     requestAnimationFrame(animate);
     controls.update();
     renderer.render(scene, camera);
   }
 
-  // ── model listeners ──
+  // -- model listeners --
   model.on("change:atom_visible", () => updateAtomVisibility());
   model.on("change:bond_visible change:bond_starts change:bond_ends change:bond_colors change:num_bonds change:show_bonds", () => buildBonds());
   model.on("change:show_cell", () => buildCell());
   model.on("change:atom_scale", () => updateAtomVisibility());
 
-  // ── init ──
+  // -- init --
   buildControls();
   buildAtoms();
   buildBonds();
@@ -379,6 +437,10 @@ function render({ model, el }) {
   frameCamera();
   resize();
   animate();
+
+  } catch (e) {
+    el.innerHTML = '<pre style="color:red;padding:12px;font-size:13px">Structure viewer error:\n' + e.message + '\n' + e.stack + '</pre>';
+  }
 }
 
 export default { render };

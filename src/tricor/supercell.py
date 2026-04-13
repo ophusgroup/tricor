@@ -250,13 +250,12 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         return dims
 
     def _build_supercell_cell(self) -> np.ndarray:
-        """Scale the source lattice vectors to the requested physical box lengths."""
-        reference_cell = np.asarray(self.reference_atoms.cell.array, dtype=np.float64)
-        reference_lengths = np.linalg.norm(reference_cell, axis=1)
-        if np.any(reference_lengths <= _EPS):
-            raise ValueError("Reference cell must have non-zero lattice-vector lengths.")
-        scale = np.asarray(self.cell_dim_angstroms, dtype=np.float64) / reference_lengths
-        return reference_cell * scale[:, None]
+        """Build an orthogonal supercell with the requested dimensions.
+
+        Always returns a diagonal cell matrix regardless of the
+        reference crystal's lattice vectors.
+        """
+        return np.diag(np.asarray(self.cell_dim_angstroms, dtype=np.float64))
 
     def _target_species_counts(self, target_volume: float) -> tuple[np.ndarray, np.ndarray]:
         """Return the closest exact-stoichiometry atom counts for the requested box."""
