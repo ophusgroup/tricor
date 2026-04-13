@@ -19,7 +19,7 @@ tricor builds periodic supercells with controllable disorder  -  from fully liqu
 :maxdepth: 2
 
 quickstart
-algorithm
+algorithm/index
 generation
 visualization
 examples
