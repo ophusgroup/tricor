@@ -4,7 +4,7 @@ Generate disordered atomic supercells guided by three-body (g3) distributions, s
 
 ## Overview
 
-tricor builds periodic supercells with controllable disorder — from fully liquid to nanocrystalline — by combining Voronoi grain construction with spring-network relaxation. The resulting structures are characterized by their rooted three-body (g3) distributions, which capture both radial and angular correlations.
+tricor builds periodic supercells with controllable disorder  -  from fully liquid to nanocrystalline  -  by combining Voronoi grain construction with spring-network relaxation. The resulting structures are characterized by their rooted three-body (g3) distributions, which capture both radial and angular correlations.
 
 **Key features:**
 
@@ -22,5 +22,6 @@ quickstart
 algorithm
 generation
 visualization
+examples
 api
 ```

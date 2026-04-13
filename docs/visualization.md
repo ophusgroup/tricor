@@ -10,11 +10,11 @@ cell.plot_g3()
 ```
 
 This opens an interactive widget with:
-- **Heatmap** — 2D slice of the g3 distribution ($r$ vs $\phi$) for a selected radial shell
-- **Radial profile** — pair correlation function with drag-to-select shell range
-- **Channel selector** — switch between triplet types (e.g. Si-Si-Si, Si-C-Si)
-- **Normalize toggle** — show raw counts or density-normalized
-- **Auto-shell toggle** — when unchecked, the shell selection stays fixed when switching channels
+- **Heatmap**  -  2D slice of the g3 distribution ($r$ vs $\phi$) for a selected radial shell
+- **Radial profile**  -  pair correlation function with drag-to-select shell range
+- **Channel selector**  -  switch between triplet types (e.g. Si-Si-Si, Si-C-Si)
+- **Normalize toggle**  -  show raw counts or density-normalized
+- **Auto-shell toggle**  -  when unchecked, the shell selection stays fixed when switching channels
 
 <!-- ![g3 widget screenshot](images/g3_widget.png) -->
 
@@ -65,9 +65,9 @@ Controls:
 - **Drag** to rotate, **scroll** to zoom, **right-click drag** to pan
 - **Atom size** slider
 - **Bond radius** slider
-- **Bond cutoff** slider — recomputes bonds live
-- **Bond type checkboxes** — toggle per species pair (Si-Si, Si-C, C-C)
-- **Slab x/y/z** sliders — clip the view to a fractional range
+- **Bond cutoff** slider  -  recomputes bonds live
+- **Bond type checkboxes**  -  toggle per species pair (Si-Si, Si-C, C-C)
+- **Slab x/y/z** sliders  -  clip the view to a fractional range
 - **Show/hide** cell outline and bonds
 
 Custom initial settings:

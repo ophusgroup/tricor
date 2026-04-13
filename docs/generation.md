@@ -4,9 +4,9 @@
 
 `generate()` builds disordered structures in two steps:
 
-1. **Grain construction** — the periodic box is Voronoi-tessellated. A fraction of cells are filled with randomly oriented crystal; the rest with random atom positions.
+1. **Grain construction**  -  the periodic box is Voronoi-tessellated. A fraction of cells are filled with randomly oriented crystal; the rest with random atom positions.
 
-2. **Shell relaxation** — all atoms are simultaneously relaxed via bond, angle, and repulsion springs. Grain-interior atoms are frozen to preserve crystalline order.
+2. **Shell relaxation**  -  all atoms are simultaneously relaxed via bond, angle, and repulsion springs. Grain-interior atoms are frozen to preserve crystalline order.
 
 See [Algorithm](algorithm.md) for the mathematical details.
 
@@ -155,18 +155,18 @@ tc.Supercell.PRESETS
 
 | Regime | grain_size | cryst_frac | bond_weight | angle_weight | density |
 |--------|-----------|------------|-------------|--------------|---------|
-| liquid | None | — | 1.0 | 0.12 | 0.86 |
+| liquid | None |  -  | 1.0 | 0.12 | 0.86 |
 | amorphous | 4 | 1.0 | 1.5 | 0.3 | 0.88 |
 | SRO | 8 | 1.0 | 2.0 | 1.0 | 0.90 |
 | MRO | 12 | 0.5 | 2.0 | 0.6 | 0.92 |
 | mixed | 18 | 0.5 | 2.5 | 1.0 | 0.94 |
 | nanocrystalline | 25 | 1.0 | 3.0 | 1.5 | 0.96 |
 
-These are tuned for Si (diamond cubic). Other materials will need different values — in particular, close-packed structures (FCC, HCP) need lower `angle_weight` since their angular distributions are broader.
+These are tuned for Si (diamond cubic). Other materials will need different values  -  in particular, close-packed structures (FCC, HCP) need lower `angle_weight` since their angular distributions are broader.
 
 ## Multi-species systems
 
-For binary compounds (SiC, GaAs, etc.), the bond topology respects per-species-pair coordination targets. In SiC zincblende, each Si bonds to 4 C atoms and vice versa — no Si-Si or C-C bonds form in the first shell.
+For binary compounds (SiC, GaAs, etc.), the bond topology respects per-species-pair coordination targets. In SiC zincblende, each Si bonds to 4 C atoms and vice versa  -  no Si-Si or C-C bonds form in the first shell.
 
 ```python
 atoms = bulk('SiC', 'zincblende', a=4.36)

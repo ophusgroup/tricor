@@ -21,11 +21,6 @@ myst_enable_extensions = [
     "dollarmath",
     "amsmath",
 ]
-source_suffix = {
-    ".rst": "restructuredtext",
-    ".md": "markdown",
-}
-
 templates_path = ["_templates"]
 exclude_patterns = ["_build"]
 

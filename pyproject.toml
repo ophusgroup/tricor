@@ -21,9 +21,10 @@ data = [
     "zarr",
 ]
 docs = [
-    "sphinx>=7",
+    "sphinx>=7,<7.3",
     "furo",
-    "myst-nb",
+    "myst-nb>=1.1,<1.2",
+    "myst-parser>=2,<3",
     "ipykernel",
 ]
 

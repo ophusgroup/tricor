@@ -1,6 +1,10 @@
 # tricor
 
+[![Documentation Status](https://readthedocs.org/projects/tricor/badge/?version=latest)](https://tricor.readthedocs.io/en/latest/?badge=latest)
+
 Generate disordered atomic supercells guided by three-body (g3) distributions, spanning the full spectrum from liquid to nanocrystalline.  Designed for machine-learning training data generation.
+
+**[Documentation](https://tricor.readthedocs.io)**
 
 ## Installation
 
@@ -8,7 +12,7 @@ Generate disordered atomic supercells guided by three-body (g3) distributions, s
 uv sync
 ```
 
-## Quick start — Si (single species)
+## Quick start  -  Si (single species)
 
 ```python
 from ase.build import bulk
@@ -43,7 +47,7 @@ cell.plot_g3()
 cell.plot_structure(shell_target, output='structure.mp4')
 ```
 
-## Quick start — SiC (binary)
+## Quick start  -  SiC (binary)
 
 ```python
 atoms = bulk('SiC', 'zincblende', a=4.36)
@@ -79,7 +83,7 @@ by physical parameters:
 | Parameter | Controls |
 |-----------|----------|
 | `grain_size` | Crystallite diameter in Angstrom. `None` = no grains (liquid/amorphous). |
-| `crystalline_fraction` | Fraction of volume filled by crystalline grains (0&ndash;1). |
+| `crystalline_fraction` | Fraction of volume filled by crystalline grains (0-1). |
 | `bond_weight` | Harmonic spring strength for bond distances. Larger = tighter. |
 | `angle_weight` | Spring strength for bond angles. Larger = tighter. Near-zero = liquid. |
 | `relative_density` | Density relative to crystal (set on `from_atoms`). Lower = fewer close-packed artifacts. |
@@ -97,7 +101,7 @@ cell.generate(shell_target, **preset)
 
 | Regime | grain_size | crystalline_fraction | bond_weight | angle_weight | density |
 |--------|-----------|---------------------|-------------|--------------|---------|
-| liquid | None | &mdash; | 1.0 | 0.12 | 0.86 |
+| liquid | None |  -  | 1.0 | 0.12 | 0.86 |
 | amorphous | 4 | 1.0 | 1.5 | 0.3 | 0.88 |
 | SRO | 8 | 1.0 | 2.0 | 1.0 | 0.90 |
 | MRO | 12 | 0.5 | 2.0 | 0.6 | 0.92 |
@@ -127,9 +131,9 @@ cell.plot_g3_compare()  # side-by-side comparison
 
 ## Core classes
 
-- **`G3Distribution`** &mdash; measures rooted three-body angle/distance histograms from atomic structures
-- **`CoordinationShellTarget`** &mdash; extracts first-shell coordination targets (bond lengths, angles, coordination numbers) from a reference crystal
-- **`Supercell`** &mdash; generates and optimises disordered supercells
+- **`G3Distribution`**  -  measures rooted three-body angle/distance histograms from atomic structures
+- **`CoordinationShellTarget`**  -  extracts first-shell coordination targets (bond lengths, angles, coordination numbers) from a reference crystal
+- **`Supercell`**  -  generates and optimises disordered supercells
 
 ## Dependencies
 
