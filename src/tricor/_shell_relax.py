@@ -89,10 +89,14 @@ class _ShellRelaxMixin:
         angle_lookup = np.asarray(shell_target.angle_lookup, dtype=np.intp)
         cutoff = float(shell_target.max_pair_outer * neighbor_cutoff_scale)
 
-        # K nearest neighbors per atom (total across all neighbor species)
+        # K nearest neighbors per atom, both total and per-species-pair
         k_per_species = np.zeros(shell_target.species.size, dtype=np.intp)
         for s in range(shell_target.species.size):
             k_per_species[s] = int(np.round(coord_target[s].sum()))
+
+        # Per-species-pair coordination targets (rounded to int)
+        num_sp = shell_target.species.size
+        coord_target_int = np.round(coord_target).astype(np.intp)
 
         # Repulsion radii: hard core (overlap prevention) and non-bonded
         # shell clearance (eliminates close-packed background).
@@ -201,12 +205,13 @@ class _ShellRelaxMixin:
 
             nl_i, nl_j, nl_d = neighbor_list("ijd", self.atoms, cutoff)
 
-            # Symmetric bond matching with angular awareness: greedily
-            # build a K-regular bond graph.  Candidates are sorted by
-            # distance; each candidate is accepted only if the new bond
-            # makes angles >= min_accept_angle with all existing bonds at
-            # BOTH endpoints.  This eliminates close-packed clusters.
+            # Symmetric bond matching with angular + species awareness:
+            # greedily build a bond graph respecting per-species-pair
+            # coordination targets.  Candidates sorted by distance;
+            # each accepted only if angle and species constraints pass.
             bond_count = np.zeros(num_atoms, dtype=np.intp)
+            # Per-atom, per-neighbor-species bond counts
+            bond_count_pair = np.zeros((num_atoms, num_sp), dtype=np.intp)
             k_atom = np.array(
                 [int(k_per_species[species_idx[a]]) for a in range(num_atoms)],
                 dtype=np.intp,
@@ -231,12 +236,38 @@ class _ShellRelaxMixin:
 
             min_accept_angle = np.deg2rad(60.0)  # reject bonds with < 60deg to existing
 
+            def _species_pair_ok(ai: int, aj: int) -> bool:
+                """Check per-species-pair coordination limits."""
+                si, sj = species_idx[ai], species_idx[aj]
+                if bond_count_pair[ai, sj] >= coord_target_int[si, sj]:
+                    return False
+                if bond_count_pair[aj, si] >= coord_target_int[sj, si]:
+                    return False
+                return True
+
+            def _accept_bond(ai: int, aj: int) -> None:
+                """Record a new bond between atoms ai and aj."""
+                si, sj = species_idx[ai], species_idx[aj]
+                _bond_i_list.append(ai)
+                _bond_j_list.append(aj)
+                _bond_rt_list.append(float(pair_peak[si, sj]))
+                bonded_set.add((ai, aj))
+                bonded_set.add((aj, ai))
+                bonded_neighbors[ai].append(aj)
+                bonded_neighbors[aj].append(ai)
+                bond_count[ai] += 1
+                bond_count[aj] += 1
+                bond_count_pair[ai, sj] += 1
+                bond_count_pair[aj, si] += 1
+
             for idx in dist_order:
                 ai = int(nl_i[idx])
                 aj = int(nl_j[idx])
                 if bond_count[ai] >= k_atom[ai] or bond_count[aj] >= k_atom[aj]:
                     continue
                 if (ai, aj) in bonded_set:
+                    continue
+                if not _species_pair_ok(ai, aj):
                     continue
 
                 hat_ij = nl_hats[idx]
@@ -246,7 +277,7 @@ class _ShellRelaxMixin:
                 accept = True
                 for existing_hat in bond_hats_per_atom[ai]:
                     cos_a = np.dot(hat_ij, existing_hat)
-                    if cos_a > np.cos(min_accept_angle):  # angle < min_accept
+                    if cos_a > np.cos(min_accept_angle):
                         accept = False
                         break
                 if not accept:
@@ -261,22 +292,13 @@ class _ShellRelaxMixin:
                 if not accept:
                     continue
 
-                s_ai = species_idx[ai]
-                s_aj = species_idx[aj]
-                _bond_i_list.append(ai)
-                _bond_j_list.append(aj)
-                _bond_rt_list.append(float(pair_peak[s_ai, s_aj]))
-                bonded_set.add((ai, aj))
-                bonded_set.add((aj, ai))
-                bonded_neighbors[ai].append(aj)
-                bonded_neighbors[aj].append(ai)
                 bond_hats_per_atom[ai].append(hat_ij.copy())
                 bond_hats_per_atom[aj].append(hat_ji.copy())
-                bond_count[ai] += 1
-                bond_count[aj] += 1
+                _accept_bond(ai, aj)
 
             # Second pass: fill remaining unsatisfied atoms with
-            # distance-only matching (relaxing angle constraint)
+            # distance-only matching (relaxing angle constraint but
+            # still respecting species-pair limits)
             for idx in dist_order:
                 ai = int(nl_i[idx])
                 aj = int(nl_j[idx])
@@ -284,17 +306,9 @@ class _ShellRelaxMixin:
                     continue
                 if (ai, aj) in bonded_set:
                     continue
-                s_ai = species_idx[ai]
-                s_aj = species_idx[aj]
-                _bond_i_list.append(ai)
-                _bond_j_list.append(aj)
-                _bond_rt_list.append(float(pair_peak[s_ai, s_aj]))
-                bonded_set.add((ai, aj))
-                bonded_set.add((aj, ai))
-                bonded_neighbors[ai].append(aj)
-                bonded_neighbors[aj].append(ai)
-                bond_count[ai] += 1
-                bond_count[aj] += 1
+                if not _species_pair_ok(ai, aj):
+                    continue
+                _accept_bond(ai, aj)
 
             bond_i = np.array(_bond_i_list, dtype=np.intp)
             bond_j = np.array(_bond_j_list, dtype=np.intp)
