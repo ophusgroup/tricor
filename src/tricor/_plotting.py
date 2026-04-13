@@ -15,6 +15,40 @@ if TYPE_CHECKING:
 class _PlottingMixin:
     """Plotting methods extracted from Supercell."""
 
+    def view_structure(
+        self: "Supercell",
+        shell_target: "CoordinationShellTarget | None" = None,
+        **kwargs,
+    ):
+        """Return an interactive 3D structure viewer widget.
+
+        Renders atoms as spheres (coloured by element) and bonds as
+        cylinders inside the periodic cell outline.  Uses Three.js
+        WebGL with OrbitControls for drag-to-rotate / scroll-to-zoom.
+
+        Parameters
+        ----------
+        shell_target
+            If provided, sets the default bond cutoff from
+            ``shell_target.max_pair_outer``.
+        **kwargs
+            Forwarded to :class:`StructureWidget` (e.g. ``atom_scale``,
+            ``bond_cutoff``, ``show_bonds``, ``slab_x``, etc.).
+
+        Returns
+        -------
+        StructureWidget
+            An anywidget instance for display in Jupyter.
+        """
+        from .structure_widget import StructureWidget
+
+        return StructureWidget(
+            self.atoms,
+            shell_target=shell_target,
+            grain_ids=self._grain_ids,
+            **kwargs,
+        )
+
     def plot_g3(
         self: "Supercell",
         pair: int | str = 0,

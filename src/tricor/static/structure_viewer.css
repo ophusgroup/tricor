@@ -1,0 +1,106 @@
+.tricor-structure-widget {
+  display: grid;
+  grid-template-columns: 1fr 220px;
+  width: 920px;
+  height: 640px;
+  border-radius: 18px;
+  overflow: hidden;
+  background: linear-gradient(180deg, #f7f8f5 0%, #eef2ea 100%);
+  box-shadow: 0 10px 28px rgba(25, 44, 34, 0.08);
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-size: 12px;
+  color: #333;
+}
+
+.tricor-structure-canvas {
+  min-width: 0;
+  min-height: 0;
+  border-radius: 14px 0 0 14px;
+  overflow: hidden;
+}
+
+.tricor-structure-canvas canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.tricor-structure-controls {
+  padding: 14px 12px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border-left: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.tricor-control-group {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.tricor-control-label {
+  font-weight: 600;
+  font-size: 11px;
+  color: #555;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.tricor-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  border-radius: 2px;
+  background: #ccc;
+  outline: none;
+}
+
+.tricor-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #555;
+  cursor: pointer;
+  border: 2px solid #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+.tricor-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #555;
+  cursor: pointer;
+  border: 2px solid #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+.tricor-slider-dual {
+  margin-top: 2px;
+}
+
+.tricor-dual-value {
+  font-size: 10px;
+  color: #888;
+  text-align: center;
+  margin-top: 1px;
+}
+
+.tricor-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 1px 0;
+}
+
+.tricor-checkbox-row input[type="checkbox"] {
+  margin: 0;
+  accent-color: #555;
+}
