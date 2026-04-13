@@ -10,13 +10,16 @@ extensions = [
     "sphinx.ext.napoleon",
     "sphinx.ext.intersphinx",
     "sphinx.ext.viewcode",
-    "myst_parser",
+    "sphinx.ext.mathjax",
+    "myst_nb",
 ]
 
 # MyST (Markdown) support
 myst_enable_extensions = [
     "colon_fence",
     "fieldlist",
+    "dollarmath",
+    "amsmath",
 ]
 source_suffix = {
     ".rst": "restructuredtext",
@@ -50,3 +53,8 @@ intersphinx_mapping = {
 # Napoleon (Google/NumPy docstrings)
 napoleon_google_docstring = False
 napoleon_numpy_docstring = True
+
+# myst-nb: execute code cells during build
+nb_execution_mode = "auto"  # execute cells marked with {code-cell}
+nb_execution_timeout = 120  # seconds per cell
+nb_execution_raise_on_error = True

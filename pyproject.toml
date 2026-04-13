@@ -23,7 +23,8 @@ data = [
 docs = [
     "sphinx>=7",
     "furo",
-    "myst-parser",
+    "myst-nb",
+    "ipykernel",
 ]
 
 [tool.hatch.build]

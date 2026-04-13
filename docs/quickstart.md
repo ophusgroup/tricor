@@ -16,7 +16,10 @@ import tricor as tc
 
 # 1. Reference crystal
 atoms = bulk('Si', 'diamond', a=5.431)
-shell_target = tc.CoordinationShellTarget.from_atoms(atoms, phi_num_bins=90)
+shell_target = tc.CoordinationShellTarget.from_atoms(
+    atoms,
+    phi_num_bins=90,
+)
 
 # 2. Create supercell
 cell = tc.Supercell.from_atoms(
@@ -50,11 +53,19 @@ cell.view_structure()
 cell.plot_structure(output='structure.mp4')
 ```
 
+<!-- Uncomment when images are available:
+![Si MRO g3 distribution](images/si_mro_g3.png)
+![Si MRO structure](images/si_mro_structure.png)
+-->
+
 ## Binary example (SiC)
 
 ```python
 atoms = bulk('SiC', 'zincblende', a=4.36)
-shell_target = tc.CoordinationShellTarget.from_atoms(atoms, phi_num_bins=90)
+shell_target = tc.CoordinationShellTarget.from_atoms(
+    atoms,
+    phi_num_bins=90,
+)
 
 cell = tc.Supercell.from_atoms(
     atoms,
@@ -94,6 +105,11 @@ for name, params in tc.Supercell.PRESETS.items():
 preset = tc.Supercell.PRESETS["nanocrystalline"].copy()
 density = preset.pop("relative_density", 1.0)
 
-cell = tc.Supercell.from_atoms(atoms, (40, 40, 40), relative_density=density, rng_seed=42)
+cell = tc.Supercell.from_atoms(
+    atoms,
+    (40, 40, 40),
+    relative_density=density,
+    rng_seed=42,
+)
 cell.generate(shell_target, **preset)
 ```
