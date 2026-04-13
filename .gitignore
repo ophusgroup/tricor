@@ -12,3 +12,4 @@ dist/
 src/tricor/.DS_Store
 
 .DS_Store
+docs/_build/

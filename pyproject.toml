@@ -20,6 +20,11 @@ data = [
     "h5py",
     "zarr",
 ]
+docs = [
+    "sphinx>=7",
+    "furo",
+    "myst-parser",
+]
 
 [tool.hatch.build]
 include = [
