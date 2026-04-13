@@ -25,7 +25,6 @@ docs = [
     "furo",
     "myst-nb>=1.1,<1.2",
     "myst-parser>=2,<3",
-    "ipykernel",
 ]
 
 [tool.hatch.build]

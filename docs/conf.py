@@ -49,7 +49,6 @@ intersphinx_mapping = {
 napoleon_google_docstring = False
 napoleon_numpy_docstring = True
 
-# myst-nb: execute code cells during build
-nb_execution_mode = "auto"  # execute cells marked with {code-cell}
-nb_execution_timeout = 120  # seconds per cell
-nb_execution_raise_on_error = True
+# myst-nb: don't execute code cells during build
+# (too slow for RTD; run locally and commit output if needed)
+nb_execution_mode = "off"
