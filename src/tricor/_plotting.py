@@ -29,8 +29,9 @@ class _PlottingMixin:
         Parameters
         ----------
         shell_target
-            If provided, sets the default bond cutoff from
-            ``shell_target.max_pair_outer``.
+            Sets the default bond cutoff from
+            ``shell_target.max_pair_outer``.  If ``None``, uses the
+            shell_target stored from the last :meth:`generate` call.
         **kwargs
             Forwarded to :class:`StructureWidget` (e.g. ``atom_scale``,
             ``bond_cutoff``, ``show_bonds``, ``slab_x``, etc.).
@@ -41,6 +42,9 @@ class _PlottingMixin:
             An anywidget instance for display in Jupyter.
         """
         from .structure_widget import StructureWidget
+
+        if shell_target is None:
+            shell_target = getattr(self, "_shell_target", None)
 
         return StructureWidget(
             self.atoms,

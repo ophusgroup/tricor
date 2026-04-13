@@ -421,6 +421,21 @@ function render({ model, el }) {
   toggleLabel.appendChild(toggleText);
   controls.appendChild(toggleLabel);
 
+  const autoShellLabel = document.createElement("label");
+  autoShellLabel.className = "tricor-compare-toggle";
+  const autoShellCb = document.createElement("input");
+  autoShellCb.type = "checkbox";
+  autoShellCb.checked = !!model.get("auto_shell");
+  autoShellLabel.appendChild(autoShellCb);
+  const autoShellText = document.createElement("span");
+  autoShellText.textContent = "Auto-select shell";
+  autoShellLabel.appendChild(autoShellText);
+  controls.appendChild(autoShellLabel);
+  autoShellCb.addEventListener("change", () => {
+    model.set("auto_shell", autoShellCb.checked);
+    model.save_changes();
+  });
+
   const status = document.createElement("div");
   status.className = "tricor-compare-status";
   controls.appendChild(status);
@@ -458,6 +473,7 @@ function render({ model, el }) {
     const tripletIndex = model.get("triplet_index") || 0;
     updateSelect(select, labels, tripletIndex);
     checkbox.checked = !!model.get("normalize");
+    autoShellCb.checked = !!model.get("auto_shell");
     sigmaRInput.value = Number(model.get("sigma_r") || 0).toFixed(2);
     sigmaPhiInput.value = Number(model.get("sigma_phi") || 0).toFixed(1);
     const sliceMax = Number(model.get("slice_max") ?? -1);

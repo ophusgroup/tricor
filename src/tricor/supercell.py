@@ -123,6 +123,7 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
             raise ValueError("spatial_bin_size must be positive.")
 
         self.reference_atoms = self.target_distribution.atoms.copy()
+        self._shell_target: Any | None = None
         self.atoms = self._build_random_atoms()
         self.current_distribution: G3Distribution | None = None
         self.mc_history: dict[str, np.ndarray] | None = None
@@ -381,6 +382,7 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
             Summary dict with regime, construction parameters, and
             relaxation loss values.
         """
+        self._shell_target = shell_target
         pair_peak = np.asarray(shell_target.pair_peak, dtype=np.float64)
         pair_peak_max = float(np.max(pair_peak[pair_peak > _EPS])) if np.any(pair_peak > _EPS) else 2.5
 
