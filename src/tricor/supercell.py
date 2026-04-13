@@ -308,11 +308,11 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
             grain_size=4.0, bond_weight=1.5, angle_weight=0.3,
             relative_density=0.88,
         ),
-        "diamond_glass": dict(
+        "SRO": dict(
             grain_size=8.0, bond_weight=2.0, angle_weight=1.0,
             relative_density=0.90,
         ),
-        "SRO": dict(
+        "MRO": dict(
             grain_size=12.0, crystalline_fraction=0.5,
             bond_weight=2.0, angle_weight=0.6,
             relative_density=0.92,

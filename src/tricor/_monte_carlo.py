@@ -1550,7 +1550,7 @@ class _MonteCarloMixin:
         self: "Supercell",
         *,
         force: bool = False,
-        show_progress: bool = False,
+        show_progress: bool = True,
     ) -> G3Distribution:
         """Measure the current random supercell on the target distribution grid.
 

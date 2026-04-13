@@ -8,3 +8,7 @@ build/
 dist/
 
 .claude/worktrees/
+
+src/tricor/.DS_Store
+
+.DS_Store

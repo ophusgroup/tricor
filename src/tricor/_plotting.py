@@ -23,8 +23,7 @@ class _PlottingMixin:
     ):
         """Return an interactive explorer for the supercell's measured g3.
 
-        Measures the current supercell (if not already cached) and
-        displays the result using :meth:`G3Distribution.plot_g3`.
+        Requires :meth:`measure_g3` to have been called first.
 
         Parameters
         ----------
@@ -33,7 +32,9 @@ class _PlottingMixin:
         normalize
             If ``True``, display the reduced (density-normalised) g3.
         """
-        dist = self.measure_g3(show_progress=True)
+        if self.current_distribution is None:
+            raise ValueError("Call measure_g3() before plot_g3().")
+        dist = self.current_distribution
         return dist.plot_g3(pair=pair, normalize=normalize)
 
     def plot_g3_compare(
