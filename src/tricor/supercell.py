@@ -122,7 +122,9 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         if self.spatial_bin_size <= 0:
             raise ValueError("spatial_bin_size must be positive.")
 
-        self.reference_atoms = self.target_distribution.atoms.copy()
+        self.reference_atoms = self._to_orthogonal_cell(
+            self.target_distribution.atoms,
+        )
         self._shell_target: Any | None = None
         self.atoms = self._build_random_atoms()
         self.current_distribution: G3Distribution | None = None
@@ -256,6 +258,65 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         reference crystal's lattice vectors.
         """
         return np.diag(np.asarray(self.cell_dim_angstroms, dtype=np.float64))
+
+    @staticmethod
+    def _to_orthogonal_cell(atoms: Atoms) -> Atoms:
+        """Convert to an orthogonal (diagonal) cell if needed.
+
+        Tiles the primitive cell and wraps into the smallest
+        axis-aligned box, removing duplicates.  If the cell is
+        already orthogonal, returns a copy unchanged.
+        """
+        cell = np.asarray(atoms.cell.array, dtype=np.float64)
+        off_diag = cell - np.diag(np.diag(cell))
+        if np.allclose(off_diag, 0, atol=1e-6):
+            return atoms.copy()
+
+        # Find the smallest orthogonal box: use the max absolute
+        # Cartesian extent of each lattice vector column.
+        # For FCC [[0,a/2,a/2],[a/2,0,a/2],[a/2,a/2,0]]:
+        # max per column = [a/2, a/2, a/2], so box = [a, a, a].
+        a_orth = 2.0 * np.max(np.abs(cell), axis=0)
+        orth_cell = np.diag(a_orth)
+        orth_inv = np.linalg.inv(orth_cell)
+
+        # Tile generously
+        ref_lengths = np.linalg.norm(cell, axis=1)
+        n_reps = np.ceil(a_orth / np.maximum(ref_lengths, 1e-10)).astype(int) + 1
+        shifts = []
+        for ix in range(-n_reps[0], n_reps[0] + 1):
+            for iy in range(-n_reps[1], n_reps[1] + 1):
+                for iz in range(-n_reps[2], n_reps[2] + 1):
+                    shifts.append([ix, iy, iz])
+        shifts = np.array(shifts, dtype=np.float64)
+        shift_cart = shifts @ cell
+
+        pos = atoms.positions
+        nums = atoms.numbers
+        tiled_pos = (pos[None, :, :] + shift_cart[:, None, :]).reshape(-1, 3)
+        tiled_nums = np.tile(nums, len(shifts))
+
+        # Keep atoms inside the orthogonal box
+        frac = tiled_pos @ orth_inv
+        eps = 1e-6
+        inside = np.all((frac >= -eps) & (frac < 1.0 - eps), axis=1)
+        tiled_pos = tiled_pos[inside]
+        tiled_nums = tiled_nums[inside]
+
+        # Remove duplicates
+        frac_inside = tiled_pos @ orth_inv
+        frac_rounded = np.round(frac_inside, decimals=5)
+        _, unique_idx = np.unique(frac_rounded, axis=0, return_index=True)
+        tiled_pos = tiled_pos[unique_idx]
+        tiled_nums = tiled_nums[unique_idx]
+
+        result = Atoms(
+            numbers=tiled_nums,
+            positions=tiled_pos,
+            cell=orth_cell,
+            pbc=atoms.pbc,
+        )
+        return result
 
     def _target_species_counts(self, target_volume: float) -> tuple[np.ndarray, np.ndarray]:
         """Return the closest exact-stoichiometry atom counts for the requested box."""

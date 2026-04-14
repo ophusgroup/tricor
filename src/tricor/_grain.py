@@ -78,38 +78,38 @@ class _GrainMixin:
             else:
                 rotations[ig] = np.eye(3)  # unused
 
-        # --- tile reference crystal once to fill the box ---
+        # --- build a crystal tile block centered at the origin ---
+        # Tile the reference cell in +/- directions to cover a sphere
+        # of radius grain_radius + buffer.  The number of reps is
+        # based on the SHORTEST lattice combination (not just the
+        # individual vectors) to handle non-orthogonal cells.
         ref_cell = np.asarray(self.reference_atoms.cell.array, dtype=np.float64)
         ref_pos = self.reference_atoms.positions.copy()
         ref_numbers = self.reference_atoms.numbers.copy()
+        u, v, w = ref_cell[0], ref_cell[1], ref_cell[2]
 
-        box_lengths = np.array(self.cell_dim_angstroms, dtype=np.float64)
-        ref_lengths = np.linalg.norm(ref_cell, axis=1)
-        ref_lengths = np.maximum(ref_lengths, _EPS)
-        n_reps = np.ceil(box_lengths / ref_lengths).astype(int)
-        n_reps = np.maximum(n_reps, 1)
+        # Find the shortest lattice vector combination
+        combos = [u, v, w, u+v, u-v, u+w, u-w, v+w, v-w,
+                  u+v+w, u+v-w, u-v+w, u-v-w]
+        min_length = min(np.linalg.norm(c) for c in combos)
+        min_length = max(min_length, _EPS)
+
+        tile_radius = grain_radius + min_length * 2
+        n_rep = int(np.ceil(tile_radius / min_length)) + 1
 
         shifts = []
-        for ix in range(n_reps[0]):
-            for iy in range(n_reps[1]):
-                for iz in range(n_reps[2]):
+        for ix in range(-n_rep, n_rep + 1):
+            for iy in range(-n_rep, n_rep + 1):
+                for iz in range(-n_rep, n_rep + 1):
                     shifts.append([ix, iy, iz])
         shifts = np.array(shifts, dtype=np.float64)
         shift_cart = shifts @ ref_cell
 
-        tiled_pos = (ref_pos[None, :, :] + shift_cart[:, None, :]).reshape(-1, 3)
-        tiled_numbers = np.tile(ref_numbers, len(shifts))
-
-        # Wrap into supercell box
-        frac_tiled = tiled_pos @ cell_inv
-        frac_tiled %= 1.0
-        tiled_pos = frac_tiled @ cell_mat
-        n_tiled = len(tiled_pos)
+        base_pos = (ref_pos[None, :, :] + shift_cart[:, None, :]).reshape(-1, 3)
+        base_numbers = np.tile(ref_numbers, len(shifts))
 
         # --- chunked Voronoi assignment ---
-        # For many seeds, the (n_atoms, n_seeds, 3) array can be huge.
-        # Process atoms in chunks to bound memory at ~100 MB.
-        max_chunk_elements = 25_000_000  # ~100 MB for float64 × 3
+        max_chunk_elements = 25_000_000
         chunk_size = max(1, max_chunk_elements // max(n_seeds, 1))
 
         def _chunked_voronoi(positions: np.ndarray) -> np.ndarray:
@@ -127,36 +127,51 @@ class _GrainMixin:
                 )
             return nearest
 
-        # Assign each tiled atom to its nearest seed
-        nearest_seed = _chunked_voronoi(tiled_pos)
+        # --- per-grain: rotate base block, place at seed, collect ---
+        # Each grain gets its own properly rotated crystal tile.
+        # This ensures both sublattices are tiled identically.
+        all_raw_pos: list[np.ndarray] = []
+        all_raw_numbers: list[np.ndarray] = []
+        all_raw_gids: list[np.ndarray] = []
 
-        # Keep only atoms in crystalline cells
-        in_crystalline = is_crystalline_cell[nearest_seed]
-        cryst_pos = tiled_pos[in_crystalline].copy()
-        cryst_numbers = tiled_numbers[in_crystalline].copy()
-        cryst_seeds = nearest_seed[in_crystalline]
-
-        # Rotate each grain's atoms around its seed center
         for ig in range(n_seeds):
             if not is_crystalline_cell[ig]:
                 continue
-            mask_ig = cryst_seeds == ig
-            if not np.any(mask_ig):
-                continue
-            delta = cryst_pos[mask_ig] - seed_cart[ig]
-            frac_d = delta @ cell_inv
-            frac_d -= np.rint(frac_d)
-            delta = frac_d @ cell_mat
-            cryst_pos[mask_ig] = seed_cart[ig] + delta @ rotations[ig].T
+            # Random fractional shift of the crystal origin along
+            # each lattice vector.  This randomises which sublattice
+            # site lands nearest the grain seed so all species are
+            # equally represented across grains.
+            rand_frac = self.rng.random(3)
+            origin_shift = (rand_frac[0] * 0.5 * u
+                          + rand_frac[1] * 0.5 * v
+                          + rand_frac[2] * 0.5 * w)
+            shifted = base_pos + origin_shift
+            # Rotate around origin, then translate to grain seed
+            rotated = shifted @ rotations[ig].T
+            grain_pos = rotated + seed_cart[ig]
+            frac = grain_pos @ cell_inv
+            frac %= 1.0
+            grain_pos = frac @ cell_mat
+            all_raw_pos.append(grain_pos)
+            all_raw_numbers.append(base_numbers.copy())
+            all_raw_gids.append(np.full(len(grain_pos), ig, dtype=np.intp))
 
-        # Wrap rotated positions
-        frac_c = cryst_pos @ cell_inv
-        frac_c %= 1.0
-        cryst_pos = frac_c @ cell_mat
+        if not all_raw_pos:
+            all_positions: list[np.ndarray] = []
+            all_numbers: list[np.ndarray] = []
+            all_grain_ids: list[np.ndarray] = []
+        else:
+            raw_pos = np.concatenate(all_raw_pos, axis=0)
+            raw_numbers = np.concatenate(all_raw_numbers, axis=0)
+            raw_gids = np.concatenate(all_raw_gids, axis=0)
 
-        all_positions: list[np.ndarray] = [cryst_pos]
-        all_numbers: list[np.ndarray] = [cryst_numbers]
-        all_grain_ids: list[np.ndarray] = [cryst_seeds.astype(np.intp)]
+            # Voronoi assignment: keep atoms only in their own
+            # grain's cell (nearest seed must match the grain).
+            nearest = _chunked_voronoi(raw_pos)
+            keep = nearest == raw_gids
+            all_positions = [raw_pos[keep]]
+            all_numbers = [raw_numbers[keep]]
+            all_grain_ids = [raw_gids[keep]]
 
         # --- fill amorphous Voronoi cells with random positions ---
         if n_crystalline < n_seeds:
