@@ -4,18 +4,38 @@ Edit the CONFIG section below, then run:
     python train_flowmatch.py
 """
 
+import time
+
 import lightning as L
-from lightning.pytorch.callbacks import ModelCheckpoint, TQDMProgressBar
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
 
 from tricor.flowmatch import LitFlowMatch, FlowMatchDataModule
+
+
+class EpochTimer(Callback):
+    """Print one line per epoch with elapsed time and logged metrics."""
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        self._t0 = time.time()
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        dt = time.time() - self._t0
+        metrics = {k: float(v) for k, v in trainer.callback_metrics.items()}
+        train_loss = metrics.get("train_loss", metrics.get("loss", float("nan")))
+        val_loss = metrics.get("val_loss", float("nan"))
+        print(
+            f"Epoch {trainer.current_epoch:4d} | {dt:6.1f}s | "
+            f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f}",
+            flush=True,
+        )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG — edit these
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Data
-DATA_DIR = "/pscratch/sd/e/ehrdt/mcstructgen/smallcell/"   # directory of xyz/extxyz/vasp/cif files
+DATA_DIR = "/pscratch/sd/e/ehrdt/mcstructgen/smallcell_labels.pt"   # directory of xyz/extxyz/vasp/cif files
 SPECIES = [7, 14]                       # atomic numbers (N, Si for Si3N4)
 CUTOFF = 5.0                            # graph construction cutoff (A)
 DUP = 128                               # noise replicas per structure
@@ -101,8 +121,9 @@ def main():
         accelerator="gpu" if GPUS > 0 else "cpu",
         devices=GPUS if GPUS > 0 else "auto",
         logger=TensorBoardLogger(save_dir=LOG_DIR, name=RUN_NAME),
-        callbacks=[checkpoint_cb, TQDMProgressBar(refresh_rate=10)],
+        callbacks=[checkpoint_cb, EpochTimer()],
         gradient_clip_val=1.0,
+        enable_progress_bar=False,
     )
 
     trainer.fit(model, datamodule, ckpt_path=RESUME_CKPT)

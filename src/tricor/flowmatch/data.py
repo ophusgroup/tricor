@@ -49,6 +49,20 @@ def _load_atoms(source: Union[list, str, Path]) -> list:
     return list(source)
 
 
+def _load_source(source: Union[list, str, Path]):
+    """Return (kind, items) where kind is 'atoms' or 'cache'."""
+    if isinstance(source, (str, Path)):
+        p = Path(source)
+        if p.is_file() and p.suffix == ".pt":
+            entries = torch.load(p, weights_only=False)
+            return "cache", list(entries)
+        return "atoms", _load_atoms(source)
+    items = list(source)
+    if items and isinstance(items[0], dict):
+        return "cache", items
+    return "atoms", items
+
+
 class FlowMatchDataset(Dataset):
     """Dataset for conditional flow matching on atomic structures.
 
@@ -87,73 +101,87 @@ class FlowMatchDataset(Dataset):
         self.dup = dup
         self.use_ot = use_ot
 
-        atoms_list = _load_atoms(structures)
-        for atoms in atoms_list:
-            atoms.wrap()
+        kind, items = _load_source(structures)
 
         # Species setup
         if species is not None:
             unique_numbers = np.array(sorted(species))
+        elif kind == "atoms":
+            unique_numbers = np.unique(
+                np.concatenate([np.unique(a.numbers) for a in items])
+            )
         else:
             unique_numbers = np.unique(
-                np.concatenate([np.unique(a.numbers) for a in atoms_list])
+                np.concatenate([np.unique(e["numbers"].numpy()) for e in items])
             )
         self.atom_encoder = OneHotEncoder(sparse_output=False)
         self.atom_encoder.fit(unique_numbers.reshape(-1, 1))
         self.num_species = len(unique_numbers)
         self.species_list = unique_numbers.tolist()
 
-        # Build PDF/ADF calculator
-        calc = DifferentiablePDFADF(
-            r_max=r_max,
-            r_step=r_step,
-            phi_num_bins=phi_num_bins,
-            sigma_r=sigma_r,
-            sigma_phi=sigma_phi,
-            species=self.species_list,
-        ).double()
-        self.num_r = calc.num_r
-        self.num_triplets = calc.num_triplets
         self.phi_num_bins = phi_num_bins
+        self.num_r = int(round(r_max / r_step))
 
-        # Precompute g2 and ADF for each structure
         self._entries = []
-        for atoms in atoms_list:
-            positions = torch.tensor(atoms.positions, dtype=torch.float64)
-            sp_tensor = torch.tensor(atoms.numbers, dtype=torch.long)
-            cell_tensor = torch.tensor(atoms.cell.array, dtype=torch.float64)
 
-            with torch.no_grad():
-                g2, adf = calc.compute(positions, sp_tensor, cell_tensor)
+        if kind == "atoms":
+            for atoms in items:
+                atoms.wrap()
 
-            # Normalize: divide by number of center atoms so magnitudes
-            # are comparable across structures of different sizes
-            n_atoms = len(atoms)
-            g2 = g2 / max(n_atoms, 1)
-            adf = adf / max(n_atoms, 1)
+            calc = DifferentiablePDFADF(
+                r_max=r_max, r_step=r_step, phi_num_bins=phi_num_bins,
+                sigma_r=sigma_r, sigma_phi=sigma_phi, species=self.species_list,
+            ).double()
+            self.num_r = calc.num_r
+            self.num_triplets = calc.num_triplets
 
-            # Composition fractions
-            comp_frac = np.zeros(self.num_species, dtype=np.float32)
-            for i, Z in enumerate(self.species_list):
-                comp_frac[i] = (atoms.numbers == Z).sum() / n_atoms
+            for atoms in items:
+                positions = torch.tensor(atoms.positions, dtype=torch.float64)
+                sp_tensor = torch.tensor(atoms.numbers, dtype=torch.long)
+                cell_tensor = torch.tensor(atoms.cell.array, dtype=torch.float64)
 
-            # One-hot encoding
-            z_onehot = self.atom_encoder.transform(atoms.numbers.reshape(-1, 1))
+                with torch.no_grad():
+                    g2, adf = calc.compute(positions, sp_tensor, cell_tensor)
 
-            # Local species indices (for OT assignment)
-            sp_local = np.searchsorted(unique_numbers, atoms.numbers)
+                n_atoms = len(atoms)
+                g2 = (g2 / max(n_atoms, 1)).float()
+                adf = (adf / max(n_atoms, 1)).float()
 
-            entry = {
-                "z": torch.tensor(z_onehot, dtype=torch.float32),
-                "pos": torch.tensor(atoms.positions, dtype=torch.float32),
-                "cell": torch.tensor(atoms.cell.array, dtype=torch.float32),
-                "sp_local": torch.tensor(sp_local, dtype=torch.long),
-                "g2": g2.float(),
-                "adf": adf.float(),
-                "comp_frac": torch.tensor(comp_frac, dtype=torch.float32),
-                "num_atoms": n_atoms,
-            }
-            self._entries.append(entry)
+                comp_frac = np.zeros(self.num_species, dtype=np.float32)
+                for i, Z in enumerate(self.species_list):
+                    comp_frac[i] = (atoms.numbers == Z).sum() / n_atoms
+
+                z_onehot = self.atom_encoder.transform(atoms.numbers.reshape(-1, 1))
+                sp_local = np.searchsorted(unique_numbers, atoms.numbers)
+
+                self._entries.append({
+                    "z": torch.tensor(z_onehot, dtype=torch.float32),
+                    "pos": torch.tensor(atoms.positions, dtype=torch.float32),
+                    "cell": torch.tensor(atoms.cell.array, dtype=torch.float32),
+                    "sp_local": torch.tensor(sp_local, dtype=torch.long),
+                    "g2": g2,
+                    "adf": adf,
+                    "comp_frac": torch.tensor(comp_frac, dtype=torch.float32),
+                    "num_atoms": n_atoms,
+                })
+        else:
+            # Cache entries from precompute_labels.py
+            for e in items:
+                numbers = e["numbers"].numpy()
+                z_onehot = self.atom_encoder.transform(numbers.reshape(-1, 1))
+                sp_local = np.searchsorted(unique_numbers, numbers)
+
+                self._entries.append({
+                    "z": torch.tensor(z_onehot, dtype=torch.float32),
+                    "pos": e["positions"].float(),
+                    "cell": e["cell"].float(),
+                    "sp_local": torch.tensor(sp_local, dtype=torch.long),
+                    "g2": e["g2"].float(),
+                    "adf": e["adf"].float(),
+                    "comp_frac": e["comp_frac"].float(),
+                    "num_atoms": int(e["num_atoms"]),
+                })
+            self.num_triplets = self._entries[0]["adf"].shape[0] if self._entries else 0
 
         # Index map for duplicates
         self._index_map = []
@@ -263,18 +291,18 @@ class FlowMatchDataModule(pl.LightningDataModule):
         self.val_fraction = val_fraction
 
     def setup(self, stage=None):
-        all_atoms = _load_atoms(self._structures)
+        _, items = _load_source(self._structures)
 
-        n_val = max(1, int(len(all_atoms) * self.val_fraction))
-        n_train = len(all_atoms) - n_val
+        n_val = max(1, int(len(items) * self.val_fraction))
+        n_train = len(items) - n_val
 
         rng = np.random.default_rng(42)
-        indices = rng.permutation(len(all_atoms))
-        train_atoms = [all_atoms[i] for i in indices[:n_train]]
-        val_atoms = [all_atoms[i] for i in indices[n_train:]]
+        indices = rng.permutation(len(items))
+        train_items = [items[i] for i in indices[:n_train]]
+        val_items = [items[i] for i in indices[n_train:]]
 
-        self.train_set = FlowMatchDataset(train_atoms, **self._ds_kwargs)
-        self.val_set = FlowMatchDataset(val_atoms, **self._ds_kwargs)
+        self.train_set = FlowMatchDataset(train_items, **self._ds_kwargs)
+        self.val_set = FlowMatchDataset(val_items, **self._ds_kwargs)
 
     def train_dataloader(self):
         return DataLoader(
