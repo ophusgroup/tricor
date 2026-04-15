@@ -25,6 +25,8 @@ class _ShellRelaxMixin:
         bond_weight: float = 1.0,
         angle_weight: float = 0.5,
         repulsion_weight: float = 3.0,
+        hard_core_scale: float = 1.0,
+        nonbond_push_scale: float = 1.0,
         step_size: float = 0.1,
         step_decay: float = 0.995,
         neighbor_update_interval: int = 10,
@@ -55,6 +57,16 @@ class _ShellRelaxMixin:
             ``angle_mode_deg``.
         repulsion_weight
             Strength of the short-range repulsive force below ``pair_hard_min``.
+        hard_core_scale
+            Multiplier for the hard-core repulsion radius.  1.0 uses
+            ``max(pair_hard_min, pair_inner)`` as the wall.  Values
+            below 1.0 allow shorter bonds (softer wall for liquid).
+            Values above 1.0 enforce a larger exclusion zone.
+        nonbond_push_scale
+            Multiplier for the non-bonded shell clearance distance.
+            1.0 pushes non-bonded atoms to ``1.5 * pair_peak``.
+            Values below 1.0 allow non-bonded atoms closer (broader
+            2nd shell for liquid).  0.0 disables non-bonded push.
         step_size
             Initial maximum displacement per step (Angstrom).
         step_decay
@@ -104,7 +116,7 @@ class _ShellRelaxMixin:
         # Hard core: use max of pair_hard_min and pair_inner to
         # prevent any bonds shorter than the shell inner boundary.
         pair_inner = np.asarray(shell_target.pair_inner, dtype=np.float64)
-        hard_core = np.maximum(pair_hard_min, pair_inner)
+        hard_core = np.maximum(pair_hard_min, pair_inner) * float(hard_core_scale)
         mask_zero = hard_core < _EPS
         hard_core[mask_zero] = 0.4 * pair_peak[mask_zero]
         global_floor = float(np.min(pair_peak[pair_peak > _EPS])) * 0.4 if np.any(pair_peak > _EPS) else 1.0
@@ -114,7 +126,7 @@ class _ShellRelaxMixin:
         # For Si, 2nd shell is at ~3.84Å (sqrt(8/3) * pair_peak).
         # Push non-bonded atoms to at least 1.5x pair_peak to
         # eliminate close-packed triplets from nearby non-bonded pairs.
-        nonbond_push = pair_peak * 1.5
+        nonbond_push = pair_peak * 1.5 * float(nonbond_push_scale)
         nonbond_push[nonbond_push < _EPS] = float(np.max(pair_peak)) * 1.5
 
         # --- grain-aware force scaling ---

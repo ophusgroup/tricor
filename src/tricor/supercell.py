@@ -362,30 +362,35 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
 
     PRESETS: dict[str, dict[str, Any]] = {
         "liquid": dict(
-            grain_size=None, bond_weight=0.5, angle_weight=0.08,
-            repulsion_weight=1.5,
-            relative_density=0.86, num_steps=80,
+            grain_size=None,
+            bond_weight=0.3, angle_weight=0.05,
+            repulsion_weight=1.0, hard_core_scale=0.85,
+            relative_density=0.96, num_steps=40,
         ),
         "amorphous": dict(
-            grain_size=4.0, bond_weight=1.5, angle_weight=0.3,
-            relative_density=0.88,
+            grain_size=4.0,
+            bond_weight=1.0, angle_weight=0.3,
+            hard_core_scale=0.92,
+            relative_density=0.96,
         ),
         "SRO": dict(
-            grain_size=8.0, bond_weight=2.0, angle_weight=1.0,
-            relative_density=0.90,
+            grain_size=8.0,
+            bond_weight=2.0, angle_weight=1.0,
+            relative_density=0.96,
         ),
         "MRO": dict(
             grain_size=12.0, crystalline_fraction=0.5,
             bond_weight=2.0, angle_weight=0.6,
-            relative_density=0.92,
+            relative_density=0.96,
         ),
         "mixed": dict(
             grain_size=18.0, crystalline_fraction=0.5,
             bond_weight=2.5, angle_weight=1.0,
-            relative_density=0.94,
+            relative_density=0.96,
         ),
         "nanocrystalline": dict(
-            grain_size=25.0, bond_weight=3.0, angle_weight=1.5,
+            grain_size=25.0,
+            bond_weight=3.0, angle_weight=1.5,
             relative_density=0.96,
         ),
     }
@@ -399,6 +404,9 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         crystalline_fraction: float = 1.0,
         bond_weight: float = 1.0,
         angle_weight: float = 0.5,
+        repulsion_weight: float = 3.0,
+        hard_core_scale: float = 1.0,
+        nonbond_push_scale: float = 1.0,
         displacement_sigma: float = 0.0,
         show_progress: bool = True,
         **shell_relax_kwargs: Any,
@@ -435,7 +443,7 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
             Display a text progress bar.
         **shell_relax_kwargs
             Additional keyword arguments forwarded to :meth:`shell_relax`
-            (e.g. ``repulsion_weight``, ``step_size``, ``num_steps``).
+            (e.g. ``repulsion_weight``, ``hard_core_scale``, ``step_size``).
 
         Returns
         -------
@@ -472,6 +480,9 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
             num_steps=num_steps,
             bond_weight=bond_weight,
             angle_weight=angle_weight,
+            repulsion_weight=repulsion_weight,
+            hard_core_scale=hard_core_scale,
+            nonbond_push_scale=nonbond_push_scale,
             show_progress=show_progress,
             **shell_relax_kwargs,
         )
