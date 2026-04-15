@@ -214,30 +214,32 @@ class _GrainMixin:
         numbers = np.concatenate(all_numbers, axis=0)
         grain_ids = np.concatenate(all_grain_ids, axis=0)
 
-        # --- remove duplicate/overlapping atoms ---
-        # Use the shell inner boundary as overlap threshold to prevent
-        # any bonds shorter than the physical minimum.
+        # --- remove overlapping atoms ---
+        # Iteratively remove atoms closer than pair_inner until no
+        # overlaps remain.  Each pass removes the higher-indexed atom
+        # of each overlapping pair.
         pair_inner_arr = np.asarray(shell_target.pair_inner, dtype=np.float64)
         pair_hard_min = np.asarray(shell_target.pair_hard_min, dtype=np.float64)
         overlap_thresh = float(np.max(np.maximum(pair_inner_arr, pair_hard_min)))
 
-        # Build a temporary Atoms to use neighbor_list
-        temp_atoms = Atoms(
-            numbers=numbers,
-            positions=positions,
-            cell=cell,
-            pbc=self.reference_atoms.pbc,
-        )
-        ov_i, ov_j, ov_d = neighbor_list("ijd", temp_atoms, overlap_thresh)
-
-        # Mark atoms to remove: for each overlapping pair, remove the one
-        # with the higher index (arbitrary but consistent)
-        remove = set()
-        for k in range(len(ov_i)):
-            if ov_i[k] < ov_j[k] and ov_i[k] not in remove:
-                remove.add(int(ov_j[k]))
-
-        if remove:
+        for _pass in range(10):  # safety limit
+            temp_atoms = Atoms(
+                numbers=numbers,
+                positions=positions,
+                cell=cell,
+                pbc=self.reference_atoms.pbc,
+            )
+            ov_i, ov_j, ov_d = neighbor_list("ijd", temp_atoms, overlap_thresh)
+            if len(ov_i) == 0:
+                break
+            # Mark one atom from each pair for removal
+            remove = set()
+            for k in range(len(ov_i)):
+                ai, aj = int(ov_i[k]), int(ov_j[k])
+                if ai not in remove and aj not in remove:
+                    remove.add(max(ai, aj))
+            if not remove:
+                break
             keep_mask = np.ones(len(numbers), dtype=bool)
             keep_mask[list(remove)] = False
             positions = positions[keep_mask]
@@ -318,6 +320,31 @@ class _GrainMixin:
         final_positions_arr = final_positions_arr[shuffle_idx]
         final_numbers_arr = final_numbers_arr[shuffle_idx]
         final_grain_ids_arr = final_grain_ids_arr[shuffle_idx]
+
+        # Final overlap removal pass (stoichiometry adjustment may
+        # have added random atoms that overlap with existing ones)
+        for _pass in range(10):
+            temp = Atoms(
+                numbers=final_numbers_arr,
+                positions=final_positions_arr,
+                cell=cell,
+                pbc=self.reference_atoms.pbc,
+            )
+            ov_i, ov_j, ov_d = neighbor_list("ijd", temp, overlap_thresh)
+            if len(ov_i) == 0:
+                break
+            remove = set()
+            for k in range(len(ov_i)):
+                ai, aj = int(ov_i[k]), int(ov_j[k])
+                if ai not in remove and aj not in remove:
+                    remove.add(max(ai, aj))
+            if not remove:
+                break
+            keep = np.ones(len(final_numbers_arr), dtype=bool)
+            keep[list(remove)] = False
+            final_positions_arr = final_positions_arr[keep]
+            final_numbers_arr = final_numbers_arr[keep]
+            final_grain_ids_arr = final_grain_ids_arr[keep]
 
         atoms = Atoms(
             numbers=final_numbers_arr,

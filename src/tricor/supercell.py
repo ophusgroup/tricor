@@ -362,7 +362,8 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
 
     PRESETS: dict[str, dict[str, Any]] = {
         "liquid": dict(
-            grain_size=None, bond_weight=1.0, angle_weight=0.12,
+            grain_size=None, bond_weight=0.5, angle_weight=0.08,
+            repulsion_weight=1.5,
             relative_density=0.86, num_steps=80,
         ),
         "amorphous": dict(

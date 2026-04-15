@@ -383,19 +383,16 @@ class _PlottingMixin:
 
             # --- crystalline bonds: depth-coloured + depth-width ---
             # Camera at +x (azim=0): larger rotated-x = closer.
-            # Use squared depth for stronger contrast: close bonds pop,
-            # far bonds fade to near-white via the Reds colormap.
+            # Linear depth with floor so far bonds remain visible.
             if np.any(cryst_mask):
                 segs_cr = list(zip(bs_r[cryst_mask], be_r[cryst_mask]))
                 mid_x_rot = 0.5 * (bs_r[cryst_mask, 0] + be_r[cryst_mask, 0])
                 norm_depth = (mid_x_rot + extent) / max(2.0 * extent, _EPS)
                 norm_depth = np.clip(norm_depth, 0, 1)
-                # Square for stronger contrast: far → ~0 (white), close → 1 (bold)
-                norm_sq = norm_depth ** 2
-                # Colormap range 0.05–0.95 to avoid pure white and clipping
-                cryst_colors = cmap(0.05 + 0.9 * norm_sq)
-                # Linewidth: 0.2 at back, 2.5 at front
-                cryst_lw = 0.2 + 2.3 * norm_sq
+                # Colormap: 0.15 at back (faint but visible), 0.95 at front
+                cryst_colors = cmap(0.15 + 0.8 * norm_depth)
+                # Linewidth: 0.4 at back, 2.0 at front
+                cryst_lw = 0.4 + 1.6 * norm_depth
                 lc_c = Line3DCollection(
                     segs_cr, linewidths=cryst_lw, colors=cryst_colors,
                 )
