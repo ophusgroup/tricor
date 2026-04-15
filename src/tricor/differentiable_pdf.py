@@ -393,11 +393,14 @@ class DifferentiableSpectralLoss(nn.Module):
             loss: Scalar total loss.
             components: Dict with 'pdf_loss' and 'adf_loss' for diagnostics.
         """
-        g2, adf_pred = self.calc.compute(positions, species, cell)
+        if self.adf_weight == 0.0 and hasattr(self.calc, "compute_g2_only"):
+            g2, _ = self.calc.compute_g2_only(positions, species, cell)
+            adf_loss = torch.zeros((), device=g2.device, dtype=g2.dtype)
+        else:
+            g2, adf_pred = self.calc.compute(positions, species, cell)
+            adf_loss = torch.mean((adf_pred - target_adf) ** 2)
 
         pdf_loss = torch.mean((g2 - target_g2) ** 2)
-        adf_loss = torch.mean((adf_pred - target_adf) ** 2)
-
         loss = self.pdf_weight * pdf_loss + self.adf_weight * adf_loss
 
         return loss, {"pdf_loss": pdf_loss.detach(), "adf_loss": adf_loss.detach()}

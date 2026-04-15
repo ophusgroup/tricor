@@ -107,11 +107,17 @@ def per_species_ot_assignment(
         cost = delta.pow(2).sum(dim=-1).cpu().numpy()  # (n_sp, n_sp)
 
         # Hungarian algorithm
+        # row_ind[i], col_ind[i] means: noise atom row_ind[i] pairs with data atom col_ind[i]
         row_ind, col_ind = linear_sum_assignment(cost)
 
-        # Apply permutation: x0[idx[row_ind]] should pair with x1[idx[col_ind]]
-        # Since row_ind is already 0..n_sp-1 in order, we permute x0 indices
-        perm[idx[row_ind]] = idx[col_ind]
+        # We want perm such that x0[perm][i] is close to x1[i].
+        # row_ind[i] is the noise atom, col_ind[i] is the data atom it should pair with.
+        # So noise atom row_ind[i] should end up at position col_ind[i].
+        # Equivalently: at position col_ind[i], we want noise atom row_ind[i].
+        # perm[col_ind[i]] = row_ind[i] → x0[perm][col_ind[i]] = x0[row_ind[i]]
+        inv_col = torch.empty_like(idx)
+        inv_col[torch.tensor(col_ind, device=idx.device)] = torch.tensor(row_ind, device=idx.device)
+        perm[idx] = idx[inv_col]
 
     return perm
 
