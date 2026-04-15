@@ -451,15 +451,9 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         use_grains = grain_size is not None and float(grain_size) > 0.0
 
         if use_grains:
-            min_grain_size = pair_peak_max * 3.0
-            grain_size_clamped = max(float(grain_size), min_grain_size)
-
-            boundary_loss = pair_peak_max * 0.75
-            construction_grain_size = grain_size_clamped + 2.0 * boundary_loss
-
             self.atoms = self._build_grain_atoms(
                 shell_target,
-                grain_size=construction_grain_size,
+                grain_size=float(grain_size),
                 crystalline_fraction=crystalline_fraction,
                 displacement_sigma=displacement_sigma,
             )
@@ -487,7 +481,6 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
             summary["regime"] = "nanocrystalline" if crystalline_fraction >= 0.9 else "mixed"
             summary["n_grains"] = int(self.atoms.info.get("n_grains", 0))
             summary["grain_size"] = float(grain_size)
-            summary["construction_grain_size"] = construction_grain_size
             summary["crystalline_fraction"] = crystalline_fraction
         else:
             summary["regime"] = "amorphous"
