@@ -38,6 +38,7 @@ class G3CompareWidget(anywidget.AnyWidget):
     sigma_r = traitlets.Float(0.0).tag(sync=True)
     sigma_phi = traitlets.Float(0.0).tag(sync=True)
     slice_max = traitlets.Float(-1.0).tag(sync=True)
+    auto_shell = traitlets.Bool(True).tag(sync=True)
     supercell_title = traitlets.Unicode("Supercell g3 slice").tag(sync=True)
     target_title = traitlets.Unicode("Target g3 slice").tag(sync=True)
     status = traitlets.Unicode("").tag(sync=True)
@@ -104,7 +105,8 @@ class G3CompareWidget(anywidget.AnyWidget):
         if self._suspend_callbacks:
             return
         self._suspend_callbacks = True
-        self._set_default_shell()
+        if self.auto_shell:
+            self._set_default_shell()
         self._update_payload()
         self._suspend_callbacks = False
 
