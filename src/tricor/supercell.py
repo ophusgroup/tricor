@@ -488,6 +488,12 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         )
 
         # --- summary ---
+        ref_density = len(self.target_distribution.atoms) / max(
+            float(self.target_distribution.atoms.cell.volume), _EPS,
+        )
+        actual_density = len(self.atoms) / max(float(self.atoms.cell.volume), _EPS)
+        actual_relative = actual_density / max(ref_density, _EPS)
+
         if use_grains:
             summary["regime"] = "nanocrystalline" if crystalline_fraction >= 0.9 else "mixed"
             summary["n_grains"] = int(self.atoms.info.get("n_grains", 0))
@@ -495,6 +501,9 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
             summary["crystalline_fraction"] = crystalline_fraction
         else:
             summary["regime"] = "amorphous"
+        summary["num_atoms"] = len(self.atoms)
+        summary["target_density"] = self.relative_density
+        summary["actual_density"] = float(f"{actual_relative:.4f}")
 
         return summary
 

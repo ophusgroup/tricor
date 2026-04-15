@@ -22,6 +22,7 @@ class _GrainMixin:
         grain_size: float,
         crystalline_fraction: float = 1.0,
         displacement_sigma: float = 0.0,
+        max_density_passes: int = 5,
     ) -> Atoms:
         """Build a supercell with crystalline grains via Voronoi construction.
 
@@ -209,66 +210,91 @@ class _GrainMixin:
             numbers = numbers[keep]
             grain_ids = grain_ids[keep]
 
-        # ---- Step 4: fill amorphous cells with random atoms ----
-        n_fill = max(0, total_target - len(positions))
+        # ---- Step 4: fill to target density ----
+        # Place atoms in low-density regions (grain boundaries).
+        # Strategy: find voids by generating candidates near existing
+        # atoms with random offsets, then keep those that are far
+        # enough from all existing atoms.
+        species_frac = counts.astype(float) / max(total_target, 1)
+        pair_peak_val = float(np.max(
+            np.asarray(shell_target.pair_peak, dtype=np.float64),
+        ))
+        # Fill overlap threshold: starts at 0.85 * NN distance and
+        # decreases each pass if density can't be reached.  This
+        # allows tight packing in narrow grain-boundary voids while
+        # keeping fill atoms as far apart as possible.
+        fill_thresh_start = pair_peak_val * 0.85
+        fill_thresh_min = pair_peak_val * 0.55
 
-        if n_fill > 0:
-            if n_crystalline < n_seeds:
-                # Generate random positions, keep those in amorphous cells
-                oversample = max(3, int(np.ceil(n_seeds / max(n_seeds - n_crystalline, 1))))
-                cand_frac = self.rng.random((n_fill * oversample, 3))
-                cand_pos = cand_frac @ cell_mat
+        for _density_pass in range(max_density_passes):
+            n_fill = max(0, total_target - len(positions))
+            if n_fill == 0:
+                break
 
-                nearest_c = _voronoi(cand_pos)
-                in_amorphous = ~is_crystalline_cell[nearest_c]
-                fill_pos = cand_pos[in_amorphous][:n_fill]
-            else:
-                # All cells crystalline, add random positions anywhere
-                fill_frac = self.rng.random((n_fill, 3))
-                fill_pos = fill_frac @ cell_mat
+            # Generate candidates: random offsets from existing atoms
+            # at roughly the NN distance.  This places candidates in
+            # the void regions near grain boundaries.
+            n_candidates = n_fill * 10
+            source_idx = self.rng.integers(0, len(positions), size=n_candidates)
+            offsets = self.rng.normal(0.0, pair_peak_val * 0.6, size=(n_candidates, 3))
+            cand_pos = positions[source_idx] + offsets
+
+            # Wrap into box
+            frac_cand = cand_pos @ cell_inv
+            frac_cand %= 1.0
+            cand_pos = frac_cand @ cell_mat
+
+            # Check distances to all existing atoms
+            combined = np.concatenate([positions, cand_pos], axis=0)
+            combined_nums = np.concatenate([
+                numbers,
+                np.zeros(len(cand_pos), dtype=numbers.dtype),
+            ])
+            # Decrease threshold each pass to fill tighter voids
+            t = _density_pass / max(max_density_passes - 1, 1)
+            fill_thresh = fill_thresh_start + t * (fill_thresh_min - fill_thresh_start)
+
+            temp = Atoms(numbers=combined_nums, positions=combined,
+                         cell=cell, pbc=self.reference_atoms.pbc)
+            ov_i, ov_j, ov_d = neighbor_list("ijd", temp, fill_thresh)
+
+            # Reject candidates that overlap with existing atoms
+            n_existing = len(positions)
+            bad = set()
+            for k in range(len(ov_i)):
+                ai, aj = int(ov_i[k]), int(ov_j[k])
+                if ai >= n_existing:
+                    bad.add(ai - n_existing)
+                if aj >= n_existing:
+                    bad.add(aj - n_existing)
+
+            good_mask = np.ones(len(cand_pos), dtype=bool)
+            if bad:
+                good_mask[list(bad)] = False
+            good_pos = cand_pos[good_mask][:n_fill]
+
+            if len(good_pos) == 0:
+                break
 
             # Assign species proportionally
-            species_frac = counts.astype(float) / max(total_target, 1)
             fill_nums = np.repeat(
                 species,
-                np.round(species_frac * len(fill_pos)).astype(int),
+                np.round(species_frac * len(good_pos)).astype(int),
             )
-            if len(fill_nums) < len(fill_pos):
+            if len(fill_nums) < len(good_pos):
                 fill_nums = np.concatenate([
                     fill_nums,
-                    np.repeat(species[0:1], len(fill_pos) - len(fill_nums)),
+                    np.repeat(species[0:1], len(good_pos) - len(fill_nums)),
                 ])
-            fill_nums = fill_nums[:len(fill_pos)]
+            fill_nums = fill_nums[:len(good_pos)]
             self.rng.shuffle(fill_nums)
 
-            positions = np.concatenate([positions, fill_pos], axis=0)
+            positions = np.concatenate([positions, good_pos], axis=0)
             numbers = np.concatenate([numbers, fill_nums], axis=0)
             grain_ids = np.concatenate([
                 grain_ids,
-                np.full(len(fill_pos), -1, dtype=np.intp),
+                np.full(len(good_pos), -1, dtype=np.intp),
             ], axis=0)
-
-            # Final overlap removal (fill atoms may overlap grains)
-            for _pass in range(10):
-                if len(positions) == 0:
-                    break
-                temp = Atoms(numbers=numbers, positions=positions,
-                             cell=cell, pbc=self.reference_atoms.pbc)
-                ov_i, ov_j, ov_d = neighbor_list("ijd", temp, overlap_thresh)
-                if len(ov_i) == 0:
-                    break
-                remove = set()
-                for k in range(len(ov_i)):
-                    ai, aj = int(ov_i[k]), int(ov_j[k])
-                    if ai not in remove and aj not in remove:
-                        remove.add(max(ai, aj))
-                if not remove:
-                    break
-                keep = np.ones(len(numbers), dtype=bool)
-                keep[list(remove)] = False
-                positions = positions[keep]
-                numbers = numbers[keep]
-                grain_ids = grain_ids[keep]
 
         if len(positions) == 0:
             return self._build_random_atoms()
