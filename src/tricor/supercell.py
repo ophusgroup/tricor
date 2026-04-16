@@ -362,36 +362,51 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
 
     PRESETS: dict[str, dict[str, Any]] = {
         "liquid": dict(
+            relative_density=0.96, num_steps=100,
             grain_size=None,
-            bond_weight=0.3, angle_weight=0.05,
-            repulsion_weight=1.0, hard_core_scale=0.85,
-            relative_density=0.96, num_steps=40,
+            bond_weight=0.4, angle_weight=0.5,
+            repulsion_weight=0.5,
+            hard_core_scale=0.75, nonbond_push_scale=0.7,
         ),
         "amorphous": dict(
-            grain_size=4.0,
-            bond_weight=1.0, angle_weight=0.3,
-            hard_core_scale=0.92,
-            relative_density=0.96,
+            relative_density=0.96, num_steps=150,
+            grain_size=6.0,
+            bond_weight=1.2, angle_weight=0.6,
+            hard_core_scale=0.9, nonbond_push_scale=0.8,
+            displacement_sigma=0.08,
         ),
         "SRO": dict(
-            grain_size=8.0,
-            bond_weight=2.0, angle_weight=1.0,
-            relative_density=0.96,
+            relative_density=0.96, num_steps=200,
+            grain_size=10.0,
+            bond_weight=2.2, angle_weight=1.0,
+            hard_core_scale=0.95, nonbond_push_scale=0.9,
+            displacement_sigma=0.04,
         ),
         "MRO": dict(
-            grain_size=12.0, crystalline_fraction=0.5,
-            bond_weight=2.0, angle_weight=0.6,
-            relative_density=0.96,
+            relative_density=0.96, num_steps=150,
+            grain_size=13.0,
+            bond_weight=1.9, angle_weight=0.9,
+            hard_core_scale=0.95, nonbond_push_scale=0.9,
+            displacement_sigma=0.04,
         ),
-        "mixed": dict(
-            grain_size=18.0, crystalline_fraction=0.5,
-            bond_weight=2.5, angle_weight=1.0,
-            relative_density=0.96,
+        "MRO_more": dict(
+            relative_density=0.96, num_steps=150,
+            grain_size=18.0,
+            bond_weight=2.0, angle_weight=1.0,
+            hard_core_scale=0.95, nonbond_push_scale=0.9,
+            displacement_sigma=0.04,
         ),
-        "nanocrystalline": dict(
-            grain_size=25.0,
+        "nanocrystalline_10": dict(
+            relative_density=0.96, num_steps=200,
+            grain_size=15.0,
+            bond_weight=2.8, angle_weight=1.3,
+            displacement_sigma=0.02,
+        ),
+        "nanocrystalline_20": dict(
+            relative_density=0.96, num_steps=150,
+            grain_size=20.0,
             bond_weight=3.0, angle_weight=1.5,
-            relative_density=0.96,
+            displacement_sigma=0.02,
         ),
     }
 

@@ -220,9 +220,7 @@ class _GrainMixin:
             np.asarray(shell_target.pair_peak, dtype=np.float64),
         ))
         # Fill overlap threshold: starts at 0.85 * NN distance and
-        # decreases each pass if density can't be reached.  This
-        # allows tight packing in narrow grain-boundary voids while
-        # keeping fill atoms as far apart as possible.
+        # decreases each pass if density can't be reached.
         fill_thresh_start = pair_peak_val * 0.85
         fill_thresh_min = pair_peak_val * 0.55
 

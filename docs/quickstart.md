@@ -3,7 +3,7 @@
 ## Installation
 
 ```bash
-git clone https://github.com/cophus/tricor.git
+git clone https://github.com/ophusgroup/tricor.git
 cd tricor
 uv sync
 ```
@@ -28,18 +28,20 @@ cell = tc.Supercell.from_atoms(
     r_max=10,
     r_step=0.1,
     phi_num_bins=90,
-    relative_density=0.92,
+    relative_density=0.96,
     rng_seed=42,
 )
 
 # 3. Generate structure (MRO example)
 cell.generate(
     shell_target,
-    grain_size=12.0,
-    crystalline_fraction=0.5,
-    bond_weight=2.0,
-    angle_weight=0.6,
     num_steps=150,
+    grain_size=13.0,
+    bond_weight=1.9,
+    angle_weight=0.9,
+    hard_core_scale=0.95,
+    nonbond_push_scale=0.9,
+    displacement_sigma=0.04,
 )
 
 # 4. Measure and view g3
@@ -52,11 +54,6 @@ cell.view_structure()
 # 6. Export movie
 cell.plot_structure(output='structure.mp4')
 ```
-
-<!-- Uncomment when images are available:
-![Si MRO g3 distribution](images/si_mro_g3.png)
-![Si MRO structure](images/si_mro_structure.png)
--->
 
 ## Binary example (SiC)
 
@@ -73,19 +70,21 @@ cell = tc.Supercell.from_atoms(
     r_max=10,
     r_step=0.1,
     phi_num_bins=90,
-    relative_density=0.92,
+    relative_density=0.96,
     rng_seed=42,
 )
 cell.generate(
     shell_target,
-    grain_size=12.0,
-    crystalline_fraction=0.5,
-    bond_weight=2.0,
-    angle_weight=0.6,
+    grain_size=13.0,
+    bond_weight=1.9,
+    angle_weight=0.9,
+    hard_core_scale=0.95,
+    nonbond_push_scale=0.9,
+    displacement_sigma=0.04,
 )
 
 cell.measure_g3()
-cell.plot_g3()  # browse Si-Si-Si, Si-C-Si, C-C-C, ... triplets
+cell.plot_g3()  # browse Si | Si Si, C | C C, etc.
 ```
 
 ## Using presets
@@ -95,14 +94,12 @@ Recommended parameter sets for Si are available as `Supercell.PRESETS`:
 ```python
 import tricor as tc
 
-# View available presets
 for name, params in tc.Supercell.PRESETS.items():
     print(f"{name}: {params}")
 ```
 
 ```python
-# Use a preset
-preset = tc.Supercell.PRESETS["nanocrystalline"].copy()
+preset = tc.Supercell.PRESETS["nanocrystalline_20"].copy()
 density = preset.pop("relative_density", 1.0)
 
 cell = tc.Supercell.from_atoms(
