@@ -6,4 +6,9 @@ __pycache__/
 .ipynb_checkpoints/
 build/
 dist/
+.claude/worktrees/
+
+src/tricor/.DS_Store
+
 .DS_Store
+docs/_build/

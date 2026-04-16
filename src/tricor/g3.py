@@ -628,7 +628,7 @@ class G3Distribution:
             self.g3_lookup[center_ind, neigh2_ind, neigh1_ind] = triplet_ind
         species_labels = [chemical_symbols[int(spec)] for spec in self.species]
         self.pair_labels = [
-            f"{species_labels[ind1]}-{species_labels[ind0]}-{species_labels[ind2]}"
+            f"{species_labels[ind0]} | {species_labels[ind1]} {species_labels[ind2]}"
             for ind0, ind1, ind2 in self.g3_index
         ]
         self.species_pairs = [tuple(int(v) for v in triplet) for triplet in self.g3_index]
