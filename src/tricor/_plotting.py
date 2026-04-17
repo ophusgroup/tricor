@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path as _Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -10,6 +11,299 @@ from .g3 import _EPS, _TextProgressBar
 if TYPE_CHECKING:
     from .shells import CoordinationShellTarget
     from .supercell import Supercell
+
+
+_STATIC_DIR = _Path(__file__).parent / "static"
+_TRAJECTORY_HTML_TEMPLATE = (_STATIC_DIR / "trajectory_viewer.html").read_text()
+_G3_HTML_TEMPLATE = (_STATIC_DIR / "g3_viewer.html").read_text()
+_OVERVIEW_HTML_TEMPLATE = (_STATIC_DIR / "overview_viewer.html").read_text()
+
+
+def export_overview_html(
+    output_path: str,
+    cells_and_labels,
+    *,
+    grid_cols: int = 3,
+    atom_scale: float = 0.18,
+    bond_radius: float = 0.07,
+    bond_color=(0.95, 0.1, 0.1),
+    background_color: str = "#f7f8f5",
+    title: str = "",
+    subtitle: str = "",
+    bond_cutoff_scale: float = 1.2,
+    max_bonds_per_atom: int = 4,
+    bond_length_tol: float = 0.10,
+    ideal_angle_deg: float = 109.47,
+    bond_angle_tol_deg: float = 18.0,
+) -> str:
+    """Export a grid of static 3D structures as a self-contained HTML file.
+
+    Each panel renders the final atoms of one :class:`Supercell` using ASE
+    element colours, black outlines, and red bonds.  All panels share a
+    camera that auto-rotates; dragging any panel pauses the rotation and
+    orbits manually.
+
+    Parameters
+    ----------
+    output_path
+        Path to write the HTML file.
+    cells_and_labels
+        Iterable of ``(supercell, label)`` pairs.
+    grid_cols
+        Number of columns in the grid (rows are inferred).
+    atom_scale, bond_radius
+        Same meaning as in :meth:`export_trajectory_html`.
+    bond_color
+        RGB tuple in [0,1] for the bond colour (default red).
+    background_color, title, subtitle
+        Cosmetic.
+    bond_cutoff_scale
+        Bond cutoff = ``shell_target.pair_peak.max() * bond_cutoff_scale``
+        (fallback ``3.0`` Å if no ``shell_target`` is attached).
+    """
+    import json
+    from ase.data import covalent_radii
+    from ase.data.colors import jmol_colors
+
+    structures = []
+    for cell, label in cells_and_labels:
+        atoms = cell.atoms
+
+        shell_target = getattr(cell, "_shell_target", None)
+        if shell_target is not None:
+            pair_peak = float(np.max(
+                np.asarray(shell_target.pair_peak, dtype=np.float64),
+            ))
+        else:
+            pair_peak = 2.35
+        cutoff_lo = pair_peak * (1.0 - bond_length_tol)
+        cutoff_hi = pair_peak * (1.0 + bond_length_tol)
+        search_cutoff = pair_peak * bond_cutoff_scale
+
+        bi_all, bj_all, bd_all, bD_all = neighbor_list(
+            "ijdD", atoms, float(search_cutoff),
+        )
+
+        # Radial filter - keep only near-ideal bond lengths.
+        length_ok = (bd_all >= cutoff_lo) & (bd_all <= cutoff_hi)
+        bi_all = bi_all[length_ok]
+        bj_all = bj_all[length_ok]
+        bd_all = bd_all[length_ok]
+        bD_all = bD_all[length_ok]
+
+        # Take the ``max_bonds_per_atom`` shortest in-band neighbours per atom.
+        order = np.lexsort((bd_all, bi_all))
+        bi_s = bi_all[order]
+        bj_s = bj_all[order]
+        bD_s = bD_all[order]
+        keep_mask = np.zeros(bi_s.size, dtype=bool)
+        if bi_s.size:
+            unique_i, start_idx = np.unique(bi_s, return_index=True)
+            end_idx = np.concatenate([start_idx[1:], [bi_s.size]])
+            for s, e in zip(start_idx, end_idx):
+                keep_mask[s : min(s + max_bonds_per_atom, e)] = True
+        bi_top = bi_s[keep_mask]
+        bj_top = bj_s[keep_mask]
+        bD_top = bD_s[keep_mask]
+
+        # Angular filter: only keep bonds from atoms whose selected neighbours
+        # form a tetrahedron whose 6 pair-wise angles are all within
+        # ``bond_angle_tol_deg`` of ``ideal_angle_deg``.  Atoms that don't
+        # satisfy this test contribute no bonds at all.
+        ideal_angle = float(np.deg2rad(ideal_angle_deg))
+        angle_tol = float(np.deg2rad(bond_angle_tol_deg))
+        needed = int(max_bonds_per_atom)
+
+        n_atoms = len(atoms)
+        per_atom_js: list[list] = [[] for _ in range(n_atoms)]
+        per_atom_vs: list[list] = [[] for _ in range(n_atoms)]
+        for i_, j_, v_ in zip(bi_top.tolist(), bj_top.tolist(), bD_top):
+            if len(per_atom_js[i_]) < needed:
+                per_atom_js[i_].append(int(j_))
+                per_atom_vs[i_].append(v_)
+
+        good_pairs: set[tuple[int, int]] = set()
+        for i_ in range(n_atoms):
+            js = per_atom_js[i_]
+            if len(js) < needed:
+                continue
+            vecs = np.asarray(per_atom_vs[i_], dtype=np.float64)
+            norms = np.linalg.norm(vecs, axis=1)
+            if np.any(norms <= 1e-9):
+                continue
+            unit = vecs / norms[:, None]
+            # Pairwise cosines (needed×needed); off-diagonal entries are the
+            # 6 angles we care about for a 4-neighbour atom.
+            cos = np.clip(unit @ unit.T, -1.0, 1.0)
+            angles = np.arccos(cos)
+            triu = np.triu_indices(needed, k=1)
+            dev = np.abs(angles[triu] - ideal_angle)
+            if np.max(dev) <= angle_tol:
+                for j_ in js:
+                    good_pairs.add((min(i_, j_), max(i_, j_)))
+
+        if good_pairs:
+            pair_arr = np.asarray(sorted(good_pairs), dtype=np.int32)
+            bi = pair_arr[:, 0]
+            bj = pair_arr[:, 1]
+        else:
+            bi = np.zeros(0, dtype=np.int32)
+            bj = np.zeros(0, dtype=np.int32)
+
+        numbers = atoms.numbers
+        colors = np.array([jmol_colors[z] for z in numbers], dtype=np.float32)
+        radii = np.array([covalent_radii[z] for z in numbers], dtype=np.float32)
+        cell_mat = np.asarray(atoms.cell.array, dtype=np.float32)
+
+        centre = 0.5 * np.sum(cell_mat, axis=0)
+        pos = (atoms.positions - centre).astype(np.float32)
+        # Round to 3 decimals (Å) to keep the JSON footprint small.
+        pos = np.round(pos, 3)
+
+        structures.append({
+            "label": label,
+            "num_atoms": int(len(atoms)),
+            "num_bonds": int(len(bi)),
+            "positions": pos.ravel().tolist(),
+            "atom_colors": colors.ravel().tolist(),
+            "atom_radii": np.round(radii, 3).tolist(),
+            "bond_i": bi.tolist(),
+            "bond_j": bj.tolist(),
+            "cell_matrix": np.round(cell_mat, 3).ravel().tolist(),
+        })
+
+    data = {
+        "structures": structures,
+        "grid_cols": int(grid_cols),
+        "grid_rows": int(-(-len(structures) // grid_cols)),
+        "atom_scale": float(atom_scale),
+        "bond_radius": float(bond_radius),
+        "bond_color": list(bond_color),
+        "background_color": background_color,
+        "title": title,
+        "subtitle": subtitle,
+    }
+
+    html = _OVERVIEW_HTML_TEMPLATE.replace(
+        "__TRICOR_DATA_PLACEHOLDER__",
+        json.dumps(data),
+    )
+    output_path = str(output_path)
+    with open(output_path, "w") as f:
+        f.write(html)
+    return output_path
+
+
+def _detect_shell_mask(triplet_data: np.ndarray, r: np.ndarray) -> np.ndarray:
+    """Auto-detect the first NN shell over r for one triplet of g3."""
+    # Pair profile: collapse both angular-partner and phi dimensions.
+    profile = triplet_data.sum(axis=(1, 2)) + triplet_data.sum(axis=(0, 2))
+    profile = profile / np.maximum(r * r, _EPS)
+    finite = np.nan_to_num(profile, nan=0.0, posinf=0.0, neginf=0.0)
+    mask = np.zeros_like(r, dtype=bool)
+    positive = np.flatnonzero(finite > 0)
+    if positive.size == 0:
+        return mask
+    start = int(positive[0])
+    peak_bin = None
+    for idx in range(max(start, 1), finite.size - 1):
+        if finite[idx] >= finite[idx - 1] and finite[idx] > finite[idx + 1]:
+            peak_bin = idx
+            break
+    if peak_bin is None:
+        peak_bin = int(start + int(np.argmax(finite[start:])))
+    threshold = max(1e-12, 0.01 * float(finite[peak_bin]))
+    leading = np.flatnonzero(finite[: peak_bin + 1] > threshold)
+    left_bin = int(leading[0]) if leading.size else start
+    right_bin = min(finite.size - 1, peak_bin + 1)
+    for idx in range(peak_bin + 1, finite.size - 1):
+        if finite[idx] <= finite[idx - 1] and finite[idx] <= finite[idx + 1]:
+            right_bin = idx
+            break
+    mask[left_bin : right_bin + 1] = True
+    return mask
+
+
+def _g3_pair_profile(
+    dist: "Any",
+    triplet_idx: int,
+    r: np.ndarray,
+) -> np.ndarray:
+    """Return the per-triplet pair profile g(r), normalised so tail -> 1.0."""
+    g2 = getattr(dist, "g2", None)
+    g3_index = getattr(dist, "g3_index", None)
+    if g2 is not None and g3_index is not None:
+        center_ind, neigh1_ind, neigh2_ind = g3_index[triplet_idx]
+        profile = np.asarray(g2[center_ind, neigh1_ind], dtype=np.float64).copy()
+        profile += np.asarray(g2[center_ind, neigh2_ind], dtype=np.float64)
+    else:
+        triplet_data = np.asarray(dist.g3[triplet_idx], dtype=np.float64)
+        profile = triplet_data.sum(axis=(1, 2)) + triplet_data.sum(axis=(0, 2))
+
+    profile = profile / np.maximum(r * r, _EPS)
+    # Scale so the tail converges to 1.0
+    tail_start = 0.7 * float(r[-1])
+    tail_mask = r >= tail_start
+    if not np.any(tail_mask):
+        tail_mask = np.zeros_like(r, dtype=bool)
+        tail_mask[-max(1, r.size // 4) :] = True
+    tail = profile[tail_mask]
+    finite = tail[np.isfinite(tail)]
+    scale = float(np.mean(finite)) if finite.size else 1.0
+    if scale <= _EPS:
+        scale = 1.0
+    return (profile / scale).astype(np.float32)
+
+
+def _g3_slice_image(
+    triplet_data: np.ndarray,
+    shell_mask: np.ndarray,
+    r: np.ndarray,
+    phi_deg: np.ndarray,
+) -> np.ndarray:
+    """Compute the (num_phi, num_r) reduced-density slice for one triplet.
+
+    Normalised so that the uniform far-field tends to 1.0.
+    """
+    image = triplet_data[shell_mask, :, :].sum(axis=0)
+    image += triplet_data[:, shell_mask, :].sum(axis=1)
+    image = image.T  # (num_phi, num_r)
+
+    phi_rad = np.deg2rad(phi_deg)
+    phi_factor = np.maximum(np.sin(phi_rad), 1e-3)[:, None]
+    radial_factor = np.maximum(r * r, _EPS)[None, :]
+    image = image / (phi_factor * radial_factor)
+
+    tail_start = 0.7 * float(r[-1])
+    tail_mask = r >= tail_start
+    if not np.any(tail_mask):
+        tail_mask = np.zeros_like(r, dtype=bool)
+        tail_mask[-max(1, r.size // 4) :] = True
+    tail = image[:, tail_mask]
+    finite = tail[np.isfinite(tail)]
+    scale = float(np.mean(finite)) if finite.size else 1.0
+    if scale <= _EPS:
+        scale = 1.0
+    return (image / scale).astype(np.float32)
+
+
+def _nice_round_up(v: float) -> float:
+    """Round *v* up to a ``nice`` number whose half is also clean.
+
+    Picks the smallest value in [1, 2, 4, 5, 10] x 10**k that is >= v.
+    E.g. 3.85 -> 4.0, 0.87 -> 1.0, 12.5 -> 20.0, 2.1 -> 4.0.
+    """
+    import math
+
+    if v <= 0 or not math.isfinite(v):
+        return 1.0
+    exp = math.floor(math.log10(v))
+    magnitude = 10.0 ** exp
+    mantissa = v / magnitude
+    for m in (1.0, 2.0, 4.0, 5.0, 10.0):
+        if mantissa <= m + 1e-9:
+            return m * magnitude
+    return 10.0 * magnitude
 
 
 class _PlottingMixin:
@@ -150,6 +444,239 @@ class _PlottingMixin:
         ax.grid(alpha=0.25)
         fig.tight_layout()
         return fig, ax
+
+    def export_trajectory_html(
+        self: "Supercell",
+        output_path: str,
+        *,
+        bond_cutoff: float | None = None,
+        atom_scale: float = 0.32,
+        bond_radius: float = 0.06,
+        background_color: str = "#f7f8f5",
+        title: str = "",
+    ) -> str:
+        """Export an interactive 3D trajectory viewer as a self-contained HTML file.
+
+        Requires :meth:`shell_relax` or :meth:`generate` to have been run
+        with ``capture_trajectory=True``.  The resulting HTML embeds the
+        full position trajectory, uses Three.js (from CDN) for rendering,
+        and provides play/pause/slider controls.
+
+        Parameters
+        ----------
+        output_path
+            Path to write the HTML file.
+        bond_cutoff
+            Maximum bond length in Angstrom.  If ``None`` and the
+            supercell was generated with a shell_target, uses
+            ``shell_target.max_pair_outer * 1.2``.  Otherwise 3.0.
+        atom_scale
+            Radius scale for atom spheres (multiplied by covalent radii).
+        bond_radius
+            Radius of bond cylinders in Angstrom.
+        background_color
+            CSS colour for the viewer background.
+        title
+            Optional title displayed above the viewer.
+
+        Returns
+        -------
+        str
+            The output path.
+        """
+        import json
+        from ase.data import covalent_radii
+        from ase.data.colors import jmol_colors
+
+        history = self.shell_relax_history
+        if history is None or "trajectory" not in history:
+            raise ValueError(
+                "No trajectory data available.  Run shell_relax() or "
+                "generate() with capture_trajectory=True first."
+            )
+        trajectory = np.asarray(history["trajectory"], dtype=np.float32)
+        n_frames, n_atoms, _ = trajectory.shape
+
+        atom_cost = history.get("atom_cost")
+        if atom_cost is not None:
+            atom_cost = np.asarray(atom_cost, dtype=np.float32)
+            # Global colour range (constant across frames).  Use 99th percentile
+            # of non-zero values to avoid single hot-spot saturation, then round
+            # up to a "nice" value so the 0 / mid / max ticks are clean.
+            flat = atom_cost.ravel()
+            cost_min = 0.0
+            positive = flat[flat > 0.0]
+            if positive.size:
+                raw_max = float(np.percentile(positive, 99.0))
+                if raw_max <= 0.0:
+                    raw_max = float(positive.max())
+            else:
+                raw_max = 1.0
+            cost_max = _nice_round_up(raw_max)
+
+        # Bond cutoff
+        shell_target = getattr(self, "_shell_target", None)
+        if bond_cutoff is None:
+            if shell_target is not None:
+                pair_peak_max = float(np.max(
+                    np.asarray(shell_target.pair_peak, dtype=np.float64),
+                ))
+                bond_cutoff = pair_peak_max * 1.2
+            else:
+                bond_cutoff = 3.0
+
+        # Bond topology from final frame
+        bi_all, bj_all, bd_all = neighbor_list(
+            "ijd", self.atoms, float(bond_cutoff),
+        )
+        mask = bi_all < bj_all
+        bi = bi_all[mask].astype(np.int32)
+        bj = bj_all[mask].astype(np.int32)
+
+        # Atom metadata
+        numbers = self.atoms.numbers
+        colors = np.array([jmol_colors[z] for z in numbers], dtype=np.float32)
+        radii = np.array([covalent_radii[z] for z in numbers], dtype=np.float32)
+
+        # Cell matrix (for min-image bond wrapping in JS)
+        cell_mat = np.asarray(self.atoms.cell.array, dtype=np.float32)
+
+        # Centre all frames at the cell centre
+        centre = 0.5 * np.sum(cell_mat, axis=0)
+        trajectory_centered = trajectory - centre
+
+        # Pack data
+        data = {
+            "num_frames": int(n_frames),
+            "num_atoms": int(n_atoms),
+            "num_bonds": int(len(bi)),
+            "atom_colors": colors.ravel().tolist(),
+            "atom_radii": radii.tolist(),
+            "atom_scale": float(atom_scale),
+            "bond_radius": float(bond_radius),
+            "bond_i": bi.tolist(),
+            "bond_j": bj.tolist(),
+            "cell_matrix": cell_mat.ravel().tolist(),
+            "positions": trajectory_centered.ravel().tolist(),
+            "background_color": background_color,
+            "title": title,
+        }
+        if atom_cost is not None:
+            data["atom_cost"] = atom_cost.ravel().tolist()
+            data["cost_min"] = float(cost_min)
+            data["cost_max"] = float(cost_max)
+            data["cost_label"] = "per-atom cost"
+
+        html = _TRAJECTORY_HTML_TEMPLATE.replace(
+            "__TRICOR_DATA_PLACEHOLDER__",
+            json.dumps(data),
+        )
+
+        output_path = str(output_path)
+        with open(output_path, "w") as f:
+            f.write(html)
+        return output_path
+
+    def export_g3_html(
+        self: "Supercell",
+        output_path: str,
+        *,
+        r_max: float = 10.0,
+        r_step: float = 0.1,
+        phi_num_bins: int = 45,
+        background_color: str = "#f7f8f5",
+        title: str = "",
+        show_progress: bool = False,
+    ) -> str:
+        """Export a static 2D g3 viewer as a self-contained HTML file.
+
+        Renders one heatmap per species-triplet of the reduced three-body
+        distribution (density / uniform, where ``1.0`` = white).  The viewer
+        uses a diverging RdBu_r colormap centred at ``1.0`` and lets the user
+        pick the triplet and adjust the upper colour limit.
+
+        A fresh :class:`G3Distribution` is measured from the current atoms on
+        the coarse export grid (by default 50 x 45 bins per triplet) so the
+        embedded JSON stays small (~500 KB) without affecting anything the
+        supercell itself has cached.
+
+        Parameters
+        ----------
+        output_path
+            Path to write the HTML file.
+        r_max, r_step, phi_num_bins
+            Measurement grid for the exported distribution.
+        background_color, title
+            Cosmetic.
+        show_progress
+            Forwarded to the g3 measurement call.
+        """
+        import json
+
+        from .g3 import G3Distribution
+
+        dist = G3Distribution(self.atoms, label=f"{self.label}-export-g3")
+        dist.measure_g3(
+            r_max=r_max,
+            r_step=r_step,
+            phi_num_bins=phi_num_bins,
+            show_progress=show_progress,
+        )
+        if dist.g3 is None:
+            raise ValueError("Measured distribution has no g3 array.")
+
+        r = np.asarray(dist.r, dtype=np.float64)
+        r_edges = np.asarray(dist.bin_edges, dtype=np.float64)
+        phi_deg = np.asarray(dist.phi_deg, dtype=np.float64)
+        phi_edges = np.asarray(dist.phi_edges, dtype=np.float64)
+        phi_edges_deg = np.rad2deg(phi_edges)
+        labels = list(dist.pair_labels)
+        num_triplets = int(dist.g3.shape[0])
+
+        slices = []
+        pair_profiles = []
+        shell_ranges = []
+        for ti in range(num_triplets):
+            triplet_data = np.asarray(dist.g3[ti], dtype=np.float64)
+            shell_mask = _detect_shell_mask(triplet_data, r)
+            if not np.any(shell_mask):
+                shell_mask = np.zeros_like(r, dtype=bool)
+                shell_mask[: max(1, r.size // 4)] = True
+            img = _g3_slice_image(triplet_data, shell_mask, r, phi_deg)
+            slices.append(img.ravel().astype(np.float32).tolist())
+
+            profile = _g3_pair_profile(dist, ti, r)
+            pair_profiles.append(profile.tolist())
+
+            idx = np.flatnonzero(shell_mask)
+            shell_min = float(r_edges[int(idx[0])])
+            shell_max = float(r_edges[int(idx[-1]) + 1])
+            shell_ranges.append([shell_min, shell_max])
+
+        data = {
+            "num_r": int(r.size),
+            "num_phi": int(phi_deg.size),
+            "num_triplets": num_triplets,
+            "r_centers": r.tolist(),
+            "r_edges": r_edges.tolist(),
+            "phi_centers_deg": phi_deg.tolist(),
+            "phi_edges_deg": phi_edges_deg.tolist(),
+            "triplet_labels": labels,
+            "slices": slices,
+            "pair_profiles": pair_profiles,
+            "shell_ranges": shell_ranges,
+            "background_color": background_color,
+            "title": title,
+        }
+
+        html = _G3_HTML_TEMPLATE.replace(
+            "__TRICOR_DATA_PLACEHOLDER__",
+            json.dumps(data),
+        )
+        output_path = str(output_path)
+        with open(output_path, "w") as f:
+            f.write(html)
+        return output_path
 
     def plot_structure(
         self: "Supercell",
@@ -518,3 +1045,5 @@ class _PlottingMixin:
         if progress is not None:
             progress.update(n_frames)
         return output
+
+

@@ -32,6 +32,7 @@ class _ShellRelaxMixin:
         neighbor_update_interval: int = 10,
         neighbor_cutoff_scale: float = 1.5,
         max_force_clip: float = 2.0,
+        capture_trajectory: bool = False,
         show_progress: bool = True,
     ) -> dict[str, Any]:
         """Relax random positions to match first-shell targets using spring forces.
@@ -363,6 +364,17 @@ class _ShellRelaxMixin:
         angle_loss_history = np.zeros(num_steps + 1, dtype=np.float64)
         repulsion_loss_history = np.zeros(num_steps + 1, dtype=np.float64)
 
+        if capture_trajectory:
+            trajectory = np.zeros(
+                (num_steps + 1, num_atoms, 3), dtype=np.float32,
+            )
+            atom_cost_history = np.zeros(
+                (num_steps + 1, num_atoms), dtype=np.float32,
+            )
+        else:
+            trajectory = None
+            atom_cost_history = None
+
         current_step = float(step_size)
         velocity = np.zeros((num_atoms, 3), dtype=np.float64)
         momentum = 0.8  # momentum damping factor
@@ -386,6 +398,10 @@ class _ShellRelaxMixin:
 
             # ---------- compute forces ----------
             force = np.zeros((num_atoms, 3), dtype=np.float64)
+            if atom_cost_history is not None:
+                atom_cost = np.zeros(num_atoms, dtype=np.float64)
+            else:
+                atom_cost = None
 
             # 1) Bond springs
             bond_loss = 0.0
@@ -399,6 +415,10 @@ class _ShellRelaxMixin:
                 f_bond = (bond_weight * delta_r)[:, None] * bond_hat
                 np.add.at(force, bond_i, f_bond)
                 np.add.at(force, bond_j, -f_bond)
+                if atom_cost is not None:
+                    half_bond_cost = 0.5 * delta_r ** 2
+                    np.add.at(atom_cost, bond_i, half_bond_cost)
+                    np.add.at(atom_cost, bond_j, half_bond_cost)
 
             # 2) Angle springs
             angle_loss = 0.0
@@ -420,6 +440,11 @@ class _ShellRelaxMixin:
 
                 delta_phi = phi - tri_phi_target
                 angle_loss = float(np.mean(delta_phi ** 2))
+                if atom_cost is not None:
+                    third_angle_cost = (delta_phi ** 2) / 3.0
+                    np.add.at(atom_cost, tri_center, third_angle_cost)
+                    np.add.at(atom_cost, tri_a, third_angle_cost)
+                    np.add.at(atom_cost, tri_b, third_angle_cost)
 
                 perp_a = (hat_b - cos_phi[:, None] * hat_a) / sin_phi_safe[:, None]
                 perp_b = (hat_a - cos_phi[:, None] * hat_b) / sin_phi_safe[:, None]
@@ -477,12 +502,25 @@ class _ShellRelaxMixin:
                     np.add.at(force, rep_i_all, -f_rep)
                     np.add.at(force, rep_j_all, f_rep)
 
+                if atom_cost is not None and np.any(active):
+                    # Cost = hard-mask indicator + 0.1 * nonbond indicator, split 0.5 / 0.5
+                    per_pair_cost = 0.5 * (
+                        hard_mask.astype(np.float64)
+                        + 0.1 * nonbond_mask.astype(np.float64)
+                    )
+                    np.add.at(atom_cost, rep_i_all, per_pair_cost)
+                    np.add.at(atom_cost, rep_j_all, per_pair_cost)
+
             # ---------- record loss ----------
             total_loss = bond_loss + angle_loss + repulsion_loss / max(num_atoms, 1)
             loss_history[step] = total_loss
             bond_loss_history[step] = bond_loss
             angle_loss_history[step] = angle_loss
             repulsion_loss_history[step] = repulsion_loss
+            if trajectory is not None:
+                trajectory[step] = pos.astype(np.float32)
+            if atom_cost_history is not None and atom_cost is not None:
+                atom_cost_history[step] = atom_cost.astype(np.float32)
             if total_loss < best_loss:
                 best_loss = total_loss
                 best_positions = pos.copy()
@@ -538,6 +576,10 @@ class _ShellRelaxMixin:
             "angle_loss": angle_loss_history,
             "repulsion_loss": repulsion_loss_history,
         }
+        if trajectory is not None:
+            self.shell_relax_history["trajectory"] = trajectory
+        if atom_cost_history is not None:
+            self.shell_relax_history["atom_cost"] = atom_cost_history
 
         # Invalidate caches
         self.current_distribution = None

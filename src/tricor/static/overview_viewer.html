@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>tricor overview</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; color: #333; }
+  #viewport {
+    position: relative; width: 100%; height: 100%; overflow: hidden;
+    background: #f7f8f5;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+  #labels {
+    position: absolute; inset: 0; pointer-events: none;
+    display: grid; gap: 0;
+  }
+  .cell-label {
+    font-size: 12px; font-weight: 600; color: #222;
+    padding: 4px 8px; align-self: start; justify-self: start;
+    background: rgba(255,255,255,0.75); border-radius: 4px;
+    margin: 4px 0 0 4px;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="viewport">
+  <canvas id="canvas"></canvas>
+  <div id="labels"></div>
+</div>
+<script>
+const DATA = __TRICOR_DATA_PLACEHOLDER__;
+
+document.getElementById("viewport").style.background = DATA.background_color || "#f7f8f5";
+
+const COLS = DATA.grid_cols || 3;
+const ROWS = DATA.grid_rows || Math.ceil(DATA.structures.length / COLS);
+
+// Place labels on a CSS grid sized identically to the viewport.
+const labels = document.getElementById("labels");
+labels.style.gridTemplateColumns = `repeat(${COLS}, 1fr)`;
+labels.style.gridTemplateRows = `repeat(${ROWS}, 1fr)`;
+for (let i = 0; i < DATA.structures.length; i++) {
+  const div = document.createElement("div");
+  const inner = document.createElement("div");
+  inner.className = "cell-label";
+  inner.textContent = DATA.structures[i].label;
+  div.appendChild(inner);
+  labels.appendChild(div);
+}
+
+(async function() {
+  const THREE = await import("https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js");
+
+  const canvas = document.getElementById("canvas");
+  const renderer = new THREE.WebGLRenderer({ antialias: true, canvas });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setScissorTest(true);
+  renderer.setClearColor(new THREE.Color(DATA.background_color || "#f7f8f5"), 1.0);
+
+  // Camera shared across all panels.  Position is determined by the bounding
+  // radius of the largest structure so every panel fits.
+  const camera = new THREE.PerspectiveCamera(28, 1, 0.1, 2000);
+
+  // Shared scratch
+  const sphereGeo = new THREE.SphereGeometry(1, 16, 12);
+  const cylinderGeo = new THREE.CylinderGeometry(1, 1, 1, 8, 1);
+  const dummy = new THREE.Object3D();
+  const _color = new THREE.Color();
+
+  // Toon gradient reused for atoms + bonds (matches trajectory viewer style)
+  const toonSteps = new Uint8Array([140, 200, 255]);
+  const toonTex = new THREE.DataTexture(toonSteps, toonSteps.length, 1, THREE.RedFormat);
+  toonTex.minFilter = THREE.NearestFilter;
+  toonTex.magFilter = THREE.NearestFilter;
+  toonTex.generateMipmaps = false;
+  toonTex.needsUpdate = true;
+
+  const outlineMat = new THREE.MeshBasicMaterial({ color: 0x000000, side: THREE.BackSide });
+  const outlineThickness = 0.02;
+
+  const atomScale = DATA.atom_scale;
+  const bondRadius = DATA.bond_radius;
+  const bondColorArr = DATA.bond_color;
+
+  // PBC min-image helper
+  function mat3Inverse(m) {
+    const a = m[0], b = m[1], c = m[2];
+    const d = m[3], e = m[4], f = m[5];
+    const g = m[6], h = m[7], i = m[8];
+    const A =  (e*i - f*h);
+    const B = -(d*i - f*g);
+    const C =  (d*h - e*g);
+    const D = -(b*i - c*h);
+    const E =  (a*i - c*g);
+    const F = -(a*h - b*g);
+    const G =  (b*f - c*e);
+    const H = -(a*f - c*d);
+    const I =  (a*e - b*d);
+    const det = a*A + b*B + c*C;
+    return [A/det, D/det, G/det, B/det, E/det, H/det, C/det, F/det, I/det];
+  }
+
+  // Build one scene per structure
+  const scenes = [];
+  let maxHalfDim = 0;
+  for (const s of DATA.structures) {
+    const scene = new THREE.Scene();
+    scene.add(new THREE.AmbientLight(0xffffff, 0.9));
+    const dir1 = new THREE.DirectionalLight(0xffffff, 0.9);
+    dir1.position.set(1.2, 1.5, 1.0);
+    scene.add(dir1);
+    const dir2 = new THREE.DirectionalLight(0xffffff, 0.25);
+    dir2.position.set(-1, -0.5, -1);
+    scene.add(dir2);
+
+    const n = s.num_atoms;
+    const nb = s.num_bonds;
+    const positions = new Float32Array(s.positions);
+    const atomColors = s.atom_colors;
+    const atomRadii = s.atom_radii;
+    const bondI = s.bond_i;
+    const bondJ = s.bond_j;
+    const cell = s.cell_matrix;
+    const cellInv = mat3Inverse(cell);
+
+    // Track max radius for camera framing
+    for (let i = 0; i < n * 3; i += 3) {
+      const d = Math.max(Math.abs(positions[i]), Math.abs(positions[i+1]), Math.abs(positions[i+2]));
+      if (d > maxHalfDim) maxHalfDim = d;
+    }
+
+    // Atoms (shiny Phong so they read as 3D)
+    const atomMat = new THREE.MeshPhongMaterial({
+      shininess: 28, specular: 0xcccccc, emissive: 0x2a2a2a,
+    });
+    const atomMesh = new THREE.InstancedMesh(sphereGeo, atomMat, n);
+    atomMesh.frustumCulled = false;
+    for (let i = 0; i < n; i++) {
+      const x = positions[i*3];
+      const y = positions[i*3 + 1];
+      const z = positions[i*3 + 2];
+      const r = atomRadii[i] * atomScale;
+      dummy.position.set(x, y, z);
+      dummy.scale.set(r, r, r);
+      dummy.updateMatrix();
+      atomMesh.setMatrixAt(i, dummy.matrix);
+      _color.setRGB(atomColors[i*3], atomColors[i*3+1], atomColors[i*3+2]);
+      atomMesh.setColorAt(i, _color);
+    }
+    atomMesh.instanceMatrix.needsUpdate = true;
+    atomMesh.instanceColor.needsUpdate = true;
+    scene.add(atomMesh);
+
+    // Atom outlines
+    const atomOutlineMesh = new THREE.InstancedMesh(sphereGeo, outlineMat, n);
+    atomOutlineMesh.frustumCulled = false;
+    for (let i = 0; i < n; i++) {
+      const x = positions[i*3];
+      const y = positions[i*3 + 1];
+      const z = positions[i*3 + 2];
+      const ro = atomRadii[i] * atomScale + outlineThickness;
+      dummy.position.set(x, y, z);
+      dummy.scale.set(ro, ro, ro);
+      dummy.updateMatrix();
+      atomOutlineMesh.setMatrixAt(i, dummy.matrix);
+    }
+    atomOutlineMesh.instanceMatrix.needsUpdate = true;
+    scene.add(atomOutlineMesh);
+
+    // Bonds (red)
+    const bondMat = new THREE.MeshToonMaterial({ gradientMap: toonTex });
+    const bondMesh = new THREE.InstancedMesh(cylinderGeo, bondMat, nb);
+    bondMesh.frustumCulled = false;
+    const bondOutlineMesh = new THREE.InstancedMesh(cylinderGeo, outlineMat, nb);
+    bondOutlineMesh.frustumCulled = false;
+    const up = new THREE.Vector3(0, 1, 0);
+    const start = new THREE.Vector3();
+    const end = new THREE.Vector3();
+    const mid = new THREE.Vector3();
+    const dirV = new THREE.Vector3();
+    const quat = new THREE.Quaternion();
+    const bondOutlineRadius = bondRadius + outlineThickness;
+    const redCol = new THREE.Color(bondColorArr[0], bondColorArr[1], bondColorArr[2]);
+
+    function minImage(dx, dy, dz) {
+      const fx = dx * cellInv[0] + dy * cellInv[3] + dz * cellInv[6];
+      const fy = dx * cellInv[1] + dy * cellInv[4] + dz * cellInv[7];
+      const fz = dx * cellInv[2] + dy * cellInv[5] + dz * cellInv[8];
+      const fxw = fx - Math.round(fx);
+      const fyw = fy - Math.round(fy);
+      const fzw = fz - Math.round(fz);
+      return [
+        fxw * cell[0] + fyw * cell[3] + fzw * cell[6],
+        fxw * cell[1] + fyw * cell[4] + fzw * cell[7],
+        fxw * cell[2] + fyw * cell[5] + fzw * cell[8],
+      ];
+    }
+
+    for (let k = 0; k < nb; k++) {
+      const i = bondI[k], j = bondJ[k];
+      const sx = positions[i*3], sy = positions[i*3+1], sz = positions[i*3+2];
+      const ex = positions[j*3], ey = positions[j*3+1], ez = positions[j*3+2];
+      const mi = minImage(ex - sx, ey - sy, ez - sz);
+      const d = Math.sqrt(mi[0]*mi[0] + mi[1]*mi[1] + mi[2]*mi[2]);
+      if (d > 5.0) {
+        dummy.scale.set(0, 0, 0); dummy.updateMatrix();
+        bondMesh.setMatrixAt(k, dummy.matrix);
+        bondOutlineMesh.setMatrixAt(k, dummy.matrix);
+        continue;
+      }
+      start.set(sx, sy, sz);
+      end.set(sx + mi[0], sy + mi[1], sz + mi[2]);
+      mid.addVectors(start, end).multiplyScalar(0.5);
+      dirV.subVectors(end, start);
+      const len = dirV.length();
+      dirV.normalize();
+      quat.setFromUnitVectors(up, dirV);
+
+      dummy.position.copy(mid);
+      dummy.quaternion.copy(quat);
+      dummy.scale.set(bondRadius, len, bondRadius);
+      dummy.updateMatrix();
+      bondMesh.setMatrixAt(k, dummy.matrix);
+      bondMesh.setColorAt(k, redCol);
+
+      dummy.scale.set(bondOutlineRadius, len, bondOutlineRadius);
+      dummy.updateMatrix();
+      bondOutlineMesh.setMatrixAt(k, dummy.matrix);
+    }
+    bondMesh.instanceMatrix.needsUpdate = true;
+    bondMesh.instanceColor.needsUpdate = true;
+    bondOutlineMesh.instanceMatrix.needsUpdate = true;
+    scene.add(bondMesh);
+    scene.add(bondOutlineMesh);
+
+    // Cell outline
+    {
+      const o = [
+        -0.5*cell[0]-0.5*cell[3]-0.5*cell[6],
+        -0.5*cell[1]-0.5*cell[4]-0.5*cell[7],
+        -0.5*cell[2]-0.5*cell[5]-0.5*cell[8],
+      ];
+      const corners = [];
+      for (let i = 0; i < 8; i++) {
+        const fx = (i >> 0) & 1;
+        const fy = (i >> 1) & 1;
+        const fz = (i >> 2) & 1;
+        corners.push([
+          o[0] + fx*cell[0] + fy*cell[3] + fz*cell[6],
+          o[1] + fx*cell[1] + fy*cell[4] + fz*cell[7],
+          o[2] + fx*cell[2] + fy*cell[5] + fz*cell[8],
+        ]);
+      }
+      const edges = [[0,1],[0,2],[0,4],[1,3],[1,5],[2,3],[2,6],[3,7],[4,5],[4,6],[5,7],[6,7]];
+      const verts = [];
+      for (const [a,b] of edges) verts.push(...corners[a], ...corners[b]);
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.Float32BufferAttribute(verts, 3));
+      const mat = new THREE.LineBasicMaterial({ color: 0x333333, transparent: true, opacity: 0.4 });
+      scene.add(new THREE.LineSegments(geo, mat));
+    }
+
+    scenes.push(scene);
+  }
+
+  // Camera framing: fit the cube's bounding sphere in whichever direction
+  // (vertical or horizontal) is tighter for the current panel aspect.
+  const radius = maxHalfDim * Math.sqrt(3);
+  const fovV = camera.fov * Math.PI / 180;
+  function computeCamDist(aspect) {
+    const halfV = fovV / 2;
+    const halfH = Math.atan(aspect * Math.tan(halfV));
+    const limit = Math.min(halfV, halfH);
+    return radius / Math.tan(limit) * 0.9;
+  }
+  let camDist = computeCamDist(1.0);  // rough initial value
+
+  // Shared rotation: auto-spin unless the user is dragging.
+  let theta = 0.6;            // azimuth
+  let phi = 0.35;             // elevation
+  let autoSpin = true;
+  let lastTime = performance.now();
+
+  function cameraFromAngles() {
+    const x = camDist * Math.cos(phi) * Math.sin(theta);
+    const y = camDist * Math.sin(phi);
+    const z = camDist * Math.cos(phi) * Math.cos(theta);
+    camera.position.set(x, y, z);
+    camera.up.set(0, 1, 0);
+    camera.lookAt(0, 0, 0);
+  }
+
+  // Mouse drag for manual rotation
+  const viewport = document.getElementById("viewport");
+  let dragging = false;
+  let lastX = 0, lastY = 0;
+  viewport.addEventListener("pointerdown", (e) => {
+    dragging = true;
+    autoSpin = false;
+    lastX = e.clientX;
+    lastY = e.clientY;
+    viewport.setPointerCapture(e.pointerId);
+  });
+  viewport.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - lastX;
+    const dy = e.clientY - lastY;
+    lastX = e.clientX;
+    lastY = e.clientY;
+    theta -= dx * 0.01;
+    phi = Math.max(-1.4, Math.min(1.4, phi + dy * 0.01));
+  });
+  viewport.addEventListener("pointerup", (e) => {
+    dragging = false;
+    viewport.releasePointerCapture(e.pointerId);
+    // Resume auto-spin a moment after release
+    setTimeout(() => { if (!dragging) autoSpin = true; }, 500);
+  });
+
+  function animate(now) {
+    requestAnimationFrame(animate);
+    const dt = Math.min(0.05, (now - lastTime) / 1000);
+    lastTime = now;
+    if (autoSpin) theta += dt * 0.25;   // ~14 deg/s
+    cameraFromAngles();
+
+    const w = viewport.clientWidth;
+    const h = viewport.clientHeight;
+    if (w === 0 || h === 0) return;
+    const dpr = window.devicePixelRatio || 1;
+    if (renderer.domElement.width !== Math.round(w * dpr) || renderer.domElement.height !== Math.round(h * dpr)) {
+      renderer.setSize(w, h, false);
+    }
+
+    const cellW = w / COLS;
+    const cellH = h / ROWS;
+    const aspect = cellW / cellH;
+    camera.aspect = aspect;
+    camDist = computeCamDist(aspect);
+    camera.updateProjectionMatrix();
+
+    // Render each scene into its grid viewport.
+    // Three.js's setViewport/setScissor take CSS-pixel coordinates and
+    // multiply by pixelRatio internally; do NOT pre-multiply here.
+    // Origin is bottom-left.
+    for (let idx = 0; idx < scenes.length; idx++) {
+      const col = idx % COLS;
+      const row = Math.floor(idx / COLS);
+      const x = col * cellW;
+      const y = (ROWS - 1 - row) * cellH;
+      renderer.setViewport(x, y, cellW, cellH);
+      renderer.setScissor(x, y, cellW, cellH);
+      renderer.render(scenes[idx], camera);
+    }
+  }
+  requestAnimationFrame((t) => { lastTime = t; animate(t); });
+})();
+</script>
+</body>
+</html>

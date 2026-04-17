@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>tricor g3 viewer</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; color: #333; }
+  #container { display: grid; grid-template-rows: auto 1fr auto; height: 100vh; background: #f7f8f5; }
+  #title { padding: 8px 16px; font-weight: 600; font-size: 14px; border-bottom: 1px solid rgba(0,0,0,0.06); background: rgba(255,255,255,0.5); }
+  #title:empty { display: none; }
+  #main {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    grid-template-rows: 1fr 1fr;        /* equal share - heatmap / profile */
+    gap: 6px 12px;
+    padding: 12px 16px;
+    min-height: 0;
+    overflow: hidden;
+  }
+  #heatmap-wrap { grid-row: 1; grid-column: 1; position: relative; min-height: 0; }
+  #legend { grid-row: 1 / span 1; grid-column: 2; }
+  #profile-wrap {
+    grid-row: 2; grid-column: 1;               /* same width as heatmap */
+    position: relative; min-height: 0;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #legend {
+    display: flex; flex-direction: column; align-items: center;
+    font-size: 11px; min-height: 0;
+  }
+  #legend-title { font-weight: 600; margin-bottom: 6px; white-space: nowrap; }
+  /* Body is a row-flex that fills the column vertically.
+     Children stretch in the cross-axis (vertical) because align-items
+     defaults to stretch; bar keeps its fixed 18px width. */
+  #legend-body {
+    display: flex; gap: 6px;
+    flex: 1 1 0; min-height: 0;
+  }
+  #legend-bar {
+    width: 18px; border: 1px solid rgba(0,0,0,0.15); border-radius: 2px;
+    position: relative; flex-shrink: 0;
+  }
+  #legend-ticks {
+    position: relative;                  /* anchors the floating 1.0 label */
+    display: flex; flex-direction: column; justify-content: space-between;
+    font-variant-numeric: tabular-nums; color: #333;
+    flex-shrink: 0;
+  }
+  .tick-white { font-weight: 600; color: #111; }
+  /* The "1.0" label is absolutely positioned at the correct fractional
+     height on the legend so it tracks the white point of the colormap. */
+  #tick-mid {
+    position: absolute; left: 0;
+    transform: translateY(50%);
+    white-space: nowrap; pointer-events: none;
+  }
+  #mid-marker {
+    position: absolute; left: -4px; right: -4px; height: 0;
+    border-top: 1px solid #000;
+  }
+  #controls {
+    padding: 8px 16px; background: rgba(255,255,255,0.6);
+    border-top: 1px solid rgba(0,0,0,0.06);
+    display: flex; align-items: center; gap: 12px; font-size: 12px;
+  }
+  select, input[type=number] {
+    font: inherit; padding: 3px 6px; border-radius: 4px;
+    border: 1px solid rgba(0,0,0,0.2); background: #fff;
+  }
+  #controls label { display: flex; align-items: center; gap: 6px; }
+</style>
+</head>
+<body>
+<div id="container">
+  <div id="title"></div>
+  <div id="main">
+    <div id="heatmap-wrap"><canvas id="heatmap"></canvas></div>
+    <div id="legend">
+      <div id="legend-title">density</div>
+      <div id="legend-body">
+        <div id="legend-bar"><div id="mid-marker"></div></div>
+        <div id="legend-ticks">
+          <span id="tick-max">0</span>
+          <span id="tick-min">0</span>
+          <span class="tick-white" id="tick-mid">1.0</span>
+        </div>
+      </div>
+    </div>
+    <div id="profile-wrap"><canvas id="profile"></canvas></div>
+  </div>
+  <div id="controls">
+    <label>triplet
+      <select id="triplet"></select>
+    </label>
+    <label>max
+      <input type="number" id="vmax-input" step="0.5" min="1" style="width: 70px;"/>
+    </label>
+    <span id="status" style="opacity: 0.6;"></span>
+  </div>
+</div>
+<script>
+const DATA = __TRICOR_DATA_PLACEHOLDER__;
+
+document.getElementById("title").textContent = DATA.title || "";
+document.getElementById("container").style.background = DATA.background_color || "#f7f8f5";
+
+// ---------- RdBu_r colormap (matplotlib stops) ----------
+const RDBU_R_STOPS = [
+  [0.000, [  5,  48,  97]],
+  [0.100, [ 33, 102, 172]],
+  [0.250, [ 67, 147, 195]],
+  [0.400, [146, 197, 222]],
+  [0.480, [209, 229, 240]],
+  [0.500, [247, 247, 247]],
+  [0.520, [253, 219, 199]],
+  [0.600, [244, 165, 130]],
+  [0.750, [214,  96,  77]],
+  [0.900, [178,  24,  43]],
+  [1.000, [103,   0,  31]],
+];
+
+function interp(stops, t) {
+  t = Math.max(0, Math.min(1, t));
+  let lo = stops[0], hi = stops[stops.length - 1];
+  for (let i = 0; i < stops.length - 1; i++) {
+    if (t >= stops[i][0] && t <= stops[i+1][0]) {
+      lo = stops[i]; hi = stops[i+1];
+      break;
+    }
+  }
+  const span = Math.max(hi[0] - lo[0], 1e-12);
+  const u = (t - lo[0]) / span;
+  return [
+    Math.round(lo[1][0] + u * (hi[1][0] - lo[1][0])),
+    Math.round(lo[1][1] + u * (hi[1][1] - lo[1][1])),
+    Math.round(lo[1][2] + u * (hi[1][2] - lo[1][2])),
+  ];
+}
+
+function colorForValue(value, vmax, midpoint = 1.0) {
+  let t;
+  if (value <= midpoint) {
+    t = 0.5 * Math.max(0, Math.min(1, value / Math.max(midpoint, 1e-12)));
+  } else {
+    const num = value - midpoint;
+    const den = Math.max(vmax - midpoint, 1e-12);
+    t = 0.5 + 0.5 * Math.max(0, Math.min(1, num / den));
+  }
+  return interp(RDBU_R_STOPS, t);
+}
+
+function buildLegendGradient(vmax, midpoint = 1.0) {
+  const steps = 64;
+  const parts = [];
+  for (let i = 0; i <= steps; i++) {
+    const frac = i / steps;
+    const value = frac * vmax;
+    const [r, g, b] = colorForValue(value, vmax, midpoint);
+    const pct = (frac * 100).toFixed(1);
+    parts.push(`rgb(${r}, ${g}, ${b}) ${pct}%`);
+  }
+  return `linear-gradient(to top, ${parts.join(", ")})`;
+}
+
+// ---------- State ----------
+const triplets = DATA.triplet_labels;
+const numR = DATA.num_r;
+const numPhi = DATA.num_phi;
+const slices = DATA.slices.map(a => new Float32Array(a));
+const pairProfiles = DATA.pair_profiles.map(a => new Float32Array(a));
+const shellRanges = DATA.shell_ranges;  // [[rmin, rmax], ...] per triplet
+const rCenters = DATA.r_centers;
+const phiCenters = DATA.phi_centers_deg;
+
+function niceRoundUp(v) {
+  if (v <= 0 || !isFinite(v)) return 2.0;
+  const exp = Math.floor(Math.log10(v));
+  const mag = Math.pow(10, exp);
+  const mant = v / mag;
+  for (const m of [1, 2, 4, 5, 10]) {
+    if (mant <= m + 1e-9) return m * mag;
+  }
+  return 10 * mag;
+}
+
+function autoVmax(sliceArr) {
+  const arr = Array.from(sliceArr).filter(v => isFinite(v) && v > 0).sort((a,b)=>a-b);
+  if (!arr.length) return 2.0;
+  const idx = Math.min(arr.length - 1, Math.floor(0.995 * arr.length));
+  return niceRoundUp(Math.max(arr[idx], 1.5));
+}
+
+let currentTriplet = 0;
+let vmax = autoVmax(slices[0]);
+const midpoint = 1.0;
+
+// ---------- DOM wiring ----------
+const select = document.getElementById("triplet");
+for (let i = 0; i < triplets.length; i++) {
+  const opt = document.createElement("option");
+  opt.value = String(i);
+  opt.textContent = triplets[i];
+  select.appendChild(opt);
+}
+if (triplets.length <= 1) {
+  select.parentElement.style.display = "none";
+}
+
+const vmaxInput = document.getElementById("vmax-input");
+vmaxInput.value = vmax;
+
+const heatmapCanvas = document.getElementById("heatmap");
+const profileCanvas = document.getElementById("profile");
+const heatmapCtx = heatmapCanvas.getContext("2d");
+const profileCtx = profileCanvas.getContext("2d");
+
+const rAxisMax = rCenters[rCenters.length - 1] + 0.5 * (rCenters[1] - rCenters[0]);
+const rAxisMin = 0;
+
+// Shared X-axis padding so heatmap and g(r) line up exactly
+const PAD_L = 48;
+const PAD_R = 8;
+
+function fitCanvasToWrapper(canvas, wrap) {
+  const w = wrap.clientWidth;
+  const h = wrap.clientHeight;
+  if (w === 0 || h === 0) return null;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  canvas.style.width = `${w}px`;
+  canvas.style.height = `${h}px`;
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  return { w, h };
+}
+
+function pickDecimals(range) {
+  if (range >= 10) return 0;
+  if (range >= 1) return 1;
+  if (range >= 0.1) return 2;
+  return 3;
+}
+
+function updateLegend() {
+  const legendBar = document.getElementById("legend-bar");
+  legendBar.style.background = buildLegendGradient(vmax, midpoint);
+  const d = pickDecimals(vmax);
+  document.getElementById("tick-max").textContent = vmax.toFixed(d);
+  document.getElementById("tick-min").textContent = (0).toFixed(d);
+
+  const fracMid = Math.max(0, Math.min(1, midpoint / Math.max(vmax, 1e-12)));
+
+  // Horizontal mid-marker line across the bar
+  const mid = document.getElementById("mid-marker");
+  mid.style.bottom = `${fracMid * 100}%`;
+  mid.style.top = "auto";
+
+  // "1.0" text label placed absolutely at the same fractional height.
+  // Hide it if it would collide with the min / max labels at the ends.
+  const tickMid = document.getElementById("tick-mid");
+  tickMid.textContent = (1.0).toFixed(1);
+  tickMid.style.bottom = `${fracMid * 100}%`;
+  tickMid.style.top = "auto";
+  const margin = 0.08;
+  tickMid.style.visibility =
+    fracMid > margin && fracMid < 1 - margin ? "visible" : "hidden";
+}
+
+function drawHeatmap() {
+  const wrap = document.getElementById("heatmap-wrap");
+  const fit = fitCanvasToWrapper(heatmapCanvas, wrap);
+  if (!fit) return;
+  const { w, h } = fit;
+
+  const padT = 6, padB = 26;
+  const plotW = Math.max(0, w - PAD_L - PAD_R);
+  const plotH = Math.max(0, h - padT - padB);
+
+  heatmapCtx.fillStyle = "#fff";
+  heatmapCtx.fillRect(PAD_L, padT, plotW, plotH);
+
+  const cellW = plotW / numR;
+  const cellH = plotH / numPhi;
+  const data = slices[currentTriplet];
+  for (let py = 0; py < numPhi; py++) {
+    const yTop = padT + plotH - (py + 1) * cellH;
+    for (let px = 0; px < numR; px++) {
+      const xLeft = PAD_L + px * cellW;
+      const v = data[py * numR + px];
+      const [r, g, b] = colorForValue(v, vmax, midpoint);
+      heatmapCtx.fillStyle = `rgb(${r}, ${g}, ${b})`;
+      heatmapCtx.fillRect(xLeft, yTop, cellW + 0.5, cellH + 0.5);
+    }
+  }
+
+  heatmapCtx.strokeStyle = "#333";
+  heatmapCtx.lineWidth = 1;
+  heatmapCtx.strokeRect(PAD_L, padT, plotW, plotH);
+
+  heatmapCtx.fillStyle = "#333";
+  heatmapCtx.font = "11px ui-sans-serif, system-ui";
+
+  // Y ticks (phi)
+  const phiTicks = [0, 30, 60, 90, 120, 150, 180];
+  heatmapCtx.textAlign = "right";
+  heatmapCtx.textBaseline = "middle";
+  for (const t of phiTicks) {
+    const y = padT + plotH - (t / 180) * plotH;
+    heatmapCtx.beginPath();
+    heatmapCtx.moveTo(PAD_L, y);
+    heatmapCtx.lineTo(PAD_L - 4, y);
+    heatmapCtx.stroke();
+    heatmapCtx.fillText(String(t), PAD_L - 6, y);
+  }
+  heatmapCtx.save();
+  heatmapCtx.translate(14, padT + plotH / 2);
+  heatmapCtx.rotate(-Math.PI / 2);
+  heatmapCtx.textAlign = "center";
+  heatmapCtx.textBaseline = "alphabetic";
+  heatmapCtx.fillText("φ (deg)", 0, 0);
+  heatmapCtx.restore();
+}
+
+function drawProfile() {
+  const wrap = document.getElementById("profile-wrap");
+  const fit = fitCanvasToWrapper(profileCanvas, wrap);
+  if (!fit) return;
+  const { w, h } = fit;
+
+  const padT = 6, padB = 26;
+  const plotW = Math.max(0, w - PAD_L - PAD_R);
+  const plotH = Math.max(0, h - padT - padB);
+
+  profileCtx.fillStyle = "#fff";
+  profileCtx.fillRect(PAD_L, padT, plotW, plotH);
+
+  const profile = pairProfiles[currentTriplet];
+  const n = profile.length;
+  // Y range: 0 to 1.1 * max(g(r)), independent of the heatmap colour max
+  let yMax = 0;
+  for (let i = 0; i < n; i++) {
+    const v = profile[i];
+    if (isFinite(v) && v > yMax) yMax = v;
+  }
+  yMax = Math.max(yMax * 1.1, 1.1);
+
+  // Root-bond shell window: shaded amber band with a label so it's clear
+  // that this is the shell over which one of the two bonds is integrated
+  // when producing the g3 slice above.
+  const [sMin, sMax] = shellRanges[currentTriplet];
+  const xMin = PAD_L + (sMin - rAxisMin) / (rAxisMax - rAxisMin) * plotW;
+  const xMax = PAD_L + (sMax - rAxisMin) / (rAxisMax - rAxisMin) * plotW;
+  profileCtx.fillStyle = "rgba(255, 220, 130, 0.45)";
+  profileCtx.fillRect(xMin, padT, Math.max(0, xMax - xMin), plotH);
+
+  // Band label "root bond" with a bracket so it visually reads as a range
+  profileCtx.strokeStyle = "rgba(170, 110, 30, 0.9)";
+  profileCtx.fillStyle = "rgba(120, 70, 20, 0.95)";
+  profileCtx.lineWidth = 1;
+  const bandY = padT + 12;
+  profileCtx.beginPath();
+  profileCtx.moveTo(xMin, bandY);
+  profileCtx.lineTo(xMax, bandY);
+  profileCtx.moveTo(xMin, bandY - 4);
+  profileCtx.lineTo(xMin, bandY + 4);
+  profileCtx.moveTo(xMax, bandY - 4);
+  profileCtx.lineTo(xMax, bandY + 4);
+  profileCtx.stroke();
+  profileCtx.font = "11px ui-sans-serif, system-ui";
+  profileCtx.textAlign = "center";
+  profileCtx.textBaseline = "bottom";
+  profileCtx.fillText("root bond", (xMin + xMax) / 2, bandY - 4);
+
+  // Horizontal reference line at g(r) = 1
+  const yOne = padT + plotH - (1.0 / yMax) * plotH;
+  profileCtx.strokeStyle = "rgba(0,0,0,0.25)";
+  profileCtx.lineWidth = 1;
+  profileCtx.setLineDash([4, 3]);
+  profileCtx.beginPath();
+  profileCtx.moveTo(PAD_L, yOne);
+  profileCtx.lineTo(PAD_L + plotW, yOne);
+  profileCtx.stroke();
+  profileCtx.setLineDash([]);
+
+  // Profile line
+  profileCtx.strokeStyle = "#2a6e4e";
+  profileCtx.lineWidth = 1.6;
+  profileCtx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const rC = rCenters[i];
+    const v = profile[i];
+    const x = PAD_L + (rC - rAxisMin) / (rAxisMax - rAxisMin) * plotW;
+    const y = padT + plotH - Math.max(0, Math.min(1, v / yMax)) * plotH;
+    if (i === 0) profileCtx.moveTo(x, y);
+    else profileCtx.lineTo(x, y);
+  }
+  profileCtx.stroke();
+
+  // Frame
+  profileCtx.strokeStyle = "#333";
+  profileCtx.lineWidth = 1;
+  profileCtx.strokeRect(PAD_L, padT, plotW, plotH);
+
+  // Axes
+  profileCtx.fillStyle = "#333";
+  profileCtx.font = "11px ui-sans-serif, system-ui";
+
+  // X ticks (r)
+  const xTicks = [0, 2, 4, 6, 8, 10].filter(t => t <= rAxisMax + 1e-6);
+  profileCtx.textAlign = "center";
+  profileCtx.textBaseline = "top";
+  for (const t of xTicks) {
+    const x = PAD_L + (t - rAxisMin) / (rAxisMax - rAxisMin) * plotW;
+    profileCtx.beginPath();
+    profileCtx.moveTo(x, padT + plotH);
+    profileCtx.lineTo(x, padT + plotH + 4);
+    profileCtx.stroke();
+    profileCtx.fillText(String(t), x, padT + plotH + 5);
+  }
+  profileCtx.textBaseline = "alphabetic";
+  profileCtx.fillText("r (Å)", PAD_L + plotW / 2, h - 4);
+
+  // Y ticks (g(r)): 0, 1.0, and yMax.  One-decimal formatting.
+  const yTicks = [0, 1.0, yMax];
+  profileCtx.textAlign = "right";
+  profileCtx.textBaseline = "middle";
+  const yDecimals = yMax >= 10 ? 0 : 1;
+  for (const t of yTicks) {
+    const y = padT + plotH - (t / yMax) * plotH;
+    profileCtx.beginPath();
+    profileCtx.moveTo(PAD_L, y);
+    profileCtx.lineTo(PAD_L - 4, y);
+    profileCtx.stroke();
+    profileCtx.fillText(t.toFixed(yDecimals), PAD_L - 6, y);
+  }
+  profileCtx.save();
+  profileCtx.translate(14, padT + plotH / 2);
+  profileCtx.rotate(-Math.PI / 2);
+  profileCtx.textAlign = "center";
+  profileCtx.textBaseline = "alphabetic";
+  profileCtx.fillText("g(r)", 0, 0);
+  profileCtx.restore();
+}
+
+function redraw() {
+  drawHeatmap();
+  drawProfile();
+  updateLegend();
+}
+
+select.addEventListener("change", () => {
+  currentTriplet = parseInt(select.value, 10);
+  vmax = autoVmax(slices[currentTriplet]);
+  vmaxInput.value = vmax;
+  redraw();
+});
+vmaxInput.addEventListener("change", () => {
+  const v = parseFloat(vmaxInput.value);
+  if (isFinite(v) && v > midpoint) vmax = v;
+  redraw();
+});
+
+new ResizeObserver(redraw).observe(document.getElementById("main"));
+redraw();
+</script>
+</body>
+</html>

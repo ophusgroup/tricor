@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>tricor trajectory viewer</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; color: #333; }
+  #container { display: grid; grid-template-rows: auto 1fr auto; height: 100vh; background: #f7f8f5; }
+  #title { padding: 8px 16px; font-weight: 600; font-size: 14px; border-bottom: 1px solid rgba(0,0,0,0.06); background: rgba(255,255,255,0.5); }
+  #title:empty { display: none; }
+  #canvas-wrap { min-height: 0; position: relative; }
+  #controls { padding: 10px 16px; background: rgba(255,255,255,0.6); border-top: 1px solid rgba(0,0,0,0.06); display: flex; align-items: center; gap: 12px; font-size: 12px; }
+  .btn { padding: 4px 12px; border-radius: 6px; border: 1px solid rgba(0,0,0,0.15); background: #fff; cursor: pointer; font-size: 12px; }
+  .btn:hover { background: #eef2ea; }
+  .btn.active { background: #2a6e4e; color: #fff; border-color: #2a6e4e; }
+  #slider { flex: 1; min-width: 100px; }
+  #frame-label { min-width: 70px; font-variant-numeric: tabular-nums; }
+  #speed-label { min-width: 60px; font-variant-numeric: tabular-nums; }
+
+  /* Colorbar legend overlay */
+  #legend {
+    position: absolute;
+    right: 12px;
+    top: 50%;
+    transform: translateY(-50%);
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    background: rgba(255,255,255,0.7);
+    padding: 8px 10px;
+    border-radius: 6px;
+    border: 1px solid rgba(0,0,0,0.08);
+    font-size: 11px;
+    pointer-events: none;
+    user-select: none;
+  }
+  #legend.on { display: flex; }
+  #legend-title { font-weight: 600; margin-bottom: 6px; font-size: 11px; color: #333; }
+  #legend-body { display: flex; align-items: center; gap: 6px; }
+  #legend-bar {
+    width: 16px;
+    height: 160px;
+    border-radius: 3px;
+    border: 1px solid rgba(0,0,0,0.15);
+  }
+  #legend-ticks {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    height: 160px;
+    font-variant-numeric: tabular-nums;
+    color: #333;
+  }
+</style>
+</head>
+<body>
+<div id="container">
+  <div id="title"></div>
+  <div id="canvas-wrap">
+    <div id="legend">
+      <div id="legend-title">cost</div>
+      <div id="legend-body">
+        <div id="legend-bar"></div>
+        <div id="legend-ticks">
+          <span id="legend-max">1.0</span>
+          <span id="legend-mid">0.5</span>
+          <span id="legend-min">0.0</span>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div id="controls">
+    <button class="btn" id="play">Play</button>
+    <button class="btn" id="restart">Restart</button>
+    <button class="btn" id="loop">Loop</button>
+    <button class="btn" id="bounce">Bounce</button>
+    <span id="frame-label">0 / 0</span>
+    <input type="range" id="slider" min="0" max="0" step="1" value="0"/>
+    <span id="speed-label">1x</span>
+    <input type="range" id="speed" min="0.25" max="4" step="0.25" value="1"/>
+  </div>
+</div>
+<script>
+const DATA = __TRICOR_DATA_PLACEHOLDER__;
+
+document.getElementById("title").textContent = DATA.title || "";
+document.getElementById("container").style.background = DATA.background_color;
+
+// ---------- Turbo colormap (Google Research) ----------
+// Polynomial approximation - produces [r,g,b] in [0,1].
+function turbo(t) {
+  t = Math.max(0, Math.min(1, t));
+  const r = Math.max(0, Math.min(1,
+    0.13572138 + t * (4.61539260 + t * (-42.66032258 + t * (132.13108234 + t * (-152.94239396 + t * 59.28637943))))));
+  const g = Math.max(0, Math.min(1,
+    0.09140261 + t * (2.19418839 + t * (4.84296658 + t * (-14.18503333 + t * (4.27729857 + t * 2.82956604))))));
+  const b = Math.max(0, Math.min(1,
+    0.10667330 + t * (12.64194608 + t * (-60.58204836 + t * (110.36276771 + t * (-89.90310912 + t * 27.34824973))))));
+  return [r, g, b];
+}
+
+// Build CSS gradient for the colorbar
+function buildTurboGradient(steps) {
+  const stops = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const [r, g, b] = turbo(t);
+    const pct = (100 * t).toFixed(1);
+    // CSS gradient renders top-to-bottom by default, so reverse by using 1-t for display
+    stops.push(`rgb(${Math.round(r*255)}, ${Math.round(g*255)}, ${Math.round(b*255)}) ${pct}%`);
+  }
+  return `linear-gradient(to top, ${stops.join(", ")})`;
+}
+
+// Set up legend if atom_cost is present
+const hasCost = Array.isArray(DATA.atom_cost);
+if (hasCost) {
+  const legend = document.getElementById("legend");
+  legend.classList.add("on");
+  document.getElementById("legend-bar").style.background = buildTurboGradient(32);
+  const cmax = DATA.cost_max;
+  const cmin = DATA.cost_min;
+  // Pick a fixed decimal count from the data range so all three ticks
+  // (0, mid, max) share the same precision, e.g. 0.0 / 2.0 / 4.0.
+  const _range = Math.max(Math.abs(cmax - cmin), 1e-12);
+  let _decimals;
+  if (_range >= 10) _decimals = 0;
+  else if (_range >= 1) _decimals = 1;
+  else if (_range >= 0.1) _decimals = 2;
+  else _decimals = 3;
+  const fmt = (v) => v.toFixed(_decimals);
+  document.getElementById("legend-max").textContent = fmt(cmax);
+  document.getElementById("legend-mid").textContent = fmt(0.5 * (cmin + cmax));
+  document.getElementById("legend-min").textContent = fmt(cmin);
+  document.getElementById("legend-title").textContent = DATA.cost_label || "cost";
+}
+
+(async function() {
+  // Load Three.js from CDN
+  const THREE = await import("https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js");
+  const orbitSrc = await (await fetch("https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/controls/OrbitControls.js")).text();
+  const patched = orbitSrc.replace(/from\s+['"]three['"]/g, `from "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js"`);
+  const blobUrl = URL.createObjectURL(new Blob([patched], { type: "application/javascript" }));
+  const { OrbitControls } = await import(blobUrl);
+  URL.revokeObjectURL(blobUrl);
+
+  const wrap = document.getElementById("canvas-wrap");
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(DATA.background_color);
+
+  const camera = new THREE.PerspectiveCamera(28, 1, 0.1, 1000);
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  wrap.appendChild(renderer.domElement);
+
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.12;
+
+  // Bright base illumination + a strong key light so Phong specular pops
+  scene.add(new THREE.AmbientLight(0xffffff, 0.9));
+  const dirLight = new THREE.DirectionalLight(0xffffff, 0.9);
+  dirLight.position.set(1.2, 1.5, 1.0);
+  scene.add(dirLight);
+  const dirLight2 = new THREE.DirectionalLight(0xffffff, 0.25);
+  dirLight2.position.set(-1, -0.5, -1);
+  scene.add(dirLight2);
+
+  const sphereGeo = new THREE.SphereGeometry(1, 16, 12);
+  const cylinderGeo = new THREE.CylinderGeometry(1, 1, 1, 8, 1);
+
+  const n = DATA.num_atoms;
+  const nb = DATA.num_bonds;
+  const nf = DATA.num_frames;
+  const positions = new Float32Array(DATA.positions);
+  const atomColors = DATA.atom_colors;
+  const atomRadii = DATA.atom_radii;
+  const atomScale = DATA.atom_scale;
+  const bondI = DATA.bond_i;
+  const bondJ = DATA.bond_j;
+  const bondRadius = DATA.bond_radius;
+  const cell = DATA.cell_matrix;  // 9 floats row-major
+
+  // Per-frame atom cost, if captured
+  const atomCost = hasCost ? new Float32Array(DATA.atom_cost) : null;
+  const cMin = hasCost ? DATA.cost_min : 0;
+  const cMax = hasCost ? DATA.cost_max : 1;
+  const cRange = Math.max(cMax - cMin, 1e-12);
+
+  // PBC minimum-image helper (JS)
+  function mat3Inverse(m) {
+    const a = m[0], b = m[1], c = m[2];
+    const d = m[3], e = m[4], f = m[5];
+    const g = m[6], h = m[7], i = m[8];
+    const A =  (e*i - f*h);
+    const B = -(d*i - f*g);
+    const C =  (d*h - e*g);
+    const D = -(b*i - c*h);
+    const E =  (a*i - c*g);
+    const F = -(a*h - b*g);
+    const G =  (b*f - c*e);
+    const H = -(a*f - c*d);
+    const I =  (a*e - b*d);
+    const det = a*A + b*B + c*C;
+    return [A/det, D/det, G/det, B/det, E/det, H/det, C/det, F/det, I/det];
+  }
+  const cellInv = mat3Inverse(cell);
+
+  function minImage(dx, dy, dz) {
+    const fx = dx * cellInv[0] + dy * cellInv[3] + dz * cellInv[6];
+    const fy = dx * cellInv[1] + dy * cellInv[4] + dz * cellInv[7];
+    const fz = dx * cellInv[2] + dy * cellInv[5] + dz * cellInv[8];
+    const fxw = fx - Math.round(fx);
+    const fyw = fy - Math.round(fy);
+    const fzw = fz - Math.round(fz);
+    return [
+      fxw * cell[0] + fyw * cell[3] + fzw * cell[6],
+      fxw * cell[1] + fyw * cell[4] + fzw * cell[7],
+      fxw * cell[2] + fyw * cell[5] + fzw * cell[8],
+    ];
+  }
+
+  // Atoms - bright Phong shading with a tight white specular highlight so they
+  // read as shiny 3D spheres against the flat cartoon outline.
+  const atomMat = new THREE.MeshPhongMaterial({
+    shininess: 28,
+    specular: 0xcccccc,
+    emissive: 0x2a2a2a,
+  });
+  // A toon gradient is still used for the bonds below
+  const toonSteps = new Uint8Array([140, 200, 255]);
+  const gradientTex = new THREE.DataTexture(toonSteps, toonSteps.length, 1, THREE.RedFormat);
+  gradientTex.minFilter = THREE.NearestFilter;
+  gradientTex.magFilter = THREE.NearestFilter;
+  gradientTex.generateMipmaps = false;
+  gradientTex.needsUpdate = true;
+  const atomMesh = new THREE.InstancedMesh(sphereGeo, atomMat, n);
+  const dummy = new THREE.Object3D();
+  const color = new THREE.Color();
+  for (let i = 0; i < n; i++) {
+    color.setRGB(atomColors[i*3], atomColors[i*3+1], atomColors[i*3+2]);
+    atomMesh.setColorAt(i, color);
+  }
+  atomMesh.instanceColor.needsUpdate = true;
+  scene.add(atomMesh);
+
+  // Atom outlines - back-face trick: render a slightly larger black sphere
+  // with only back faces visible; the edge ring peeks out as a black outline.
+  const outlineMat = new THREE.MeshBasicMaterial({
+    color: 0x000000,
+    side: THREE.BackSide,
+  });
+  const outlineMesh = new THREE.InstancedMesh(sphereGeo, outlineMat, n);
+  outlineMesh.frustumCulled = false;
+  scene.add(outlineMesh);
+  // Absolute outline thickness (Angstrom) - used for both atoms and bonds
+  // so the black ring looks like the same line weight everywhere.
+  const outlineThickness = 0.035;
+
+  // Bonds - toon shading for flat cartoon look that matches the atom outline
+  const bondMat = new THREE.MeshToonMaterial({ gradientMap: gradientTex });
+  const bondMesh = new THREE.InstancedMesh(cylinderGeo, bondMat, nb);
+
+  // Bond outlines - same back-face trick as atoms, slightly larger radius
+  const bondOutlineMat = new THREE.MeshBasicMaterial({
+    color: 0x000000,
+    side: THREE.BackSide,
+  });
+  const bondOutlineMesh = new THREE.InstancedMesh(cylinderGeo, bondOutlineMat, nb);
+  bondOutlineMesh.frustumCulled = false;
+  scene.add(bondOutlineMesh);
+  // Bond outline uses the same absolute outlineThickness as the atoms
+  // Bond colours: when cost is NOT captured, use averaged element colour (set once).
+  // When cost IS captured, colours are updated per-frame in renderFrame().
+  if (!hasCost) {
+    for (let k = 0; k < nb; k++) {
+      const i = bondI[k];
+      const j = bondJ[k];
+      const r = 0.5 * (atomColors[i*3] + atomColors[j*3]);
+      const g = 0.5 * (atomColors[i*3+1] + atomColors[j*3+1]);
+      const b = 0.5 * (atomColors[i*3+2] + atomColors[j*3+2]);
+      color.setRGB(r, g, b);
+      bondMesh.setColorAt(k, color);
+    }
+    bondMesh.instanceColor.needsUpdate = true;
+  }
+  scene.add(bondMesh);
+
+  // Cell outline (wireframe box)
+  {
+    const o = [-0.5*cell[0]-0.5*cell[3]-0.5*cell[6], -0.5*cell[1]-0.5*cell[4]-0.5*cell[7], -0.5*cell[2]-0.5*cell[5]-0.5*cell[8]];
+    const corners = [];
+    for (let i = 0; i < 8; i++) {
+      const fx = (i >> 0) & 1;
+      const fy = (i >> 1) & 1;
+      const fz = (i >> 2) & 1;
+      corners.push([
+        o[0] + fx*cell[0] + fy*cell[3] + fz*cell[6],
+        o[1] + fx*cell[1] + fy*cell[4] + fz*cell[7],
+        o[2] + fx*cell[2] + fy*cell[5] + fz*cell[8],
+      ]);
+    }
+    const edges = [[0,1],[0,2],[0,4],[1,3],[1,5],[2,3],[2,6],[3,7],[4,5],[4,6],[5,7],[6,7]];
+    const geo = new THREE.BufferGeometry();
+    const verts = [];
+    for (const [a,b] of edges) {
+      verts.push(...corners[a], ...corners[b]);
+    }
+    geo.setAttribute("position", new THREE.Float32BufferAttribute(verts, 3));
+    const mat = new THREE.LineBasicMaterial({ color: 0x333333, linewidth: 1, transparent: true, opacity: 0.4 });
+    scene.add(new THREE.LineSegments(geo, mat));
+  }
+
+  // Reusable scratch
+  const up = new THREE.Vector3(0, 1, 0);
+  const start = new THREE.Vector3();
+  const end = new THREE.Vector3();
+  const mid = new THREE.Vector3();
+  const dir = new THREE.Vector3();
+  const quat = new THREE.Quaternion();
+
+  function renderFrame(frameIdx) {
+    const frameOffset = frameIdx * n * 3;
+    const costOffset = hasCost ? frameIdx * n : 0;
+
+    // Update atom positions, scales, and (optionally) colours
+    for (let i = 0; i < n; i++) {
+      const x = positions[frameOffset + i*3];
+      const y = positions[frameOffset + i*3 + 1];
+      const z = positions[frameOffset + i*3 + 2];
+      const r = atomRadii[i] * atomScale;
+      dummy.position.set(x, y, z);
+      dummy.scale.set(r, r, r);
+      dummy.updateMatrix();
+      atomMesh.setMatrixAt(i, dummy.matrix);
+
+      // Outline sphere: absolute thickness in world units
+      const ro = r + outlineThickness;
+      dummy.scale.set(ro, ro, ro);
+      dummy.updateMatrix();
+      outlineMesh.setMatrixAt(i, dummy.matrix);
+
+      if (hasCost) {
+        const c = atomCost[costOffset + i];
+        const t = (c - cMin) / cRange;
+        const [cr, cg, cb] = turbo(t);
+        color.setRGB(cr, cg, cb);
+        atomMesh.setColorAt(i, color);
+      }
+    }
+    atomMesh.instanceMatrix.needsUpdate = true;
+    outlineMesh.instanceMatrix.needsUpdate = true;
+    if (hasCost) {
+      atomMesh.instanceColor.needsUpdate = true;
+    }
+
+    // Update bond cylinders (minimum-image applied)
+    for (let k = 0; k < nb; k++) {
+      const i = bondI[k];
+      const j = bondJ[k];
+
+      if (hasCost) {
+        // Colour bond by mean atom cost of its two endpoints
+        const ci = atomCost[costOffset + i];
+        const cj = atomCost[costOffset + j];
+        const tb = 0.5 * (ci + cj - 2.0 * cMin) / cRange;
+        const [br, bg, bb] = turbo(tb);
+        color.setRGB(br, bg, bb);
+        bondMesh.setColorAt(k, color);
+      }
+
+      const sx = positions[frameOffset + i*3];
+      const sy = positions[frameOffset + i*3 + 1];
+      const sz = positions[frameOffset + i*3 + 2];
+      const ex = positions[frameOffset + j*3];
+      const ey = positions[frameOffset + j*3 + 1];
+      const ez = positions[frameOffset + j*3 + 2];
+      const mi = minImage(ex - sx, ey - sy, ez - sz);
+      const exw = sx + mi[0];
+      const eyw = sy + mi[1];
+      const ezw = sz + mi[2];
+      const d = Math.sqrt(mi[0]*mi[0] + mi[1]*mi[1] + mi[2]*mi[2]);
+      if (d > 5.0) {
+        dummy.scale.set(0, 0, 0);
+        dummy.updateMatrix();
+        bondMesh.setMatrixAt(k, dummy.matrix);
+        bondOutlineMesh.setMatrixAt(k, dummy.matrix);
+        continue;
+      }
+      start.set(sx, sy, sz);
+      end.set(exw, eyw, ezw);
+      mid.addVectors(start, end).multiplyScalar(0.5);
+      dir.subVectors(end, start);
+      const len = dir.length();
+      dir.normalize();
+      dummy.position.copy(mid);
+      quat.setFromUnitVectors(up, dir);
+      dummy.quaternion.copy(quat);
+      dummy.scale.set(bondRadius, len, bondRadius);
+      dummy.updateMatrix();
+      bondMesh.setMatrixAt(k, dummy.matrix);
+
+      // Outline cylinder: absolute thickness in world units (matches atoms)
+      const bondOutlineRadius = bondRadius + outlineThickness;
+      dummy.scale.set(bondOutlineRadius, len, bondOutlineRadius);
+      dummy.updateMatrix();
+      bondOutlineMesh.setMatrixAt(k, dummy.matrix);
+    }
+    bondMesh.instanceMatrix.needsUpdate = true;
+    bondOutlineMesh.instanceMatrix.needsUpdate = true;
+    if (hasCost) {
+      bondMesh.instanceColor.needsUpdate = true;
+    }
+  }
+
+  // Camera framing: look down the +x axis so the yz face fills the viewport.
+  // The cell is already centred at the origin by the exporter.
+  const cellHalfX = 0.5 * Math.abs(cell[0]);
+  const cellHalfY = 0.5 * Math.abs(cell[4]);
+  const cellHalfZ = 0.5 * Math.abs(cell[8]);
+
+  function framedCameraDistance(aspect) {
+    const fovV = camera.fov * Math.PI / 180;
+    const tanV = Math.tan(fovV / 2);
+    const distV = cellHalfY / tanV;                 // fit full height
+    const distH = cellHalfZ / (aspect * tanV);      // fit full width
+    const dist = Math.max(distV, distH);
+    // Place camera so the near face (x = cellHalfX) is at 'dist' from the lens
+    return cellHalfX + dist;
+  }
+
+  let cameraFramed = false;
+  function frameCamera(aspect) {
+    const camX = framedCameraDistance(aspect);
+    camera.position.set(camX, 0, 0);
+    camera.up.set(0, 1, 0);
+    camera.lookAt(0, 0, 0);
+    controls.target.set(0, 0, 0);
+    controls.update();
+    cameraFramed = true;
+  }
+
+  // Resize handling
+  function resize() {
+    const w = wrap.clientWidth;
+    const h = wrap.clientHeight;
+    if (w === 0 || h === 0) return;
+    const aspect = w / h;
+    camera.aspect = aspect;
+    camera.updateProjectionMatrix();
+    renderer.setSize(w, h);
+    if (!cameraFramed) {
+      frameCamera(aspect);
+    }
+  }
+  new ResizeObserver(resize).observe(wrap);
+
+  // Animation controls
+  let currentFrame = 0;
+  let isPlaying = false;
+  let isLooping = true;
+  let isBouncing = false;
+  let direction = 1;          // +1 = forward, -1 = reverse (bounce)
+  let speed = 1.0;
+  let lastTime = 0;
+  let frameTimer = 0;
+  const baseInterval = 1000 / 30;  // 30 fps at speed=1
+
+  const slider = document.getElementById("slider");
+  const frameLabel = document.getElementById("frame-label");
+  const speedSlider = document.getElementById("speed");
+  const speedLabel = document.getElementById("speed-label");
+  const playBtn = document.getElementById("play");
+  const restartBtn = document.getElementById("restart");
+  const loopBtn = document.getElementById("loop");
+  const bounceBtn = document.getElementById("bounce");
+
+  slider.max = nf - 1;
+
+  function updateLabel() {
+    frameLabel.textContent = `${currentFrame} / ${nf - 1}`;
+    slider.value = currentFrame;
+  }
+
+  function setFrame(idx) {
+    currentFrame = Math.max(0, Math.min(nf - 1, idx));
+    renderFrame(currentFrame);
+    updateLabel();
+  }
+
+  slider.addEventListener("input", () => {
+    setFrame(parseInt(slider.value, 10));
+  });
+  speedSlider.addEventListener("input", () => {
+    speed = parseFloat(speedSlider.value);
+    speedLabel.textContent = `${speed.toFixed(2)}x`;
+  });
+  playBtn.addEventListener("click", () => {
+    isPlaying = !isPlaying;
+    playBtn.textContent = isPlaying ? "Pause" : "Play";
+    playBtn.classList.toggle("active", isPlaying);
+    lastTime = performance.now();
+    frameTimer = 0;
+  });
+  restartBtn.addEventListener("click", () => {
+    setFrame(0);
+    direction = 1;
+  });
+  loopBtn.classList.add("active");
+  loopBtn.addEventListener("click", () => {
+    isLooping = !isLooping;
+    loopBtn.classList.toggle("active", isLooping);
+  });
+  bounceBtn.addEventListener("click", () => {
+    isBouncing = !isBouncing;
+    bounceBtn.classList.toggle("active", isBouncing);
+    if (!isBouncing) direction = 1;
+  });
+
+  function animate(now) {
+    requestAnimationFrame(animate);
+    if (isPlaying) {
+      const dt = now - lastTime;
+      lastTime = now;
+      frameTimer += dt * speed;
+      while (frameTimer >= baseInterval) {
+        frameTimer -= baseInterval;
+
+        if (isBouncing) {
+          // Ping-pong between 0 and nf-1
+          let next = currentFrame + direction;
+          if (next > nf - 1) {
+            direction = -1;
+            next = currentFrame - 1;
+          } else if (next < 0) {
+            direction = 1;
+            next = currentFrame + 1;
+          }
+          currentFrame = Math.max(0, Math.min(nf - 1, next));
+        } else {
+          // Forward-only: loop or stop at end
+          if (currentFrame >= nf - 1) {
+            if (isLooping) {
+              currentFrame = 0;
+            } else {
+              isPlaying = false;
+              playBtn.textContent = "Play";
+              playBtn.classList.remove("active");
+              break;
+            }
+          } else {
+            currentFrame += 1;
+          }
+        }
+      }
+      setFrame(currentFrame);
+    }
+    controls.update();
+    renderer.render(scene, camera);
+  }
+
+  setFrame(0);
+  resize();
+  requestAnimationFrame((t) => { lastTime = t; animate(t); });
+})();
+</script>
+</body>
+</html>

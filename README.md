@@ -105,15 +105,12 @@ construction with spring-network relaxation.
 Available as `Supercell.PRESETS`:
 
 ```python
-preset = tc.Supercell.PRESETS["MRO"].copy()
-density = preset.pop("relative_density", 1.0)
 cell = tc.Supercell.from_atoms(
     atoms,
     (40, 40, 40),
-    relative_density=density,
     rng_seed=42,
 )
-cell.generate(shell_target, **preset)
+cell.generate(shell_target, **tc.Supercell.PRESETS["MRO"])
 ```
 
 | Regime | grain_size | bond_wt | angle_wt | rep_wt | hc_scale | nbp_scale | disp_sigma |

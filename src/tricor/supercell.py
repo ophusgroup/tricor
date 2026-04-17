@@ -32,7 +32,7 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         distribution: G3Distribution,
         cell_dim_angstroms: float | Sequence[float],
         *,
-        relative_density: float = 1.0,
+        relative_density: float = 0.96,
         measure_g3: bool = False,
         plot_g3_compare: bool = False,
         label: str | None = None,
@@ -172,7 +172,7 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         r_max: float = 10.0,
         r_step: float = 0.2,
         phi_num_bins: int = 90,
-        relative_density: float = 1.0,
+        relative_density: float = 0.96,
         rng_seed: int | None = None,
         label: str | None = None,
         **kwargs: Any,
@@ -362,14 +362,14 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
 
     PRESETS: dict[str, dict[str, Any]] = {
         "liquid": dict(
-            relative_density=0.96, num_steps=100,
+            num_steps=100,
             grain_size=None,
             bond_weight=0.4, angle_weight=0.5,
             repulsion_weight=0.5,
             hard_core_scale=0.75, nonbond_push_scale=0.7,
         ),
         "amorphous": dict(
-            relative_density=0.96, num_steps=150,
+            num_steps=150,
             grain_size=6.0,
             bond_weight=1.2, angle_weight=0.6,
             repulsion_weight=1.5,
@@ -377,7 +377,7 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
             displacement_sigma=0.08,
         ),
         "SRO": dict(
-            relative_density=0.96, num_steps=200,
+            num_steps=200,
             grain_size=10.0,
             bond_weight=2.2, angle_weight=1.0,
             repulsion_weight=2.0,
@@ -385,7 +385,7 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
             displacement_sigma=0.04,
         ),
         "MRO": dict(
-            relative_density=0.96, num_steps=150,
+            num_steps=150,
             grain_size=13.0,
             bond_weight=1.9, angle_weight=0.9,
             repulsion_weight=2.5,
@@ -393,20 +393,20 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
             displacement_sigma=0.04,
         ),
         "MRO_more": dict(
-            relative_density=0.96, num_steps=150,
+            num_steps=150,
             grain_size=18.0,
             bond_weight=2.0, angle_weight=1.0,
             hard_core_scale=0.95, nonbond_push_scale=0.9,
             displacement_sigma=0.04,
         ),
         "nanocrystalline_10": dict(
-            relative_density=0.96, num_steps=200,
+            num_steps=200,
             grain_size=15.0,
             bond_weight=2.8, angle_weight=1.3,
             displacement_sigma=0.02,
         ),
         "nanocrystalline_20": dict(
-            relative_density=0.96, num_steps=150,
+            num_steps=150,
             grain_size=20.0,
             bond_weight=3.0, angle_weight=1.5,
             displacement_sigma=0.02,
