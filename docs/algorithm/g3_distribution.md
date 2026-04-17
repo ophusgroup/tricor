@@ -10,9 +10,9 @@ The rooted three-body distribution $g_3$ captures pairwise distance and angular 
 
 The raw histogram is accumulated over all ordered triplets $(i, j, k)$ where $j \le k$ (to avoid double-counting), binned into a 4D array:
 
-$$g_3[\text{triplet\_type}, r_{01}, r_{02}, \phi]$$
+$$g_3[\text{type}, r_{01}, r_{02}, \phi]$$
 
-where `triplet_type` indexes the species combination (e.g. Si-Si-Si, Si-Si-C, ...).
+where `type` indexes the species combination (e.g. Si | Si Si, Si | Si C, ...).
 
 ## Reduced coordinates
 

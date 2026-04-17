@@ -23,5 +23,5 @@ algorithm/index
 generation
 visualization
 examples
-api
+api/index
 ```

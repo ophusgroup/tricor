@@ -51,7 +51,7 @@ cell.generate(
 
 ### Amorphous
 
-Small grains (~6 A) provide ~2 visible maxima in the radial profile. Softened hard-core and non-bonded push keep peaks broad.
+Small grains (~6 A) provide ~2 visible maxima in the radial profile. Softened non-bonded push (0.5) and reduced repulsion weight (1.5) eliminate spurious 2nd-shell ridges.
 
 ```python
 cell.generate(
@@ -60,8 +60,9 @@ cell.generate(
     grain_size=6.0,
     bond_weight=1.2,
     angle_weight=0.6,
+    repulsion_weight=1.5,
     hard_core_scale=0.9,
-    nonbond_push_scale=0.8,
+    nonbond_push_scale=0.5,
     displacement_sigma=0.08,
 )
 ```
@@ -77,8 +78,9 @@ cell.generate(
     grain_size=10.0,
     bond_weight=2.2,
     angle_weight=1.0,
+    repulsion_weight=2.0,
     hard_core_scale=0.95,
-    nonbond_push_scale=0.9,
+    nonbond_push_scale=0.6,
     displacement_sigma=0.04,
 )
 ```
@@ -94,8 +96,9 @@ cell.generate(
     grain_size=13.0,
     bond_weight=1.9,
     angle_weight=0.9,
+    repulsion_weight=2.5,
     hard_core_scale=0.95,
-    nonbond_push_scale=0.9,
+    nonbond_push_scale=0.7,
     displacement_sigma=0.04,
 )
 ```
@@ -155,17 +158,17 @@ Recommended parameter sets for Si are provided as a class attribute:
 tc.Supercell.PRESETS
 ```
 
-| Regime | grain_size | bond_weight | angle_weight | hard_core_scale | nonbond_push_scale | disp_sigma |
-|--------|-----------|-------------|--------------|-----------------|-------------------|------------|
-| liquid | None | 0.4 | 0.5 | 0.75 | 0.7 | - |
-| amorphous | 6 | 1.2 | 0.6 | 0.9 | 0.8 | 0.08 |
-| SRO | 10 | 2.2 | 1.0 | 0.95 | 0.9 | 0.04 |
-| MRO | 13 | 1.9 | 0.9 | 0.95 | 0.9 | 0.04 |
-| MRO_more | 18 | 2.0 | 1.0 | 0.95 | 0.9 | 0.04 |
-| nanocrystalline_10 | 15 | 2.8 | 1.3 | 1.0 | 1.0 | 0.02 |
-| nanocrystalline_20 | 20 | 3.0 | 1.5 | 1.0 | 1.0 | 0.02 |
+| Regime | grain_size | bond_wt | angle_wt | rep_wt | hc_scale | nbp_scale | disp_sigma |
+|--------|-----------|---------|----------|--------|----------|-----------|------------|
+| liquid | None | 0.4 | 0.5 | 0.5 | 0.75 | 0.7 | - |
+| amorphous | 6 | 1.2 | 0.6 | 1.5 | 0.9 | 0.5 | 0.08 |
+| SRO | 10 | 2.2 | 1.0 | 2.0 | 0.95 | 0.6 | 0.04 |
+| MRO | 13 | 1.9 | 0.9 | 2.5 | 0.95 | 0.7 | 0.04 |
+| MRO_more | 18 | 2.0 | 1.0 | default | 0.95 | 0.9 | 0.04 |
+| nanocrystalline_10 | 15 | 2.8 | 1.3 | default | default | default | 0.02 |
+| nanocrystalline_20 | 20 | 3.0 | 1.5 | default | default | default | 0.02 |
 
-All presets use `relative_density=0.96`. These are tuned for Si (diamond cubic). Other materials will need different values - in particular, close-packed structures (FCC, HCP) need lower `angle_weight` since their angular distributions are broader.
+All presets use `relative_density=0.96`. Abbreviations: `rep_wt` = `repulsion_weight`, `hc_scale` = `hard_core_scale`, `nbp_scale` = `nonbond_push_scale`. These are tuned for Si (diamond cubic). Other materials will need different values - in particular, close-packed structures (FCC, HCP) need lower `angle_weight` since their angular distributions are broader.
 
 ## Multi-species systems
 

@@ -39,8 +39,9 @@ cell.generate(
     grain_size=13.0,
     bond_weight=1.9,
     angle_weight=0.9,
+    repulsion_weight=2.5,
     hard_core_scale=0.95,
-    nonbond_push_scale=0.9,
+    nonbond_push_scale=0.7,
     displacement_sigma=0.04,
 )
 
@@ -75,11 +76,13 @@ cell = tc.Supercell.from_atoms(
 )
 cell.generate(
     shell_target,
+    num_steps=150,
     grain_size=13.0,
     bond_weight=1.9,
     angle_weight=0.9,
+    repulsion_weight=2.5,
     hard_core_scale=0.95,
-    nonbond_push_scale=0.9,
+    nonbond_push_scale=0.7,
     displacement_sigma=0.04,
 )
 
