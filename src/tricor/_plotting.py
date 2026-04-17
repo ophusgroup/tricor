@@ -194,8 +194,33 @@ def export_overview_html(
     return output_path
 
 
-def _detect_shell_mask(triplet_data: np.ndarray, r: np.ndarray) -> np.ndarray:
-    """Auto-detect the first NN shell over r for one triplet of g3."""
+def _detect_shell_mask(
+    triplet_data: np.ndarray,
+    r: np.ndarray,
+    *,
+    pair_peak: float | None = None,
+    smooth_sigma_r: float = 0.25,
+) -> np.ndarray:
+    """Auto-detect the first NN shell window over r for one triplet of g3.
+
+    Parameters
+    ----------
+    triplet_data
+        One channel of the raw g3 histogram, shape ``(num_r, num_r, num_phi)``.
+    r
+        Bin-centre radii (Å), shape ``(num_r,)``.
+    pair_peak
+        Optional hint - the reference first-neighbour distance (Å) for this
+        triplet's root bond, typically ``shell_target.pair_peak[center,
+        neighbour]``.  When provided, the peak search is seeded here instead
+        of at the first local maximum, which is much more robust at small
+        cell sizes where g(r) is noisy.
+    smooth_sigma_r
+        Gaussian standard deviation applied to g(r) before peak / minimum
+        detection, in Å.  Default 0.25 Å suppresses single-bin noise spikes
+        at the typical ``r_step = 0.1`` Å grid without blurring the first
+        shell.  Set to ``0`` to disable smoothing.
+    """
     # Pair profile: collapse both angular-partner and phi dimensions.
     profile = triplet_data.sum(axis=(1, 2)) + triplet_data.sum(axis=(0, 2))
     profile = profile / np.maximum(r * r, _EPS)
@@ -204,22 +229,69 @@ def _detect_shell_mask(triplet_data: np.ndarray, r: np.ndarray) -> np.ndarray:
     positive = np.flatnonzero(finite > 0)
     if positive.size == 0:
         return mask
-    start = int(positive[0])
-    peak_bin = None
-    for idx in range(max(start, 1), finite.size - 1):
-        if finite[idx] >= finite[idx - 1] and finite[idx] > finite[idx + 1]:
-            peak_bin = idx
+
+    # Smooth before peak / minimum detection to avoid single-bin noise
+    # triggering a premature "first minimum" right after the peak.
+    r_step = float(r[1] - r[0]) if r.size > 1 else 1.0
+    sigma_bins = max(0.0, float(smooth_sigma_r) / max(r_step, _EPS))
+    if sigma_bins > 0.0:
+        radius = max(1, int(np.ceil(3.0 * sigma_bins)))
+        xk = np.arange(-radius, radius + 1, dtype=np.float64)
+        kernel = np.exp(-0.5 * (xk / sigma_bins) ** 2)
+        kernel /= float(kernel.sum())
+        pad = np.pad(finite, (radius, radius), mode="edge")
+        smoothed = np.convolve(pad, kernel, mode="valid")
+    else:
+        smoothed = finite
+
+    # Seed the peak search: prefer the user-supplied pair_peak, fall back to
+    # the first local maximum of the smoothed profile.
+    if pair_peak is not None and np.isfinite(pair_peak) and pair_peak > 0:
+        seed = int(np.argmin(np.abs(r - float(pair_peak))))
+        window_half = max(3, int(np.ceil(0.25 * float(pair_peak) / max(r_step, _EPS))))
+        lo = max(0, seed - window_half)
+        hi = min(smoothed.size, seed + window_half + 1)
+        peak_bin = int(lo + int(np.argmax(smoothed[lo:hi])))
+    else:
+        start = int(positive[0])
+        peak_bin = None
+        for idx in range(max(start, 1), smoothed.size - 1):
+            if smoothed[idx] >= smoothed[idx - 1] and smoothed[idx] > smoothed[idx + 1]:
+                peak_bin = idx
+                break
+        if peak_bin is None:
+            peak_bin = int(start + int(np.argmax(smoothed[start:])))
+
+    # Bound the search with pair_peak-relative limits so a flat or noisy
+    # profile never widens the window into the second shell (on the right)
+    # or into the tiny-r numerical divergence (on the left).  Defaults
+    # assume a first-shell width of roughly +/- 25% of pair_peak.
+    if pair_peak is not None and np.isfinite(pair_peak) and pair_peak > 0:
+        lo_lim_r = 0.75 * float(pair_peak)
+        hi_lim_r = 1.30 * float(pair_peak)
+    else:
+        # Without pair_peak, fall back to bounds relative to the detected peak.
+        lo_lim_r = 0.70 * float(r[peak_bin])
+        hi_lim_r = 1.35 * float(r[peak_bin])
+    lo_lim_bin = int(max(0, np.searchsorted(r, lo_lim_r) - 1))
+    hi_lim_bin = int(min(r.size - 1, np.searchsorted(r, hi_lim_r)))
+
+    # Walk inward to the first smoothed local minimum before the peak,
+    # clamped at lo_lim_bin.
+    left_bin = lo_lim_bin
+    for idx in range(peak_bin - 1, lo_lim_bin, -1):
+        if smoothed[idx] <= smoothed[idx - 1] and smoothed[idx] < smoothed[idx + 1]:
+            left_bin = idx
             break
-    if peak_bin is None:
-        peak_bin = int(start + int(np.argmax(finite[start:])))
-    threshold = max(1e-12, 0.01 * float(finite[peak_bin]))
-    leading = np.flatnonzero(finite[: peak_bin + 1] > threshold)
-    left_bin = int(leading[0]) if leading.size else start
-    right_bin = min(finite.size - 1, peak_bin + 1)
-    for idx in range(peak_bin + 1, finite.size - 1):
-        if finite[idx] <= finite[idx - 1] and finite[idx] <= finite[idx + 1]:
+
+    # Walk outward to the first smoothed local minimum after the peak,
+    # clamped at hi_lim_bin.
+    right_bin = hi_lim_bin
+    for idx in range(peak_bin + 1, hi_lim_bin):
+        if smoothed[idx] < smoothed[idx - 1] and smoothed[idx] <= smoothed[idx + 1]:
             right_bin = idx
             break
+
     mask[left_bin : right_bin + 1] = True
     return mask
 
@@ -633,12 +705,31 @@ class _PlottingMixin:
         labels = list(dist.pair_labels)
         num_triplets = int(dist.g3.shape[0])
 
+        # Per-triplet pair_peak from the supercell's shell target (if present).
+        # Used to seed the shell-mask peak search; much more robust than
+        # falling back to "first local maximum" on a noisy 20x20x20 g(r).
+        shell_target = getattr(self, "_shell_target", None)
+        pair_peak_matrix = None
+        if shell_target is not None:
+            pair_peak_matrix = np.asarray(shell_target.pair_peak, dtype=np.float64)
+        g3_index = getattr(dist, "g3_index", None)
+
         slices = []
         pair_profiles = []
         shell_ranges = []
         for ti in range(num_triplets):
             triplet_data = np.asarray(dist.g3[ti], dtype=np.float64)
-            shell_mask = _detect_shell_mask(triplet_data, r)
+
+            triplet_pair_peak = None
+            if pair_peak_matrix is not None and g3_index is not None:
+                center_ind, neigh1_ind, _neigh2_ind = g3_index[ti]
+                val = float(pair_peak_matrix[int(center_ind), int(neigh1_ind)])
+                if np.isfinite(val) and val > 0:
+                    triplet_pair_peak = val
+
+            shell_mask = _detect_shell_mask(
+                triplet_data, r, pair_peak=triplet_pair_peak,
+            )
             if not np.any(shell_mask):
                 shell_mask = np.zeros_like(r, dtype=bool)
                 shell_mask[: max(1, r.size // 4)] = True
