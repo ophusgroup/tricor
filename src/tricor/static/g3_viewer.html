@@ -169,6 +169,7 @@ const numR = DATA.num_r;
 const numPhi = DATA.num_phi;
 const slices = DATA.slices.map(a => new Float32Array(a));
 const pairProfiles = DATA.pair_profiles.map(a => new Float32Array(a));
+const profileLabels = DATA.profile_labels || DATA.triplet_labels;
 const shellRanges = DATA.shell_ranges;  // [[rmin, rmax], ...] per triplet
 const rCenters = DATA.r_centers;
 const phiCenters = DATA.phi_centers_deg;
@@ -191,37 +192,13 @@ function autoVmax(sliceArr) {
   return niceRoundUp(Math.max(arr[idx], 1.5));
 }
 
-let currentTriplet = 0;
-let vmax = autoVmax(slices[0]);
+let currentTriplet = (typeof DATA.default_triplet === "number")
+  ? Math.max(0, Math.min(triplets.length - 1, DATA.default_triplet))
+  : 0;
+let vmax = autoVmax(slices[currentTriplet]);
 const midpoint = 1.0;
 
-// ---------- DOM wiring ----------
-const select = document.getElementById("triplet");
-for (let i = 0; i < triplets.length; i++) {
-  const opt = document.createElement("option");
-  opt.value = String(i);
-  opt.textContent = triplets[i];
-  select.appendChild(opt);
-}
-if (triplets.length <= 1) {
-  select.parentElement.style.display = "none";
-}
-
-const vmaxInput = document.getElementById("vmax-input");
-vmaxInput.value = vmax;
-
-const heatmapCanvas = document.getElementById("heatmap");
-const profileCanvas = document.getElementById("profile");
-const heatmapCtx = heatmapCanvas.getContext("2d");
-const profileCtx = profileCanvas.getContext("2d");
-
-const rAxisMax = rCenters[rCenters.length - 1] + 0.5 * (rCenters[1] - rCenters[0]);
-const rAxisMin = 0;
-
-// Shared X-axis padding so heatmap and g(r) line up exactly
-const PAD_L = 48;
-const PAD_R = 8;
-
+// ---------- fitCanvasToWrapper + updateLegend helpers (used by both modes) ----------
 function fitCanvasToWrapper(canvas, wrap) {
   const w = wrap.clientWidth;
   const h = wrap.clientHeight;
@@ -253,13 +230,10 @@ function updateLegend() {
 
   const fracMid = Math.max(0, Math.min(1, midpoint / Math.max(vmax, 1e-12)));
 
-  // Horizontal mid-marker line across the bar
   const mid = document.getElementById("mid-marker");
   mid.style.bottom = `${fracMid * 100}%`;
   mid.style.top = "auto";
 
-  // "1.0" text label placed absolutely at the same fractional height.
-  // Hide it if it would collide with the min / max labels at the ends.
   const tickMid = document.getElementById("tick-mid");
   tickMid.textContent = (1.0).toFixed(1);
   tickMid.style.bottom = `${fracMid * 100}%`;
@@ -268,6 +242,277 @@ function updateLegend() {
   tickMid.style.visibility =
     fracMid > margin && fracMid < 1 - margin ? "visible" : "hidden";
 }
+
+if (DATA.show_all) {
+  // ============================================================
+  // Grid mode: render every triplet as its own mini heatmap with
+  // a single shared legend.  No profile panel, no controls.
+  // ============================================================
+  const N = slices.length;
+  const cols = Math.min(N, 3);
+  const rows = Math.ceil(N / cols);
+
+  // Global vmax = max over per-slice autoVmax so every channel fits.
+  let gvmax = 1.5;
+  for (let i = 0; i < N; i++) {
+    gvmax = Math.max(gvmax, autoVmax(slices[i]));
+  }
+  vmax = gvmax;
+
+  // Rebuild #main: grid of panels on the left, legend on the right.
+  const main = document.getElementById("main");
+  const legend = document.getElementById("legend");
+  legend.parentNode.removeChild(legend);
+  main.innerHTML = "";
+  main.style.gridTemplateRows = "1fr";
+
+  const gridWrap = document.createElement("div");
+  gridWrap.style.display = "grid";
+  gridWrap.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+  gridWrap.style.gridTemplateRows = `repeat(${rows}, 1fr)`;
+  gridWrap.style.gap = "10px 12px";
+  gridWrap.style.minWidth = "0";
+  gridWrap.style.minHeight = "0";
+  gridWrap.style.gridRow = "1";
+  gridWrap.style.gridColumn = "1";
+  main.appendChild(gridWrap);
+  legend.style.gridRow = "1";
+  legend.style.gridColumn = "2";
+  main.appendChild(legend);
+
+  const controls = document.getElementById("controls");
+  if (controls) controls.style.display = "none";
+
+  const rMaxAxis = rCenters[rCenters.length - 1]
+    + 0.5 * (rCenters[1] - rCenters[0]);
+  // Shared padding so the heatmap r-axis and the g(r) r-axis line up.
+  const GRID_PAD_L = 32, GRID_PAD_R = 4;
+
+  const panels = [];
+  for (let ti = 0; ti < N; ti++) {
+    const panel = document.createElement("div");
+    panel.style.display = "grid";
+    panel.style.gridTemplateRows = "auto 2fr 1fr";
+    panel.style.minWidth = "0";
+    panel.style.minHeight = "0";
+    panel.style.gap = "2px";
+
+    const label = document.createElement("div");
+    label.textContent = triplets[ti];
+    label.style.fontSize = "12px";
+    label.style.fontWeight = "600";
+    label.style.textAlign = "center";
+    label.style.padding = "2px 0 2px";
+    panel.appendChild(label);
+
+    const hmWrap = document.createElement("div");
+    hmWrap.style.position = "relative";
+    hmWrap.style.minHeight = "0";
+    const hmCanvas = document.createElement("canvas");
+    hmCanvas.style.display = "block";
+    hmCanvas.style.width = "100%";
+    hmCanvas.style.height = "100%";
+    hmWrap.appendChild(hmCanvas);
+    panel.appendChild(hmWrap);
+
+    const prWrap = document.createElement("div");
+    prWrap.style.position = "relative";
+    prWrap.style.minHeight = "0";
+    const prCanvas = document.createElement("canvas");
+    prCanvas.style.display = "block";
+    prCanvas.style.width = "100%";
+    prCanvas.style.height = "100%";
+    prWrap.appendChild(prCanvas);
+    panel.appendChild(prWrap);
+
+    gridWrap.appendChild(panel);
+    panels.push({ hmCanvas, hmWrap, prCanvas, prWrap, ti });
+  }
+
+  function drawMiniHeatmap(canvas, wrap, ti) {
+    const fit = fitCanvasToWrapper(canvas, wrap);
+    if (!fit) return;
+    const { w, h } = fit;
+    const ctx = canvas.getContext("2d");
+    const padT = 4, padB = 4;
+    const plotW = Math.max(0, w - GRID_PAD_L - GRID_PAD_R);
+    const plotH = Math.max(0, h - padT - padB);
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(GRID_PAD_L, padT, plotW, plotH);
+
+    const cellW = plotW / numR;
+    const cellH = plotH / numPhi;
+    const data = slices[ti];
+    for (let py = 0; py < numPhi; py++) {
+      const yTop = padT + plotH - (py + 1) * cellH;
+      for (let px = 0; px < numR; px++) {
+        const xLeft = GRID_PAD_L + px * cellW;
+        const v = data[py * numR + px];
+        const [r, g, b] = colorForValue(v, vmax, midpoint);
+        ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
+        ctx.fillRect(xLeft, yTop, cellW + 0.5, cellH + 0.5);
+      }
+    }
+
+    ctx.strokeStyle = "#333";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(GRID_PAD_L, padT, plotW, plotH);
+    ctx.fillStyle = "#333";
+    ctx.font = "10px ui-sans-serif, system-ui";
+
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    for (const t of [0, 60, 120, 180]) {
+      const y = padT + plotH - (t / 180) * plotH;
+      ctx.beginPath();
+      ctx.moveTo(GRID_PAD_L, y);
+      ctx.lineTo(GRID_PAD_L - 3, y);
+      ctx.stroke();
+      ctx.fillText(String(t), GRID_PAD_L - 5, y);
+    }
+    ctx.save();
+    ctx.translate(10, padT + plotH / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillText("φ (deg)", 0, 0);
+    ctx.restore();
+  }
+
+  function drawMiniProfile(canvas, wrap, ti) {
+    const fit = fitCanvasToWrapper(canvas, wrap);
+    if (!fit) return;
+    const { w, h } = fit;
+    const ctx = canvas.getContext("2d");
+    const padT = 4, padB = 20;
+    const plotW = Math.max(0, w - GRID_PAD_L - GRID_PAD_R);
+    const plotH = Math.max(0, h - padT - padB);
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(GRID_PAD_L, padT, plotW, plotH);
+
+    const profile = pairProfiles[ti];
+    let yMax = 0;
+    for (let i = 0; i < profile.length; i++) {
+      const v = profile[i];
+      if (isFinite(v) && v > yMax) yMax = v;
+    }
+    yMax = Math.max(yMax * 1.1, 1.1);
+
+    // Shell-window band (the r-range used to build the heatmap above)
+    const [sMin, sMax] = shellRanges[ti];
+    const xMin = GRID_PAD_L + (sMin / rMaxAxis) * plotW;
+    const xMax = GRID_PAD_L + (sMax / rMaxAxis) * plotW;
+    ctx.fillStyle = "rgba(255, 220, 130, 0.45)";
+    ctx.fillRect(xMin, padT, Math.max(0, xMax - xMin), plotH);
+
+    // g(r) = 1 reference line
+    const yOne = padT + plotH - (1.0 / yMax) * plotH;
+    ctx.strokeStyle = "rgba(0,0,0,0.25)";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(GRID_PAD_L, yOne);
+    ctx.lineTo(GRID_PAD_L + plotW, yOne);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Profile line
+    ctx.strokeStyle = "#2a6e4e";
+    ctx.lineWidth = 1.3;
+    ctx.beginPath();
+    for (let i = 0; i < profile.length; i++) {
+      const rC = rCenters[i];
+      const v = profile[i];
+      const x = GRID_PAD_L + (rC / rMaxAxis) * plotW;
+      const y = padT + plotH - Math.max(0, Math.min(1, v / yMax)) * plotH;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    ctx.strokeStyle = "#333";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(GRID_PAD_L, padT, plotW, plotH);
+
+    ctx.fillStyle = "#333";
+    ctx.font = "10px ui-sans-serif, system-ui";
+
+    // X ticks (r)
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    for (const t of [0, 2, 4, 6, 8, 10]) {
+      if (t > rMaxAxis) continue;
+      const x = GRID_PAD_L + (t / rMaxAxis) * plotW;
+      ctx.beginPath();
+      ctx.moveTo(x, padT + plotH);
+      ctx.lineTo(x, padT + plotH + 3);
+      ctx.stroke();
+      ctx.fillText(String(t), x, padT + plotH + 4);
+    }
+    ctx.textBaseline = "alphabetic";
+    ctx.fillText("r (Å)", GRID_PAD_L + plotW / 2, h - 2);
+
+    // Y ticks (g(r)): 0, 1.0, and yMax
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    const yD = yMax >= 10 ? 0 : 1;
+    for (const t of [0, 1.0, yMax]) {
+      const y = padT + plotH - (t / yMax) * plotH;
+      ctx.beginPath();
+      ctx.moveTo(GRID_PAD_L, y);
+      ctx.lineTo(GRID_PAD_L - 3, y);
+      ctx.stroke();
+      ctx.fillText(t.toFixed(yD), GRID_PAD_L - 5, y);
+    }
+    ctx.save();
+    ctx.translate(10, padT + plotH / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillText(profileLabels[ti] || "g(r)", 0, 0);
+    ctx.restore();
+  }
+
+  function redrawGrid() {
+    for (const p of panels) {
+      drawMiniHeatmap(p.hmCanvas, p.hmWrap, p.ti);
+      drawMiniProfile(p.prCanvas, p.prWrap, p.ti);
+    }
+    updateLegend();
+  }
+
+  new ResizeObserver(redrawGrid).observe(main);
+  redrawGrid();
+
+} else {
+
+// ---------- DOM wiring (single-panel mode) ----------
+const select = document.getElementById("triplet");
+for (let i = 0; i < triplets.length; i++) {
+  const opt = document.createElement("option");
+  opt.value = String(i);
+  opt.textContent = triplets[i];
+  select.appendChild(opt);
+}
+select.value = String(currentTriplet);
+if (triplets.length <= 1) {
+  select.parentElement.style.display = "none";
+}
+
+const vmaxInput = document.getElementById("vmax-input");
+vmaxInput.value = vmax;
+
+const heatmapCanvas = document.getElementById("heatmap");
+const profileCanvas = document.getElementById("profile");
+const heatmapCtx = heatmapCanvas.getContext("2d");
+const profileCtx = profileCanvas.getContext("2d");
+
+const rAxisMax = rCenters[rCenters.length - 1] + 0.5 * (rCenters[1] - rCenters[0]);
+const rAxisMin = 0;
+
+// Shared X-axis padding so heatmap and g(r) line up exactly
+const PAD_L = 48;
+const PAD_R = 8;
 
 function drawHeatmap() {
   const wrap = document.getElementById("heatmap-wrap");
@@ -465,6 +710,8 @@ vmaxInput.addEventListener("change", () => {
 
 new ResizeObserver(redraw).observe(document.getElementById("main"));
 redraw();
+
+}  // end single-panel else branch
 </script>
 </body>
 </html>

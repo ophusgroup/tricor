@@ -168,71 +168,146 @@ for (let i = 0; i < DATA.structures.length; i++) {
     atomOutlineMesh.instanceMatrix.needsUpdate = true;
     scene.add(atomOutlineMesh);
 
-    // Bonds (red)
-    const bondMat = new THREE.MeshToonMaterial({ gradientMap: toonTex });
-    const bondMesh = new THREE.InstancedMesh(cylinderGeo, bondMat, nb);
-    bondMesh.frustumCulled = false;
-    const bondOutlineMesh = new THREE.InstancedMesh(cylinderGeo, outlineMat, nb);
-    bondOutlineMesh.frustumCulled = false;
-    const up = new THREE.Vector3(0, 1, 0);
-    const start = new THREE.Vector3();
-    const end = new THREE.Vector3();
-    const mid = new THREE.Vector3();
-    const dirV = new THREE.Vector3();
-    const quat = new THREE.Quaternion();
-    const bondOutlineRadius = bondRadius + outlineThickness;
-    const redCol = new THREE.Color(bondColorArr[0], bondColorArr[1], bondColorArr[2]);
+    // Bonds OR tetrahedra.
+    const tetraMode = !!DATA.tetrahedra_mode;
+    if (!tetraMode) {
+      // Bonds (red)
+      const bondMat = new THREE.MeshToonMaterial({ gradientMap: toonTex });
+      const bondMesh = new THREE.InstancedMesh(cylinderGeo, bondMat, nb);
+      bondMesh.frustumCulled = false;
+      const bondOutlineMesh = new THREE.InstancedMesh(cylinderGeo, outlineMat, nb);
+      bondOutlineMesh.frustumCulled = false;
+      const up = new THREE.Vector3(0, 1, 0);
+      const start = new THREE.Vector3();
+      const end = new THREE.Vector3();
+      const mid = new THREE.Vector3();
+      const dirV = new THREE.Vector3();
+      const quat = new THREE.Quaternion();
+      const bondOutlineRadius = bondRadius + outlineThickness;
+      const redCol = new THREE.Color(bondColorArr[0], bondColorArr[1], bondColorArr[2]);
 
-    function minImage(dx, dy, dz) {
-      const fx = dx * cellInv[0] + dy * cellInv[3] + dz * cellInv[6];
-      const fy = dx * cellInv[1] + dy * cellInv[4] + dz * cellInv[7];
-      const fz = dx * cellInv[2] + dy * cellInv[5] + dz * cellInv[8];
-      const fxw = fx - Math.round(fx);
-      const fyw = fy - Math.round(fy);
-      const fzw = fz - Math.round(fz);
-      return [
-        fxw * cell[0] + fyw * cell[3] + fzw * cell[6],
-        fxw * cell[1] + fyw * cell[4] + fzw * cell[7],
-        fxw * cell[2] + fyw * cell[5] + fzw * cell[8],
-      ];
-    }
-
-    for (let k = 0; k < nb; k++) {
-      const i = bondI[k], j = bondJ[k];
-      const sx = positions[i*3], sy = positions[i*3+1], sz = positions[i*3+2];
-      const ex = positions[j*3], ey = positions[j*3+1], ez = positions[j*3+2];
-      const mi = minImage(ex - sx, ey - sy, ez - sz);
-      const d = Math.sqrt(mi[0]*mi[0] + mi[1]*mi[1] + mi[2]*mi[2]);
-      if (d > 5.0) {
-        dummy.scale.set(0, 0, 0); dummy.updateMatrix();
-        bondMesh.setMatrixAt(k, dummy.matrix);
-        bondOutlineMesh.setMatrixAt(k, dummy.matrix);
-        continue;
+      function minImage(dx, dy, dz) {
+        const fx = dx * cellInv[0] + dy * cellInv[3] + dz * cellInv[6];
+        const fy = dx * cellInv[1] + dy * cellInv[4] + dz * cellInv[7];
+        const fz = dx * cellInv[2] + dy * cellInv[5] + dz * cellInv[8];
+        const fxw = fx - Math.round(fx);
+        const fyw = fy - Math.round(fy);
+        const fzw = fz - Math.round(fz);
+        return [
+          fxw * cell[0] + fyw * cell[3] + fzw * cell[6],
+          fxw * cell[1] + fyw * cell[4] + fzw * cell[7],
+          fxw * cell[2] + fyw * cell[5] + fzw * cell[8],
+        ];
       }
-      start.set(sx, sy, sz);
-      end.set(sx + mi[0], sy + mi[1], sz + mi[2]);
-      mid.addVectors(start, end).multiplyScalar(0.5);
-      dirV.subVectors(end, start);
-      const len = dirV.length();
-      dirV.normalize();
-      quat.setFromUnitVectors(up, dirV);
 
-      dummy.position.copy(mid);
-      dummy.quaternion.copy(quat);
-      dummy.scale.set(bondRadius, len, bondRadius);
-      dummy.updateMatrix();
-      bondMesh.setMatrixAt(k, dummy.matrix);
-      bondMesh.setColorAt(k, redCol);
+      for (let k = 0; k < nb; k++) {
+        const i = bondI[k], j = bondJ[k];
+        const sx = positions[i*3], sy = positions[i*3+1], sz = positions[i*3+2];
+        const ex = positions[j*3], ey = positions[j*3+1], ez = positions[j*3+2];
+        const mi = minImage(ex - sx, ey - sy, ez - sz);
+        const d = Math.sqrt(mi[0]*mi[0] + mi[1]*mi[1] + mi[2]*mi[2]);
+        if (d > 5.0) {
+          dummy.scale.set(0, 0, 0); dummy.updateMatrix();
+          bondMesh.setMatrixAt(k, dummy.matrix);
+          bondOutlineMesh.setMatrixAt(k, dummy.matrix);
+          continue;
+        }
+        start.set(sx, sy, sz);
+        end.set(sx + mi[0], sy + mi[1], sz + mi[2]);
+        mid.addVectors(start, end).multiplyScalar(0.5);
+        dirV.subVectors(end, start);
+        const len = dirV.length();
+        dirV.normalize();
+        quat.setFromUnitVectors(up, dirV);
 
-      dummy.scale.set(bondOutlineRadius, len, bondOutlineRadius);
-      dummy.updateMatrix();
-      bondOutlineMesh.setMatrixAt(k, dummy.matrix);
+        dummy.position.copy(mid);
+        dummy.quaternion.copy(quat);
+        dummy.scale.set(bondRadius, len, bondRadius);
+        dummy.updateMatrix();
+        bondMesh.setMatrixAt(k, dummy.matrix);
+        bondMesh.setColorAt(k, redCol);
+
+        dummy.scale.set(bondOutlineRadius, len, bondOutlineRadius);
+        dummy.updateMatrix();
+        bondOutlineMesh.setMatrixAt(k, dummy.matrix);
+      }
+      bondMesh.instanceMatrix.needsUpdate = true;
+      bondMesh.instanceColor.needsUpdate = true;
+      bondOutlineMesh.instanceMatrix.needsUpdate = true;
+      scene.add(bondMesh);
+      scene.add(bondOutlineMesh);
+    } else {
+      // Translucent tetrahedra.  Each tet has 4 pre-computed vertex
+      // positions (already min-image wrt the centre and centred); expand
+      // them into 4 triangular faces.
+      const tetVerts = new Float32Array(s.tetrahedra_vertices || []);
+      const nTets = s.num_tetrahedra || 0;
+      if (nTets > 0) {
+        const positionsAttr = new Float32Array(nTets * 4 * 3 * 3);
+        const faceIdx = [[0,1,2],[0,1,3],[0,2,3],[1,2,3]];
+        for (let t = 0; t < nTets; t++) {
+          const base = t * 12;
+          const V = [
+            [tetVerts[base+0],  tetVerts[base+1],  tetVerts[base+2]],
+            [tetVerts[base+3],  tetVerts[base+4],  tetVerts[base+5]],
+            [tetVerts[base+6],  tetVerts[base+7],  tetVerts[base+8]],
+            [tetVerts[base+9],  tetVerts[base+10], tetVerts[base+11]],
+          ];
+          for (let f = 0; f < 4; f++) {
+            const [a, b, c_] = faceIdx[f];
+            const outBase = (t * 4 + f) * 9;
+            positionsAttr[outBase+0] = V[a][0];
+            positionsAttr[outBase+1] = V[a][1];
+            positionsAttr[outBase+2] = V[a][2];
+            positionsAttr[outBase+3] = V[b][0];
+            positionsAttr[outBase+4] = V[b][1];
+            positionsAttr[outBase+5] = V[b][2];
+            positionsAttr[outBase+6] = V[c_][0];
+            positionsAttr[outBase+7] = V[c_][1];
+            positionsAttr[outBase+8] = V[c_][2];
+          }
+        }
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute("position", new THREE.BufferAttribute(positionsAttr, 3));
+        geo.computeVertexNormals();
+        const tetColor = DATA.tetrahedra_color || [0.25, 0.65, 0.95];
+        const tetOpacity = DATA.tetrahedra_opacity != null ? DATA.tetrahedra_opacity : 0.35;
+        const mat = new THREE.MeshPhongMaterial({
+          color: new THREE.Color(tetColor[0], tetColor[1], tetColor[2]),
+          shininess: 20,
+          specular: 0x888888,
+          transparent: true,
+          opacity: tetOpacity,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+        });
+        scene.add(new THREE.Mesh(geo, mat));
+
+        // Edge wireframe for legibility.
+        const edgeMat = new THREE.LineBasicMaterial({
+          color: 0x111111,
+          transparent: true,
+          opacity: 0.55,
+        });
+        const edgeVerts = [];
+        const tetEdges = [[0,1],[0,2],[0,3],[1,2],[1,3],[2,3]];
+        for (let t = 0; t < nTets; t++) {
+          const base = t * 12;
+          const V = [
+            [tetVerts[base+0],  tetVerts[base+1],  tetVerts[base+2]],
+            [tetVerts[base+3],  tetVerts[base+4],  tetVerts[base+5]],
+            [tetVerts[base+6],  tetVerts[base+7],  tetVerts[base+8]],
+            [tetVerts[base+9],  tetVerts[base+10], tetVerts[base+11]],
+          ];
+          for (const [a,b] of tetEdges) {
+            edgeVerts.push(...V[a], ...V[b]);
+          }
+        }
+        const edgeGeo = new THREE.BufferGeometry();
+        edgeGeo.setAttribute("position", new THREE.Float32BufferAttribute(edgeVerts, 3));
+        scene.add(new THREE.LineSegments(edgeGeo, edgeMat));
+      }
     }
-    bondMesh.instanceMatrix.needsUpdate = true;
-    bondMesh.instanceColor.needsUpdate = true;
-    bondOutlineMesh.instanceMatrix.needsUpdate = true;
-    scene.add(bondMesh);
-    scene.add(bondOutlineMesh);
 
     // Cell outline
     {

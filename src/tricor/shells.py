@@ -430,6 +430,26 @@ class CoordinationShellTarget:
             summary=summary,
         )
 
+    def with_cross_species_bonds_only(self) -> "CoordinationShellTarget":
+        """Return a copy where same-species ``coordination_target`` entries
+        are zeroed.
+
+        Useful for network-former compounds such as SiO\u2082 where only
+        cross-species pairs (Si-O) are real chemical bonds; the same-species
+        "shell" peaks (Si-Si, O-O) come from the second coordination shell
+        through the bridging atom and should not be treated as bonds by
+        :meth:`Supercell.shell_relax` (which would otherwise install
+        spurious angle springs on triplets like Si-Si-Si or O-O-O whose
+        ``angle_mode_deg`` is just a geometric artefact of the reference
+        sampling, not a physical target).
+        """
+        from dataclasses import replace as _dc_replace
+
+        ct = np.asarray(self.coordination_target, dtype=np.float64).copy()
+        for i in range(ct.shape[0]):
+            ct[i, i] = 0.0
+        return _dc_replace(self, coordination_target=ct)
+
     @property
     def pair_labels(self) -> list[str]:
         """Return human-readable pair labels."""

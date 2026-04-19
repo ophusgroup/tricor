@@ -19,6 +19,120 @@ _G3_HTML_TEMPLATE = (_STATIC_DIR / "g3_viewer.html").read_text()
 _OVERVIEW_HTML_TEMPLATE = (_STATIC_DIR / "overview_viewer.html").read_text()
 
 
+def _detect_tetrahedra(
+    atoms,
+    *,
+    center_symbol: str = "Si",
+    vertex_symbol: str = "O",
+    bond_length: float | None = None,
+    bond_length_tol: float = 0.15,
+    ideal_angle_deg: float = 109.47,
+    angle_tol_deg: float = 25.0,
+) -> list[dict]:
+    """Find center atoms whose 4 nearest vertex atoms form a tetrahedron.
+
+    Returns a list of dicts with keys ``center`` (int) and ``vertices``
+    (list of 4 ints), in order of increasing center-to-vertex distance.
+    Only tetrahedra whose 4 bond lengths are within
+    ``bond_length_tol`` of ``bond_length`` AND whose 6 pairwise
+    (vertex)-(center)-(vertex) angles are within ``angle_tol_deg`` of
+    ``ideal_angle_deg`` are returned.
+
+    When ``bond_length`` is ``None`` the median of all center-vertex
+    distances inside 3.5 Å is used as an estimate.
+    """
+    from ase.data import atomic_numbers
+
+    Zc = atomic_numbers[center_symbol]
+    Zv = atomic_numbers[vertex_symbol]
+    numbers = np.asarray(atoms.numbers)
+
+    if bond_length is None:
+        # Use the 10th percentile of center-vertex distances so the
+        # "bond length" sits near the first-neighbour peak even in
+        # disordered samples where many longer pairs exist.
+        bi, bj, bd = neighbor_list("ijd", atoms, 3.5)
+        mask = (numbers[bi] == Zc) & (numbers[bj] == Zv)
+        if not np.any(mask):
+            return []
+        bond_length = float(np.percentile(bd[mask], 10))
+
+    cutoff = float(bond_length) * (1.0 + float(bond_length_tol)) * 1.05
+    bi_all, bj_all, bd_all, bD_all = neighbor_list("ijdD", atoms, float(cutoff))
+
+    keep = (
+        (numbers[bi_all] == Zc)
+        & (numbers[bj_all] == Zv)
+        & (bd_all >= bond_length * (1.0 - bond_length_tol))
+        & (bd_all <= bond_length * (1.0 + bond_length_tol))
+    )
+    if not np.any(keep):
+        return []
+    bi = bi_all[keep]
+    bj = bj_all[keep]
+    bd = bd_all[keep]
+    bD = bD_all[keep]
+
+    order = np.lexsort((bd, bi))
+    bi_s = bi[order]
+    bj_s = bj[order]
+    bD_s = bD[order]
+
+    ideal_rad = float(np.deg2rad(ideal_angle_deg))
+    tol_rad = float(np.deg2rad(angle_tol_deg))
+
+    unique_i, start_idx = np.unique(bi_s, return_index=True)
+    end_idx = np.concatenate([start_idx[1:], [bi_s.size]])
+
+    tetrahedra: list[dict] = []
+    for u, s, e in zip(unique_i, start_idx, end_idx):
+        if int(e - s) < 4:
+            continue
+        js = bj_s[s : s + 4]
+        vs = bD_s[s : s + 4]
+        norms = np.linalg.norm(vs, axis=1)
+        if np.any(norms < 1e-6):
+            continue
+        unit = vs / norms[:, None]
+        cos_ab = np.clip(unit @ unit.T, -1.0, 1.0)
+        angles = np.arccos(cos_ab)
+        triu = np.triu_indices(4, k=1)
+        if float(np.max(np.abs(angles[triu] - ideal_rad))) <= tol_rad:
+            tetrahedra.append(
+                {
+                    "center": int(u),
+                    "vertices": [int(j) for j in js],
+                }
+            )
+    return tetrahedra
+
+
+def _tetrahedra_vertex_coords(
+    tetrahedra: list[dict],
+    positions: np.ndarray,
+    cell_matrix: np.ndarray,
+) -> list[float]:
+    """Flat list: for each tet, 4 vertex positions (min-image wrt the
+    centre), already centred so the box centre sits at the origin."""
+    if not tetrahedra:
+        return []
+    cell = np.asarray(cell_matrix, dtype=np.float64)
+    cell_inv = np.linalg.inv(cell)
+    centre = 0.5 * cell.sum(axis=0)
+    out = []
+    for t in tetrahedra:
+        c_pos = positions[t["center"]]
+        for v_idx in t["vertices"]:
+            v_pos = positions[v_idx]
+            disp = v_pos - c_pos
+            frac = disp @ cell_inv
+            frac -= np.round(frac)
+            disp_w = frac @ cell
+            adj = c_pos + disp_w - centre
+            out.extend(float(x) for x in adj)
+    return out
+
+
 def export_overview_html(
     output_path: str,
     cells_and_labels,
@@ -35,6 +149,9 @@ def export_overview_html(
     bond_length_tol: float = 0.10,
     ideal_angle_deg: float = 109.47,
     bond_angle_tol_deg: float = 18.0,
+    tetrahedra: dict | None = None,
+    tetrahedra_color=(0.25, 0.65, 0.95),
+    tetrahedra_opacity: float = 0.35,
 ) -> str:
     """Export a grid of static 3D structures as a self-contained HTML file.
 
@@ -43,27 +160,47 @@ def export_overview_html(
     camera that auto-rotates; dragging any panel pauses the rotation and
     orbits manually.
 
-    Parameters
-    ----------
-    output_path
-        Path to write the HTML file.
-    cells_and_labels
-        Iterable of ``(supercell, label)`` pairs.
-    grid_cols
-        Number of columns in the grid (rows are inferred).
-    atom_scale, bond_radius
-        Same meaning as in :meth:`export_trajectory_html`.
-    bond_color
-        RGB tuple in [0,1] for the bond colour (default red).
-    background_color, title, subtitle
-        Cosmetic.
-    bond_cutoff_scale
-        Bond cutoff = ``shell_target.pair_peak.max() * bond_cutoff_scale``
-        (fallback ``3.0`` Å if no ``shell_target`` is attached).
+    Passing a ``tetrahedra`` dict switches the per-panel rendering from
+    bonds to translucent polyhedra.  Keys:
+
+    - ``center_symbol`` (default ``"Si"``) - element at the centre
+    - ``vertex_symbol`` (default ``"O"``)  - element at each vertex
+    - ``bond_length`` (default auto)        - centre-vertex ideal distance
+    - ``bond_length_tol`` (default ``0.15``)
+    - ``ideal_angle_deg`` (default ``109.47``)
+    - ``angle_tol_deg`` (default ``25.0``)
+
+    Only centres whose four nearest vertex atoms satisfy all of the above
+    contribute a tetrahedron; bonds are not drawn in this mode.
     """
     import json
     from ase.data import covalent_radii
     from ase.data.colors import jmol_colors
+
+    tetra_cfg = None
+    if tetrahedra is not None:
+        tetra_cfg = {
+            "center_symbol": tetrahedra.get("center_symbol", "Si"),
+            "vertex_symbol": tetrahedra.get("vertex_symbol", "O"),
+            "bond_length": tetrahedra.get("bond_length"),
+            "bond_length_tol": float(tetrahedra.get("bond_length_tol", 0.15)),
+            "ideal_angle_deg": float(tetrahedra.get("ideal_angle_deg", 109.47)),
+            "angle_tol_deg": float(tetrahedra.get("angle_tol_deg", 25.0)),
+        }
+
+    def _bond_length_from_shell_target(cell, center_sym, vertex_sym):
+        from ase.data import atomic_numbers
+        st = getattr(cell, "_shell_target", None)
+        if st is None:
+            return None
+        sp = np.asarray(st.species, dtype=np.int64)
+        try:
+            i = int(np.where(sp == atomic_numbers[center_sym])[0][0])
+            j = int(np.where(sp == atomic_numbers[vertex_sym])[0][0])
+        except (IndexError, KeyError):
+            return None
+        v = float(np.asarray(st.pair_peak, dtype=np.float64)[i, j])
+        return v if v > 0 else None
 
     structures = []
     for cell, label in cells_and_labels:
@@ -76,89 +213,105 @@ def export_overview_html(
             ))
         else:
             pair_peak = 2.35
-        cutoff_lo = pair_peak * (1.0 - bond_length_tol)
-        cutoff_hi = pair_peak * (1.0 + bond_length_tol)
-        search_cutoff = pair_peak * bond_cutoff_scale
-
-        bi_all, bj_all, bd_all, bD_all = neighbor_list(
-            "ijdD", atoms, float(search_cutoff),
-        )
-
-        # Radial filter - keep only near-ideal bond lengths.
-        length_ok = (bd_all >= cutoff_lo) & (bd_all <= cutoff_hi)
-        bi_all = bi_all[length_ok]
-        bj_all = bj_all[length_ok]
-        bd_all = bd_all[length_ok]
-        bD_all = bD_all[length_ok]
-
-        # Take the ``max_bonds_per_atom`` shortest in-band neighbours per atom.
-        order = np.lexsort((bd_all, bi_all))
-        bi_s = bi_all[order]
-        bj_s = bj_all[order]
-        bD_s = bD_all[order]
-        keep_mask = np.zeros(bi_s.size, dtype=bool)
-        if bi_s.size:
-            unique_i, start_idx = np.unique(bi_s, return_index=True)
-            end_idx = np.concatenate([start_idx[1:], [bi_s.size]])
-            for s, e in zip(start_idx, end_idx):
-                keep_mask[s : min(s + max_bonds_per_atom, e)] = True
-        bi_top = bi_s[keep_mask]
-        bj_top = bj_s[keep_mask]
-        bD_top = bD_s[keep_mask]
-
-        # Angular filter: only keep bonds from atoms whose selected neighbours
-        # form a tetrahedron whose 6 pair-wise angles are all within
-        # ``bond_angle_tol_deg`` of ``ideal_angle_deg``.  Atoms that don't
-        # satisfy this test contribute no bonds at all.
-        ideal_angle = float(np.deg2rad(ideal_angle_deg))
-        angle_tol = float(np.deg2rad(bond_angle_tol_deg))
-        needed = int(max_bonds_per_atom)
-
-        n_atoms = len(atoms)
-        per_atom_js: list[list] = [[] for _ in range(n_atoms)]
-        per_atom_vs: list[list] = [[] for _ in range(n_atoms)]
-        for i_, j_, v_ in zip(bi_top.tolist(), bj_top.tolist(), bD_top):
-            if len(per_atom_js[i_]) < needed:
-                per_atom_js[i_].append(int(j_))
-                per_atom_vs[i_].append(v_)
-
-        good_pairs: set[tuple[int, int]] = set()
-        for i_ in range(n_atoms):
-            js = per_atom_js[i_]
-            if len(js) < needed:
-                continue
-            vecs = np.asarray(per_atom_vs[i_], dtype=np.float64)
-            norms = np.linalg.norm(vecs, axis=1)
-            if np.any(norms <= 1e-9):
-                continue
-            unit = vecs / norms[:, None]
-            # Pairwise cosines (needed×needed); off-diagonal entries are the
-            # 6 angles we care about for a 4-neighbour atom.
-            cos = np.clip(unit @ unit.T, -1.0, 1.0)
-            angles = np.arccos(cos)
-            triu = np.triu_indices(needed, k=1)
-            dev = np.abs(angles[triu] - ideal_angle)
-            if np.max(dev) <= angle_tol:
-                for j_ in js:
-                    good_pairs.add((min(i_, j_), max(i_, j_)))
-
-        if good_pairs:
-            pair_arr = np.asarray(sorted(good_pairs), dtype=np.int32)
-            bi = pair_arr[:, 0]
-            bj = pair_arr[:, 1]
-        else:
-            bi = np.zeros(0, dtype=np.int32)
-            bj = np.zeros(0, dtype=np.int32)
-
+        cell_mat = np.asarray(atoms.cell.array, dtype=np.float32)
+        centre = 0.5 * np.sum(cell_mat, axis=0)
+        pos = (atoms.positions - centre).astype(np.float32)
+        pos = np.round(pos, 3)
         numbers = atoms.numbers
         colors = np.array([jmol_colors[z] for z in numbers], dtype=np.float32)
         radii = np.array([covalent_radii[z] for z in numbers], dtype=np.float32)
-        cell_mat = np.asarray(atoms.cell.array, dtype=np.float32)
 
-        centre = 0.5 * np.sum(cell_mat, axis=0)
-        pos = (atoms.positions - centre).astype(np.float32)
-        # Round to 3 decimals (Å) to keep the JSON footprint small.
-        pos = np.round(pos, 3)
+        if tetra_cfg is None:
+            # Existing bond-filter path.
+            cutoff_lo = pair_peak * (1.0 - bond_length_tol)
+            cutoff_hi = pair_peak * (1.0 + bond_length_tol)
+            search_cutoff = pair_peak * bond_cutoff_scale
+
+            bi_all, bj_all, bd_all, bD_all = neighbor_list(
+                "ijdD", atoms, float(search_cutoff),
+            )
+            length_ok = (bd_all >= cutoff_lo) & (bd_all <= cutoff_hi)
+            bi_all = bi_all[length_ok]
+            bj_all = bj_all[length_ok]
+            bd_all = bd_all[length_ok]
+            bD_all = bD_all[length_ok]
+
+            order = np.lexsort((bd_all, bi_all))
+            bi_s = bi_all[order]
+            bj_s = bj_all[order]
+            bD_s = bD_all[order]
+            keep_mask = np.zeros(bi_s.size, dtype=bool)
+            if bi_s.size:
+                unique_i, start_idx = np.unique(bi_s, return_index=True)
+                end_idx = np.concatenate([start_idx[1:], [bi_s.size]])
+                for s, e in zip(start_idx, end_idx):
+                    keep_mask[s : min(s + max_bonds_per_atom, e)] = True
+            bi_top = bi_s[keep_mask]
+            bj_top = bj_s[keep_mask]
+            bD_top = bD_s[keep_mask]
+
+            ideal_angle = float(np.deg2rad(ideal_angle_deg))
+            angle_tol = float(np.deg2rad(bond_angle_tol_deg))
+            needed = int(max_bonds_per_atom)
+
+            n_atoms = len(atoms)
+            per_atom_js: list[list] = [[] for _ in range(n_atoms)]
+            per_atom_vs: list[list] = [[] for _ in range(n_atoms)]
+            for i_, j_, v_ in zip(bi_top.tolist(), bj_top.tolist(), bD_top):
+                if len(per_atom_js[i_]) < needed:
+                    per_atom_js[i_].append(int(j_))
+                    per_atom_vs[i_].append(v_)
+
+            good_pairs: set[tuple[int, int]] = set()
+            for i_ in range(n_atoms):
+                js = per_atom_js[i_]
+                if len(js) < needed:
+                    continue
+                vecs = np.asarray(per_atom_vs[i_], dtype=np.float64)
+                norms = np.linalg.norm(vecs, axis=1)
+                if np.any(norms <= 1e-9):
+                    continue
+                unit = vecs / norms[:, None]
+                cos = np.clip(unit @ unit.T, -1.0, 1.0)
+                angles = np.arccos(cos)
+                triu = np.triu_indices(needed, k=1)
+                dev = np.abs(angles[triu] - ideal_angle)
+                if np.max(dev) <= angle_tol:
+                    for j_ in js:
+                        good_pairs.add((min(i_, j_), max(i_, j_)))
+
+            if good_pairs:
+                pair_arr = np.asarray(sorted(good_pairs), dtype=np.int32)
+                bi = pair_arr[:, 0]
+                bj = pair_arr[:, 1]
+            else:
+                bi = np.zeros(0, dtype=np.int32)
+                bj = np.zeros(0, dtype=np.int32)
+            tet_vertices_flat: list[float] = []
+            num_tets = 0
+        else:
+            # Tetrahedron mode: skip bonds, find polyhedra.
+            effective_bond_length = tetra_cfg["bond_length"]
+            if effective_bond_length is None:
+                effective_bond_length = _bond_length_from_shell_target(
+                    cell, tetra_cfg["center_symbol"], tetra_cfg["vertex_symbol"],
+                )
+            tets = _detect_tetrahedra(
+                atoms,
+                center_symbol=tetra_cfg["center_symbol"],
+                vertex_symbol=tetra_cfg["vertex_symbol"],
+                bond_length=effective_bond_length,
+                bond_length_tol=tetra_cfg["bond_length_tol"],
+                ideal_angle_deg=tetra_cfg["ideal_angle_deg"],
+                angle_tol_deg=tetra_cfg["angle_tol_deg"],
+            )
+            tet_vertices_flat = _tetrahedra_vertex_coords(
+                tets, atoms.positions, atoms.cell.array,
+            )
+            tet_vertices_flat = [round(v, 3) for v in tet_vertices_flat]
+            num_tets = len(tets)
+            bi = np.zeros(0, dtype=np.int32)
+            bj = np.zeros(0, dtype=np.int32)
 
         structures.append({
             "label": label,
@@ -170,6 +323,8 @@ def export_overview_html(
             "bond_i": bi.tolist(),
             "bond_j": bj.tolist(),
             "cell_matrix": np.round(cell_mat, 3).ravel().tolist(),
+            "tetrahedra_vertices": tet_vertices_flat,
+            "num_tetrahedra": int(num_tets),
         })
 
     data = {
@@ -182,6 +337,9 @@ def export_overview_html(
         "background_color": background_color,
         "title": title,
         "subtitle": subtitle,
+        "tetrahedra_mode": tetra_cfg is not None,
+        "tetrahedra_color": list(tetrahedra_color),
+        "tetrahedra_opacity": float(tetrahedra_opacity),
     }
 
     html = _OVERVIEW_HTML_TEMPLATE.replace(
@@ -301,16 +459,24 @@ def _g3_pair_profile(
     triplet_idx: int,
     r: np.ndarray,
 ) -> np.ndarray:
-    """Return the per-triplet pair profile g(r), normalised so tail -> 1.0."""
+    """Return the per-triplet ROOT-bond pair profile g(r), normalised so
+    the tail -> 1.0.
+
+    For a triplet ``A | B C`` the root bond is ``A-B`` (center to first
+    neighbour).  The heatmap above the profile integrates over this same
+    A-B shell to expose how the third atom C is distributed about the
+    A-B backbone.
+    """
     g2 = getattr(dist, "g2", None)
     g3_index = getattr(dist, "g3_index", None)
     if g2 is not None and g3_index is not None:
-        center_ind, neigh1_ind, neigh2_ind = g3_index[triplet_idx]
+        center_ind, neigh1_ind, _neigh2_ind = g3_index[triplet_idx]
         profile = np.asarray(g2[center_ind, neigh1_ind], dtype=np.float64).copy()
-        profile += np.asarray(g2[center_ind, neigh2_ind], dtype=np.float64)
     else:
+        # Fall back to integrating r2 and phi out of g3, which leaves
+        # the r1 profile (the root bond).
         triplet_data = np.asarray(dist.g3[triplet_idx], dtype=np.float64)
-        profile = triplet_data.sum(axis=(1, 2)) + triplet_data.sum(axis=(0, 2))
+        profile = triplet_data.sum(axis=(1, 2))
 
     profile = profile / np.maximum(r * r, _EPS)
     # Scale so the tail converges to 1.0
@@ -335,10 +501,12 @@ def _g3_slice_image(
 ) -> np.ndarray:
     """Compute the (num_phi, num_r) reduced-density slice for one triplet.
 
-    Normalised so that the uniform far-field tends to 1.0.
+    Integrates the root bond (axis 0, ``r1``) over ``shell_mask``; the
+    remaining ``(r2, phi)`` plane shows where the *third* atom sits
+    relative to the root bond.  Normalised so that the uniform far-field
+    tends to 1.0.
     """
     image = triplet_data[shell_mask, :, :].sum(axis=0)
-    image += triplet_data[:, shell_mask, :].sum(axis=1)
     image = image.T  # (num_phi, num_r)
 
     phi_rad = np.deg2rad(phi_deg)
@@ -526,6 +694,10 @@ class _PlottingMixin:
         bond_radius: float = 0.06,
         background_color: str = "#f7f8f5",
         title: str = "",
+        tetrahedra: dict | None = None,
+        tetrahedra_color=(0.25, 0.65, 0.95),
+        tetrahedra_opacity: float = 0.35,
+        show_bonds: bool | None = None,
     ) -> str:
         """Export an interactive 3D trajectory viewer as a self-contained HTML file.
 
@@ -550,6 +722,11 @@ class _PlottingMixin:
             CSS colour for the viewer background.
         title
             Optional title displayed above the viewer.
+        show_bonds
+            Whether to emit bond cylinders.  ``None`` (default) auto-picks:
+            ``True`` when no ``tetrahedra`` are requested, ``False`` when
+            they are (tetrahedra supersede bonds).  Pass ``True`` / ``False``
+            explicitly to override.
 
         Returns
         -------
@@ -597,13 +774,65 @@ class _PlottingMixin:
             else:
                 bond_cutoff = 3.0
 
-        # Bond topology from final frame
-        bi_all, bj_all, bd_all = neighbor_list(
-            "ijd", self.atoms, float(bond_cutoff),
-        )
-        mask = bi_all < bj_all
-        bi = bi_all[mask].astype(np.int32)
-        bj = bj_all[mask].astype(np.int32)
+        # Tetrahedra topology (from final frame) if requested; disables bonds.
+        tetra_cfg = None
+        if tetrahedra is not None:
+            tetra_cfg = {
+                "center_symbol": tetrahedra.get("center_symbol", "Si"),
+                "vertex_symbol": tetrahedra.get("vertex_symbol", "O"),
+                "bond_length": tetrahedra.get("bond_length"),
+                "bond_length_tol": float(tetrahedra.get("bond_length_tol", 0.15)),
+                "ideal_angle_deg": float(tetrahedra.get("ideal_angle_deg", 109.47)),
+                "angle_tol_deg": float(tetrahedra.get("angle_tol_deg", 25.0)),
+            }
+
+        tet_centers: list[int] = []
+        tet_vertex_idx: list[int] = []
+
+        # Resolve show_bonds auto-default: bonds follow atoms when no
+        # tetrahedra are requested; tetrahedra supersede bonds otherwise.
+        if show_bonds is None:
+            show_bonds_eff = tetra_cfg is None
+        else:
+            show_bonds_eff = bool(show_bonds)
+
+        if tetra_cfg is not None:
+            effective_bond_length = tetra_cfg["bond_length"]
+            if effective_bond_length is None:
+                from ase.data import atomic_numbers
+                _st = getattr(self, "_shell_target", None)
+                if _st is not None:
+                    _sp = np.asarray(_st.species, dtype=np.int64)
+                    try:
+                        ci = int(np.where(_sp == atomic_numbers[tetra_cfg["center_symbol"]])[0][0])
+                        vi = int(np.where(_sp == atomic_numbers[tetra_cfg["vertex_symbol"]])[0][0])
+                        v = float(np.asarray(_st.pair_peak, dtype=np.float64)[ci, vi])
+                        if v > 0:
+                            effective_bond_length = v
+                    except (IndexError, KeyError):
+                        pass
+            tets = _detect_tetrahedra(
+                self.atoms,
+                center_symbol=tetra_cfg["center_symbol"],
+                vertex_symbol=tetra_cfg["vertex_symbol"],
+                bond_length=effective_bond_length,
+                bond_length_tol=tetra_cfg["bond_length_tol"],
+                ideal_angle_deg=tetra_cfg["ideal_angle_deg"],
+                angle_tol_deg=tetra_cfg["angle_tol_deg"],
+            )
+            tet_centers = [t["center"] for t in tets]
+            tet_vertex_idx = [v for t in tets for v in t["vertices"]]
+
+        if show_bonds_eff:
+            bi_all, bj_all, bd_all = neighbor_list(
+                "ijd", self.atoms, float(bond_cutoff),
+            )
+            mask = bi_all < bj_all
+            bi = bi_all[mask].astype(np.int32)
+            bj = bj_all[mask].astype(np.int32)
+        else:
+            bi = np.zeros(0, dtype=np.int32)
+            bj = np.zeros(0, dtype=np.int32)
 
         # Atom metadata
         numbers = self.atoms.numbers
@@ -639,6 +868,13 @@ class _PlottingMixin:
             data["cost_max"] = float(cost_max)
             data["cost_label"] = "per-atom cost"
 
+        data["tetrahedra_mode"] = tetra_cfg is not None
+        data["tetrahedra_centers"] = list(tet_centers)
+        data["tetrahedra_vertex_indices"] = list(tet_vertex_idx)
+        data["num_tetrahedra"] = len(tet_centers)
+        data["tetrahedra_color"] = list(tetrahedra_color)
+        data["tetrahedra_opacity"] = float(tetrahedra_opacity)
+
         html = _TRAJECTORY_HTML_TEMPLATE.replace(
             "__TRICOR_DATA_PLACEHOLDER__",
             json.dumps(data),
@@ -659,6 +895,7 @@ class _PlottingMixin:
         background_color: str = "#f7f8f5",
         title: str = "",
         show_progress: bool = False,
+        show_all_triplets: bool = False,
     ) -> str:
         """Export a static 2D g3 viewer as a self-contained HTML file.
 
@@ -682,6 +919,12 @@ class _PlottingMixin:
             Cosmetic.
         show_progress
             Forwarded to the g3 measurement call.
+        show_all_triplets
+            If True, the viewer renders a grid of all triplet heatmaps
+            simultaneously (sharing one legend and colour scale) instead
+            of the interactive single-panel view.  Useful for multi-
+            species cases like SiO\u2082 where it's otherwise unclear which
+            triplet channel is being displayed.
         """
         import json
 
@@ -714,6 +957,24 @@ class _PlottingMixin:
             pair_peak_matrix = np.asarray(shell_target.pair_peak, dtype=np.float64)
         g3_index = getattr(dist, "g3_index", None)
 
+        # Per-triplet root-bond label ("Si-O" etc.) for the g(r) panel
+        # below each heatmap, derived from g3_index + species_labels so it
+        # matches however the user labels each species.
+        species_labels = [str(s) for s in getattr(dist, "species_labels", None) or []]
+        if not species_labels:
+            from ase.data import chemical_symbols as _chemical_symbols
+            species_labels = [_chemical_symbols[int(z)] for z in dist.species]
+        profile_labels: list[str] = []
+        for ti in range(num_triplets):
+            if g3_index is not None:
+                center_ind, neigh1_ind, _neigh2_ind = g3_index[ti]
+                profile_labels.append(
+                    f"g(r) {species_labels[int(center_ind)]}-"
+                    f"{species_labels[int(neigh1_ind)]}"
+                )
+            else:
+                profile_labels.append("g(r)")
+
         slices = []
         pair_profiles = []
         shell_ranges = []
@@ -744,6 +1005,21 @@ class _PlottingMixin:
             shell_max = float(r_edges[int(idx[-1]) + 1])
             shell_ranges.append([shell_min, shell_max])
 
+        # Default triplet: prefer a canonical tetrahedral channel when
+        # present (Si|O O for silica, Si|Si Si for silicon, etc.).
+        # Labels are like "Si | O O"; compare the center/neighbour
+        # symbols after normalising whitespace.
+        default_triplet = 0
+        preferred = [
+            "Si | O O", "Si | Si Si", "C | C C", "Cu | Cu Cu",
+            "Ti | O O", "Sr | O O",
+        ]
+        norm_labels = [str(lab).replace("  ", " ").strip() for lab in labels]
+        for candidate in preferred:
+            if candidate in norm_labels:
+                default_triplet = norm_labels.index(candidate)
+                break
+
         data = {
             "num_r": int(r.size),
             "num_phi": int(phi_deg.size),
@@ -753,11 +1029,14 @@ class _PlottingMixin:
             "phi_centers_deg": phi_deg.tolist(),
             "phi_edges_deg": phi_edges_deg.tolist(),
             "triplet_labels": labels,
+            "profile_labels": profile_labels,
+            "default_triplet": int(default_triplet),
             "slices": slices,
             "pair_profiles": pair_profiles,
             "shell_ranges": shell_ranges,
             "background_color": background_color,
             "title": title,
+            "show_all": bool(show_all_triplets),
         }
 
         html = _G3_HTML_TEMPLATE.replace(

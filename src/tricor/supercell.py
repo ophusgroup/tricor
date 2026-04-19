@@ -233,31 +233,57 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
     # Cell geometry utilities
     # ------------------------------------------------------------------
 
-    def _normalize_cell_dim_angstroms(
-        self,
-        cell_dim_angstroms: float | Sequence[float],
-    ) -> tuple[float, float, float]:
-        """Validate and normalize the requested supercell lengths in Angstrom."""
+    def _normalize_cell_dim_angstroms(self, cell_dim_angstroms):
+        """Validate and normalize the requested supercell lattice.
+
+        Accepts:
+            - a scalar (cubic box),
+            - a length-3 sequence of positive edge lengths (orthogonal box),
+            - a 3 x 3 array of cell vectors (general triclinic box).
+        """
         if isinstance(cell_dim_angstroms, (int, float)):
             if float(cell_dim_angstroms) <= 0:
                 raise ValueError("cell_dim_angstroms must be positive.")
             length = float(cell_dim_angstroms)
             return (length, length, length)
 
-        dims = tuple(float(value) for value in cell_dim_angstroms)
-        if len(dims) != 3 or any(value <= 0 for value in dims):
-            raise ValueError(
-                "cell_dim_angstroms must be a scalar or a length-3 sequence of positive values."
-            )
-        return dims
+        arr = np.asarray(cell_dim_angstroms, dtype=float)
+        if arr.ndim == 2 and arr.shape == (3, 3):
+            if abs(np.linalg.det(arr)) < 1e-8:
+                raise ValueError("cell_dim_angstroms 3x3 matrix is singular.")
+            return arr.copy()
+
+        if arr.ndim == 1 and arr.shape[0] == 3:
+            if np.any(arr <= 0):
+                raise ValueError(
+                    "cell_dim_angstroms edge lengths must be positive."
+                )
+            return tuple(float(v) for v in arr)
+
+        raise ValueError(
+            "cell_dim_angstroms must be a scalar, a length-3 sequence, "
+            "or a 3x3 matrix of cell vectors.",
+        )
 
     def _build_supercell_cell(self) -> np.ndarray:
-        """Build an orthogonal supercell with the requested dimensions.
+        """Build the supercell cell matrix.
 
-        Always returns a diagonal cell matrix regardless of the
-        reference crystal's lattice vectors.
+        ``cell_dim_angstroms`` can be supplied as either
+        - a 3-tuple of edge lengths (orthogonal cell), or
+        - a full 3x3 array of cell vectors (rows = cell vectors).
+
+        The second form lets a hexagonal / triclinic reference be tiled
+        into a supercell that shares its lattice geometry so that quartz,
+        etc., tile cleanly through the periodic boundaries.
         """
-        return np.diag(np.asarray(self.cell_dim_angstroms, dtype=np.float64))
+        dim = np.asarray(self.cell_dim_angstroms, dtype=np.float64)
+        if dim.ndim == 1 and dim.shape[0] == 3:
+            return np.diag(dim)
+        if dim.ndim == 2 and dim.shape == (3, 3):
+            return dim.copy()
+        raise ValueError(
+            f"cell_dim_angstroms must be shape (3,) or (3, 3), got {dim.shape!r}"
+        )
 
     @staticmethod
     def _to_orthogonal_cell(atoms: Atoms) -> Atoms:
