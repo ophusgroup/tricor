@@ -416,7 +416,15 @@ class _ShellRelaxMixin:
                 np.add.at(force, bond_i, f_bond)
                 np.add.at(force, bond_j, -f_bond)
                 if atom_cost is not None:
-                    half_bond_cost = 0.5 * delta_r ** 2
+                    # Spring-energy contribution: 0.5 * k * delta_r^2
+                    # with k = bond_weight.  Before this the cost
+                    # stored just delta_r^2/2 (unscaled), so weak-
+                    # relax liquids with large residual delta_r
+                    # reported spuriously enormous per-atom costs in
+                    # the trajectory viewer (e.g. Cu liquid with
+                    # bond_weight=0.05 showed cost_max=100 vs Si's
+                    # bond_weight=0.4 showing cost_max=4).
+                    half_bond_cost = 0.5 * float(bond_weight) * delta_r ** 2
                     np.add.at(atom_cost, bond_i, half_bond_cost)
                     np.add.at(atom_cost, bond_j, half_bond_cost)
 
@@ -441,7 +449,12 @@ class _ShellRelaxMixin:
                 delta_phi = phi - tri_phi_target
                 angle_loss = float(np.mean(delta_phi ** 2))
                 if atom_cost is not None:
-                    third_angle_cost = (delta_phi ** 2) / 3.0
+                    # 0.5 * angle_weight * delta_phi^2 split 1/3 to
+                    # each of the three triplet atoms.  Same scaling
+                    # rationale as the bond cost above.
+                    third_angle_cost = (
+                        0.5 * float(angle_weight) * delta_phi ** 2 / 3.0
+                    )
                     np.add.at(atom_cost, tri_center, third_angle_cost)
                     np.add.at(atom_cost, tri_a, third_angle_cost)
                     np.add.at(atom_cost, tri_b, third_angle_cost)

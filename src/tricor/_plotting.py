@@ -1025,7 +1025,10 @@ def _detect_shell_mask(
     # the first local maximum of the smoothed profile.
     if pair_peak is not None and np.isfinite(pair_peak) and pair_peak > 0:
         seed = int(np.argmin(np.abs(r - float(pair_peak))))
-        window_half = max(3, int(np.ceil(0.25 * float(pair_peak) / max(r_step, _EPS))))
+        # Narrow search window (+/- 15%) so a weak-liquid low-r bump
+        # (atoms still close-packed from the random start) doesn't
+        # out-vote the true first-neighbour peak near pair_peak.
+        window_half = max(3, int(np.ceil(0.15 * float(pair_peak) / max(r_step, _EPS))))
         lo = max(0, seed - window_half)
         hi = min(smoothed.size, seed + window_half + 1)
         peak_bin = int(lo + int(np.argmax(smoothed[lo:hi])))
@@ -1053,19 +1056,31 @@ def _detect_shell_mask(
     lo_lim_bin = int(max(0, np.searchsorted(r, lo_lim_r) - 1))
     hi_lim_bin = int(min(r.size - 1, np.searchsorted(r, hi_lim_r)))
 
-    # Walk inward to the first smoothed local minimum before the peak,
-    # clamped at lo_lim_bin.
+    # Walk inward / outward to the first *significant* smoothed local
+    # minimum.  "Significant" means below a fraction of the peak - just
+    # any noise wiggle used to stop the walk, and for noisy liquids
+    # with a nearly-flat profile the window was collapsing to almost a
+    # single bin.
+    peak_val = float(smoothed[peak_bin])
+    # Dip threshold: a candidate minimum has to be at most ``min_ratio``
+    # of peak_val to count.  0.85 still lets us pick the obvious valley
+    # between first and second shell in crystalline cases.
+    min_ratio = 0.85
+    dip_thresh = peak_val * min_ratio
+
     left_bin = lo_lim_bin
     for idx in range(peak_bin - 1, lo_lim_bin, -1):
-        if smoothed[idx] <= smoothed[idx - 1] and smoothed[idx] < smoothed[idx + 1]:
+        if (smoothed[idx] <= smoothed[idx - 1]
+                and smoothed[idx] < smoothed[idx + 1]
+                and smoothed[idx] <= dip_thresh):
             left_bin = idx
             break
 
-    # Walk outward to the first smoothed local minimum after the peak,
-    # clamped at hi_lim_bin.
     right_bin = hi_lim_bin
     for idx in range(peak_bin + 1, hi_lim_bin):
-        if smoothed[idx] < smoothed[idx - 1] and smoothed[idx] <= smoothed[idx + 1]:
+        if (smoothed[idx] < smoothed[idx - 1]
+                and smoothed[idx] <= smoothed[idx + 1]
+                and smoothed[idx] <= dip_thresh):
             right_bin = idx
             break
 
@@ -1397,12 +1412,21 @@ class _PlottingMixin:
         atom_cost = history.get("atom_cost")
         if atom_cost is not None:
             atom_cost = np.asarray(atom_cost, dtype=np.float32)
-            # Global colour range (constant across frames).  Use 99th percentile
-            # of non-zero values to avoid single hot-spot saturation, then round
-            # up to a "nice" value so the 0 / mid / max ticks are clean.
-            flat = atom_cost.ravel()
+            # Global colour range (constant across frames).  We scale
+            # to the STEADY-STATE cost - the 99th percentile of the
+            # last quarter of frames - rather than percentile-of-all,
+            # which is dominated by the initial random-position chaos
+            # for liquid-path runs (Cu liquid starting at random
+            # positions has early per-atom costs of ~100 even with
+            # bond_weight=0.05, which then saturates the colour scale
+            # long after those atoms have relaxed).
             cost_min = 0.0
-            positive = flat[flat > 0.0]
+            n_frames_cost = atom_cost.shape[0]
+            tail_start = max(0, int(n_frames_cost * 0.75))
+            tail = atom_cost[tail_start:].ravel()
+            positive = tail[tail > 0.0]
+            if positive.size == 0:
+                positive = atom_cost.ravel()[atom_cost.ravel() > 0]
             if positive.size:
                 raw_max = float(np.percentile(positive, 99.0))
                 if raw_max <= 0.0:

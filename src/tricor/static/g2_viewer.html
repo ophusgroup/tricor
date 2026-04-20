@@ -129,40 +129,87 @@ function drawProfile() {
     }];
   }
 
-  let yMax = 0;
+  // Compute per-curve y-range.  In compare mode we stack the curves:
+  // each series is shifted vertically by `offsetStep` so the six
+  // overlaid curves don't smear together.  The order is input order;
+  // the regen scripts pass liquid->nano, so the bottom curve is the
+  // most disordered and the top is the most ordered.
+  let perCurveMax = 0;
   for (const { profile } of drawSpec) {
     for (let k = 0; k < profile.length; k++) {
-      if (isFinite(profile[k]) && profile[k] > yMax) yMax = profile[k];
+      if (isFinite(profile[k]) && profile[k] > perCurveMax) perCurveMax = profile[k];
     }
   }
-  yMax = Math.max(yMax * 1.1, 1.5);
+  perCurveMax = Math.max(perCurveMax * 1.1, 1.5);
 
-  // g(r) = 1 reference
-  const yOne = PAD_T + plotH - (1.0 / yMax) * plotH;
-  profileCtx.strokeStyle = "rgba(0,0,0,0.25)";
+  let yMax, offsetStep;
+  if (IS_COMPARE && drawSpec.length > 1) {
+    // Each curve gets its own slot of height perCurveMax; offsets
+    // stack them bottom-to-top with a tiny gap so crests don't touch
+    // the next series' trough.
+    offsetStep = perCurveMax * 0.35;
+    yMax = perCurveMax + offsetStep * (drawSpec.length - 1);
+  } else {
+    offsetStep = 0;
+    yMax = perCurveMax;
+  }
+
+  // g(r) = 1 reference - one faint line per curve in stacked mode,
+  // one global line in single-curve mode.
+  profileCtx.strokeStyle = "rgba(0,0,0,0.22)";
   profileCtx.lineWidth = 1;
   profileCtx.setLineDash([4, 3]);
-  profileCtx.beginPath();
-  profileCtx.moveTo(PAD_L, yOne);
-  profileCtx.lineTo(PAD_L + plotW, yOne);
-  profileCtx.stroke();
+  const refCount = IS_COMPARE && drawSpec.length > 1 ? drawSpec.length : 1;
+  for (let i = 0; i < refCount; i++) {
+    const offY = i * offsetStep;
+    const y = PAD_T + plotH - ((1.0 + offY) / yMax) * plotH;
+    profileCtx.beginPath();
+    profileCtx.moveTo(PAD_L, y);
+    profileCtx.lineTo(PAD_L + plotW, y);
+    profileCtx.stroke();
+  }
   profileCtx.setLineDash([]);
 
-  // Draw each profile
-  drawSpec.forEach(({ profile, color }) => {
+  // Draw each profile at its stacked offset; remember the label anchor
+  // point so we can write the series name just above the curve near r=0.
+  const labelAnchors = [];
+  drawSpec.forEach(({ profile, color, label }, si) => {
+    const offY = si * offsetStep;
     profileCtx.strokeStyle = color;
     profileCtx.lineWidth = 1.6;
     profileCtx.beginPath();
+    let anchorX = 0, anchorY = 0, anchorSet = false;
     for (let k = 0; k < profile.length; k++) {
       const rC = rCenters[k];
       const v = profile[k];
       const x = PAD_L + (rC / rAxisMax) * plotW;
-      const y = PAD_T + plotH - Math.max(0, Math.min(1, v / yMax)) * plotH;
+      const shifted = Math.max(0, Math.min(1, (v + offY) / yMax));
+      const y = PAD_T + plotH - shifted * plotH;
       if (k === 0) profileCtx.moveTo(x, y);
       else profileCtx.lineTo(x, y);
+      // Pick anchor at the first r ~ 0.3 \u00c5 (sits in the "divergent"
+      // region near zero where labels don't overlap any structure).
+      if (!anchorSet && rC >= 0.3) {
+        anchorX = x;
+        anchorY = y;
+        anchorSet = true;
+      }
     }
     profileCtx.stroke();
+    if (anchorSet) labelAnchors.push({ x: anchorX, y: anchorY, color, label });
   });
+
+  // Inline labels for stacked compare mode: draw each series label
+  // just above its curve at the near-origin anchor.
+  if (IS_COMPARE && drawSpec.length > 1) {
+    profileCtx.font = "11px ui-sans-serif, system-ui";
+    profileCtx.textAlign = "left";
+    profileCtx.textBaseline = "bottom";
+    for (const { x, y, color, label } of labelAnchors) {
+      profileCtx.fillStyle = color;
+      profileCtx.fillText(label, x + 2, y - 3);
+    }
+  }
 
   // Optional pair-peak marker for the currently-displayed pair
   if (pairPeaks[currentPair] && pairPeaks[currentPair] > 0) {
@@ -202,18 +249,23 @@ function drawProfile() {
   profileCtx.textBaseline = "alphabetic";
   profileCtx.fillText("r (Å)", PAD_L + plotW / 2, h - 4);
 
-  // Y ticks
-  profileCtx.textAlign = "right";
-  profileCtx.textBaseline = "middle";
-  const yDecimals = yMax >= 10 ? 0 : 1;
-  const yTicks = [0, 1.0, yMax];
-  for (const t of yTicks) {
-    const y = PAD_T + plotH - (t / yMax) * plotH;
-    profileCtx.beginPath();
-    profileCtx.moveTo(PAD_L, y);
-    profileCtx.lineTo(PAD_L - 4, y);
-    profileCtx.stroke();
-    profileCtx.fillText(t.toFixed(yDecimals), PAD_L - 6, y);
+  // Y ticks: only meaningful when not stacked (in compare mode each
+  // curve has its own implicit baseline, so absolute y values on the
+  // axis stop mapping to one g(r) value).
+  const stacked = IS_COMPARE && drawSpec.length > 1;
+  if (!stacked) {
+    profileCtx.textAlign = "right";
+    profileCtx.textBaseline = "middle";
+    const yDecimals = yMax >= 10 ? 0 : 1;
+    const yTicks = [0, 1.0, yMax];
+    for (const t of yTicks) {
+      const y = PAD_T + plotH - (t / yMax) * plotH;
+      profileCtx.beginPath();
+      profileCtx.moveTo(PAD_L, y);
+      profileCtx.lineTo(PAD_L - 4, y);
+      profileCtx.stroke();
+      profileCtx.fillText(t.toFixed(yDecimals), PAD_L - 6, y);
+    }
   }
   profileCtx.save();
   profileCtx.translate(16, PAD_T + plotH / 2);
@@ -229,8 +281,10 @@ function drawProfile() {
   profileCtx.fillText(yLabel, 0, 0);
   profileCtx.restore();
 
-  // Legend whenever we draw more than one curve
-  if (drawSpec.length > 1) {
+  // Legend box: only for the single-cell "overlay all pairs" mode.
+  // The compare mode labels each curve inline above the near-origin
+  // anchor, so a separate legend would duplicate them.
+  if (!IS_COMPARE && drawSpec.length > 1) {
     const lx = PAD_L + 12;
     const ly = PAD_T + 14;
     const lineH = 16;

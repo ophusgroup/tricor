@@ -457,10 +457,18 @@ class _GrainMixin:
             and crystalline_fraction >= 0.9
         )
         if is_crystalline_build:
+            # Moderate dup_cutoff: aggressive enough to clear
+            # sub-boundary collisions (where atoms from adjacent
+            # rotated grains land almost on top of each other) while
+            # lax enough that shell_relax can still spread out the
+            # merely-distorted boundary pairs in the 0.7-0.9 x hard_min
+            # range.  Paired with random-position padding below to
+            # guarantee a uniform per-species atom count across the
+            # whole regime ladder.
             dup_cutoff = max(0.5, 0.7 * hard_min_scalar)
         else:
             dup_cutoff = max(0.5, 0.9 * hard_min_scalar)
-        pad_min_sep = max(0.5, 0.9 * hard_min_scalar)
+        pad_min_sep = max(0.5, 0.8 * hard_min_scalar)
 
         # Target per-species counts: reference stoichiometry scaled by
         # (V_box / V_ref) * relative_density.  Rounding is done via
@@ -530,12 +538,13 @@ class _GrainMixin:
         # most a few percent (incommensurate-box wrap artefact), which
         # we accept.
         cell_inv_local = np.linalg.inv(cell_mat)
-        # Skip random padding for any crystalline grain build.  We keep
-        # the drop-surplus side of exact-count enforcement so the atom
-        # count doesn't drift upward, but we don't inject random atoms
-        # into a near-full box - that was the main source of sub-
-        # hard_min pairs that shell_relax couldn't escape.
-        skip_padding = skip_overlap_removal or is_crystalline_build
+        # Only the single-box-grain path skips padding entirely (it
+        # preserves a coherent tile by construction).  Multi-grain
+        # crystalline builds DO need padding to hit the target atom
+        # count; we pair it with the tight dup_cutoff above and an
+        # aggressive retry budget below so new atoms respect the hard-
+        # core spacing and boundary distortions aren't over-destroyed.
+        skip_padding = skip_overlap_removal
         if skip_overlap_removal:
             target_by_z = {}   # skip exact-count adjustment
         for z, target in target_by_z.items():
@@ -554,7 +563,10 @@ class _GrainMixin:
                 n_missing = target - current
                 added = np.empty((0, 3), dtype=np.float64)
                 tries = 0
-                max_tries = max(500, 50 * n_missing)
+                # Bigger retry budget for crystalline builds where the
+                # box is already densely packed; at 96% density the
+                # free volume is limited so we need many attempts.
+                max_tries = max(2000, 200 * n_missing)
                 while len(added) < n_missing and tries < max_tries:
                     trial = self.rng.random(3) * box_dim
                     ok = True
