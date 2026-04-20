@@ -500,6 +500,223 @@ def _detect_cuboctahedra(
     return cubocta
 
 
+def export_g2_compare_html(
+    cells_and_labels,
+    output_path: "str | None" = None,
+    *,
+    r_max: float = 10.0,
+    r_step: float = 0.05,
+    background_color: str = "#f7f8f5",
+    title: str = "",
+    show_progress: bool = False,
+) -> str:
+    """Export a g(r) overlay viewer comparing multiple supercells.
+
+    Every cell must share the same set of species (same reference
+    material).  One g(r) curve is drawn per cell for the currently
+    selected species pair; the dropdown in the viewer switches which
+    pair is shown and a legend identifies each cell by its label.
+
+    Parameters
+    ----------
+    cells_and_labels
+        Accepts any of:
+
+        * ``dict[str, Supercell]`` - keys become legend labels
+        * ``list[tuple[Supercell, str]]``
+        * ``list[Supercell]`` - each ``cell.label`` is used
+    output_path
+        Path to write the HTML file.  When ``None`` the HTML string is
+        returned instead (for :func:`IPython.display.HTML` / inline
+        display); see :func:`plot_g2_compare` for a ready-made Jupyter
+        wrapper.
+    r_max, r_step
+        Radial grid for the measurements.  Finer ``r_step`` gives
+        smoother curves; 0.05 A is a good default.
+    background_color, title
+        Cosmetic.
+    show_progress
+        Forwarded to each :meth:`Supercell.measure_g3` call (used under
+        the hood; ``phi_num_bins`` is set low for speed).
+
+    Returns
+    -------
+    str
+        Resolved output path when ``output_path`` was provided,
+        otherwise the HTML source string.
+    """
+    import json
+
+    from .g3 import G3Distribution
+    from ase.data import chemical_symbols
+
+    # Normalise input into [(cell, label), ...]
+    pairs: list[tuple] = []
+    if isinstance(cells_and_labels, dict):
+        for label, cell in cells_and_labels.items():
+            pairs.append((cell, str(label)))
+    else:
+        for item in cells_and_labels:
+            if isinstance(item, tuple) and len(item) == 2:
+                cell, label = item
+                pairs.append((cell, str(label)))
+            else:
+                pairs.append((item, str(getattr(item, "label", "cell"))))
+    if not pairs:
+        raise ValueError("cells_and_labels is empty.")
+
+    # Species from the first cell define the pair grid.  Verify that
+    # every subsequent cell uses the same species set so the curves
+    # line up.
+    def _species_of(cell) -> np.ndarray:
+        return np.unique(np.asarray(cell.atoms.numbers, dtype=np.int64))
+
+    ref_species = _species_of(pairs[0][0])
+    for cell, lab in pairs[1:]:
+        if not np.array_equal(_species_of(cell), ref_species):
+            raise ValueError(
+                f"Cell '{lab}' has species {_species_of(cell)} which "
+                f"differs from the first cell's {ref_species}.  "
+                "export_g2_compare_html requires all supercells to share "
+                "the same species."
+            )
+
+    sp_labels = [chemical_symbols[int(z)] for z in ref_species]
+    num_species = len(ref_species)
+
+    # Measure every cell on the same grid.
+    r_edges_global = None
+    r_centres_global = None
+
+    def _norm_profile(y: np.ndarray, r_arr: np.ndarray) -> np.ndarray:
+        y = y / np.maximum(r_arr * r_arr, _EPS)
+        tail_start = 0.7 * float(r_arr[-1])
+        tail_mask = r_arr >= tail_start
+        if not np.any(tail_mask):
+            tail_mask = np.zeros_like(r_arr, dtype=bool)
+            tail_mask[-max(1, r_arr.size // 4):] = True
+        tail = y[tail_mask]
+        finite = tail[np.isfinite(tail)]
+        scale = float(np.mean(finite)) if finite.size else 1.0
+        if scale <= _EPS:
+            scale = 1.0
+        return (y / scale).astype(np.float32)
+
+    series: list[dict] = []
+    pair_labels: list[str] = []
+    # Build pair labels from the first cell's species ordering.
+    for ci in range(num_species):
+        for vi in range(ci, num_species):
+            pair_labels.append(f"{sp_labels[ci]}-{sp_labels[vi]}")
+
+    for cell, lab in pairs:
+        dist = G3Distribution(cell.atoms, label=f"{lab}-g2-compare")
+        dist.measure_g3(
+            r_max=r_max, r_step=r_step, phi_num_bins=12,
+            show_progress=show_progress,
+        )
+        if dist.g2 is None:
+            raise ValueError(f"Distribution measurement for '{lab}' has no g2.")
+        r = np.asarray(dist.r, dtype=np.float64)
+        if r_centres_global is None:
+            r_centres_global = r.tolist()
+            r_edges_global = np.asarray(dist.bin_edges, dtype=np.float64).tolist()
+        g2 = np.asarray(dist.g2, dtype=np.float64)
+        profiles: list[list[float]] = []
+        for ci in range(num_species):
+            for vi in range(ci, num_species):
+                prof = _norm_profile(g2[ci, vi], r)
+                profiles.append(prof.tolist())
+        series.append({"label": lab, "profiles": profiles})
+
+    # Per-pair peak markers pulled from the first cell's shell_target
+    # (if present).
+    pair_peaks: list[float] = [0.0] * len(pair_labels)
+    shell_target = getattr(pairs[0][0], "_shell_target", None)
+    if shell_target is not None:
+        st_species = np.asarray(shell_target.species, dtype=np.int64)
+        pair_peak_mat = np.asarray(shell_target.pair_peak, dtype=np.float64)
+        # Map dist species -> shell_target species index
+        idx_map: dict[int, int] = {}
+        for ci_dist, z in enumerate(ref_species):
+            m = np.where(st_species == int(z))[0]
+            if m.size:
+                idx_map[ci_dist] = int(m[0])
+        out_idx = 0
+        for ci in range(num_species):
+            for vi in range(ci, num_species):
+                ci_st = idx_map.get(ci)
+                vi_st = idx_map.get(vi)
+                if ci_st is not None and vi_st is not None:
+                    val = float(pair_peak_mat[ci_st, vi_st])
+                    if np.isfinite(val) and val > 0:
+                        pair_peaks[out_idx] = val
+                out_idx += 1
+
+    # Default pair: smallest positive peak (typically the short bond).
+    default_pair = 0
+    positive = [(i, p) for i, p in enumerate(pair_peaks) if p > 0]
+    if positive:
+        default_pair = min(positive, key=lambda x: x[1])[0]
+
+    data = {
+        "num_r": len(r_centres_global),
+        "num_pairs": len(pair_labels),
+        "r_centers": r_centres_global,
+        "r_edges": r_edges_global,
+        "pair_labels": pair_labels,
+        "pair_peaks": pair_peaks,
+        "series": series,
+        "default_pair": int(default_pair),
+        "background_color": background_color,
+        "title": title,
+    }
+
+    html = _G2_HTML_TEMPLATE.replace(
+        "__TRICOR_DATA_PLACEHOLDER__",
+        json.dumps(data),
+    )
+    if output_path is None:
+        return html
+    output_path = str(output_path)
+    with open(output_path, "w") as f:
+        f.write(html)
+    return output_path
+
+
+def plot_g2_compare(
+    cells_and_labels,
+    *,
+    r_max: float = 10.0,
+    r_step: float = 0.05,
+    title: str = "",
+    height: int = 480,
+    show_progress: bool = False,
+):
+    """Inline Jupyter display of the g(r) overlay-compare viewer.
+
+    Convenience wrapper around :func:`export_g2_compare_html` that
+    packages the HTML as an :class:`IPython.display.HTML` object so you
+    can do ``tc.plot_g2_compare(cells)`` in a notebook cell.  See that
+    function's docstring for the accepted input shapes.
+    """
+    from IPython.display import HTML
+    html = export_g2_compare_html(
+        cells_and_labels, None,
+        r_max=r_max, r_step=r_step,
+        title=title, show_progress=show_progress,
+    )
+    import html as _html
+    escaped = _html.escape(html, quote=True)
+    return HTML(
+        f'<div class="tricor-g2-compare-wrapper" style="width:100%">'
+        f'<iframe srcdoc="{escaped}" '
+        f'style="width:100%; height:{int(height)}px; '
+        f'border:1px solid rgba(0,0,0,0.1); border-radius:6px;"></iframe>'
+        f'</div>'
+    )
+
+
 def export_overview_html(
     output_path: str,
     cells_and_labels,

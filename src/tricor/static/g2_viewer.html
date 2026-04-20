@@ -45,9 +45,20 @@ document.getElementById("container").style.background = DATA.background_color ||
 
 const pairLabels = DATA.pair_labels;            // e.g. ["Si-Si", "Si-O", "O-O"]
 const pairPeaks = DATA.pair_peaks || [];         // per-pair first-shell peak r, optional
-const profiles = DATA.profiles.map(a => new Float32Array(a));
 const rCenters = DATA.r_centers;
 const rEdges = DATA.r_edges;
+
+// Data shape:
+//  - single-cell mode: profiles = [prof_pair_0, prof_pair_1, ...]
+//  - compare mode:     series = [{label, profiles:[pair_0, pair_1, ...]}, ...]
+// The compare mode renders one curve per series for the currently
+// selected pair (legend shows the series labels).  The single-cell
+// "overlay all pairs" checkbox is hidden when compare mode is active.
+const IS_COMPARE = Array.isArray(DATA.series) && DATA.series.length > 0;
+const seriesLabels = IS_COMPARE ? DATA.series.map(s => s.label) : [""];
+const seriesProfiles = IS_COMPARE
+  ? DATA.series.map(s => s.profiles.map(p => new Float32Array(p)))
+  : [DATA.profiles.map(a => new Float32Array(a))];
 
 const rAxisMax = rCenters[rCenters.length - 1] + 0.5 * (rCenters[1] - rCenters[0]);
 
@@ -94,15 +105,34 @@ function drawProfile() {
   profileCtx.fillStyle = "#fff";
   profileCtx.fillRect(PAD_L, PAD_T, plotW, plotH);
 
-  // Determine the profiles we're drawing + global y-range.
-  const drawIndices = overlayAll
-    ? pairLabels.map((_, i) => i)
-    : [currentPair];
+  // In compare mode we draw one curve per SERIES for the current pair.
+  // In single-cell mode, we either draw one curve (current pair) or
+  // all pairs of the one series (overlay-all-pairs checkbox).
+  let drawSpec;  // array of {profile, color, label}
+  if (IS_COMPARE) {
+    drawSpec = seriesLabels.map((lab, si) => ({
+      profile: seriesProfiles[si][currentPair],
+      color: PALETTE[si % PALETTE.length],
+      label: lab,
+    }));
+  } else if (overlayAll) {
+    drawSpec = pairLabels.map((lab, i) => ({
+      profile: seriesProfiles[0][i],
+      color: PALETTE[i % PALETTE.length],
+      label: lab,
+    }));
+  } else {
+    drawSpec = [{
+      profile: seriesProfiles[0][currentPair],
+      color: "#2a6e4e",
+      label: pairLabels[currentPair],
+    }];
+  }
+
   let yMax = 0;
-  for (const i of drawIndices) {
-    const p = profiles[i];
-    for (let k = 0; k < p.length; k++) {
-      if (isFinite(p[k]) && p[k] > yMax) yMax = p[k];
+  for (const { profile } of drawSpec) {
+    for (let k = 0; k < profile.length; k++) {
+      if (isFinite(profile[k]) && profile[k] > yMax) yMax = profile[k];
     }
   }
   yMax = Math.max(yMax * 1.1, 1.5);
@@ -119,9 +149,7 @@ function drawProfile() {
   profileCtx.setLineDash([]);
 
   // Draw each profile
-  drawIndices.forEach((idx, slot) => {
-    const profile = profiles[idx];
-    const color = overlayAll ? PALETTE[slot % PALETTE.length] : "#2a6e4e";
+  drawSpec.forEach(({ profile, color }) => {
     profileCtx.strokeStyle = color;
     profileCtx.lineWidth = 1.6;
     profileCtx.beginPath();
@@ -134,21 +162,21 @@ function drawProfile() {
       else profileCtx.lineTo(x, y);
     }
     profileCtx.stroke();
-
-    // Optional pair-peak marker
-    if (pairPeaks[idx] && pairPeaks[idx] > 0) {
-      const px = PAD_L + (pairPeaks[idx] / rAxisMax) * plotW;
-      profileCtx.strokeStyle = color;
-      profileCtx.globalAlpha = 0.4;
-      profileCtx.setLineDash([3, 3]);
-      profileCtx.beginPath();
-      profileCtx.moveTo(px, PAD_T);
-      profileCtx.lineTo(px, PAD_T + plotH);
-      profileCtx.stroke();
-      profileCtx.setLineDash([]);
-      profileCtx.globalAlpha = 1.0;
-    }
   });
+
+  // Optional pair-peak marker for the currently-displayed pair
+  if (pairPeaks[currentPair] && pairPeaks[currentPair] > 0) {
+    const px = PAD_L + (pairPeaks[currentPair] / rAxisMax) * plotW;
+    profileCtx.strokeStyle = "#777";
+    profileCtx.globalAlpha = 0.5;
+    profileCtx.setLineDash([3, 3]);
+    profileCtx.beginPath();
+    profileCtx.moveTo(px, PAD_T);
+    profileCtx.lineTo(px, PAD_T + plotH);
+    profileCtx.stroke();
+    profileCtx.setLineDash([]);
+    profileCtx.globalAlpha = 1.0;
+  }
 
   // Frame
   profileCtx.strokeStyle = "#333";
@@ -192,17 +220,22 @@ function drawProfile() {
   profileCtx.rotate(-Math.PI / 2);
   profileCtx.textAlign = "center";
   profileCtx.textBaseline = "alphabetic";
-  profileCtx.fillText(overlayAll ? "g(r)" : `g(r) ${pairLabels[currentPair]}`, 0, 0);
+  // Y-axis label: in compare mode shows the pair; in single-cell mode
+  // shows either the pair or "g(r)" depending on overlay-all.
+  let yLabel;
+  if (IS_COMPARE) yLabel = `g(r) ${pairLabels[currentPair]}`;
+  else if (overlayAll) yLabel = "g(r)";
+  else yLabel = `g(r) ${pairLabels[currentPair]}`;
+  profileCtx.fillText(yLabel, 0, 0);
   profileCtx.restore();
 
-  // Legend in overlay mode
-  if (overlayAll) {
+  // Legend whenever we draw more than one curve
+  if (drawSpec.length > 1) {
     const lx = PAD_L + 12;
     const ly = PAD_T + 14;
     const lineH = 16;
     profileCtx.font = "11px ui-sans-serif, system-ui";
-    drawIndices.forEach((idx, slot) => {
-      const color = PALETTE[slot % PALETTE.length];
+    drawSpec.forEach(({ color, label }, slot) => {
       const y = ly + slot * lineH;
       profileCtx.strokeStyle = color;
       profileCtx.lineWidth = 2;
@@ -213,7 +246,7 @@ function drawProfile() {
       profileCtx.fillStyle = "#333";
       profileCtx.textAlign = "left";
       profileCtx.textBaseline = "middle";
-      profileCtx.fillText(pairLabels[idx], lx + 22, y);
+      profileCtx.fillText(label, lx + 22, y);
     });
   }
 }
@@ -233,14 +266,23 @@ sel.addEventListener("change", () => {
 });
 
 const overlayCb = document.getElementById("overlay-all");
-overlayCb.addEventListener("change", () => {
-  overlayAll = overlayCb.checked;
-  sel.disabled = overlayAll;
-  drawProfile();
-});
+if (IS_COMPARE) {
+  // "overlay all pairs" isn't meaningful in multi-series compare mode;
+  // the overlay IS the series axis.
+  overlayCb.parentElement.style.display = "none";
+} else {
+  overlayCb.addEventListener("change", () => {
+    overlayAll = overlayCb.checked;
+    sel.disabled = overlayAll;
+    drawProfile();
+  });
+}
 
 const info = document.getElementById("info");
-info.textContent = `${pairLabels.length} pair${pairLabels.length === 1 ? "" : "s"} | ${profiles[0].length} radial bins`;
+const nBins = seriesProfiles[0][0].length;
+info.textContent = IS_COMPARE
+  ? `${seriesLabels.length} cells | ${pairLabels.length} pair${pairLabels.length === 1 ? "" : "s"} | ${nBins} radial bins`
+  : `${pairLabels.length} pair${pairLabels.length === 1 ? "" : "s"} | ${nBins} radial bins`;
 
 new ResizeObserver(drawProfile).observe(document.getElementById("main"));
 drawProfile();
