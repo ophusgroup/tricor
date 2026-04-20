@@ -88,7 +88,15 @@ class _ShellRelaxMixin:
             Summary with parameters and final/initial loss values.
         """
         num_atoms = len(self.atoms)
-        species_idx = self._atom_species_index  # (num_atoms,) int
+        # Prefer the composite-target virtual species mapping if the
+        # caller set one (e.g. sp²/sp³ carbon blends where atomic
+        # number alone can't distinguish the two chemistries);
+        # otherwise fall back to the atomic-number mapping.
+        species_idx = (
+            self._atom_shell_species_index
+            if getattr(self, "_atom_shell_species_index", None) is not None
+            else self._atom_species_index
+        )  # (num_atoms,) int
         cell_inv = self._cell_inverse
         cell_mat = self._cell_matrix
 

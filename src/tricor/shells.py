@@ -430,6 +430,258 @@ class CoordinationShellTarget:
             summary=summary,
         )
 
+    @classmethod
+    def from_targets(
+        cls,
+        targets: "dict[str, CoordinationShellTarget]",
+        *,
+        cross_pair_peak: "dict[tuple[str, str], float] | None" = None,
+        cross_pair_outer_scale: float = 1.15,
+        label: str | None = None,
+    ) -> "CoordinationShellTarget":
+        """Stack multiple shell targets into one with a widened species axis.
+
+        Used for blended materials where atoms share an atomic number but
+        want different local coordination (e.g. graphite sp\u00b2 + diamond
+        sp\u00b3 carbon).  Each input target contributes a *virtual species
+        slot* per element of its ``species`` array; the composite target's
+        ``species`` is the concatenation of all inputs, with
+        ``species_labels`` rewritten as ``f"{key}_{element}"``.
+
+        Cross-target pairs default to:
+
+        - ``coordination_target = 0`` (no bonds form across virtual
+          species boundaries; the repulsion term still keeps them apart),
+        - ``pair_peak = mean(peak_a, peak_b)`` unless overridden by
+          ``cross_pair_peak``,
+        - ``pair_outer = max(outer_a, outer_b) * cross_pair_outer_scale``,
+        - ``pair_hard_min`` / ``pair_inner`` pro-rated from the two
+          source values.
+
+        Cross-target triplets (any of the three species drawn from a
+        different source than the other two) get
+        ``coordination_target = 0`` and zero ``angle_mode_deg`` — the
+        relaxer will never enumerate these triplets because no such
+        bonds form.
+
+        Parameters
+        ----------
+        targets
+            Mapping ``{key: CoordinationShellTarget}``.  Insertion order
+            defines the virtual-species order.
+        cross_pair_peak
+            Optional overrides for ``pair_peak`` between elements drawn
+            from different source targets.  Keys are ``(key_a, key_b)``
+            with symbol lookup done via ``atomic_numbers`` when pair
+            contains non-tuple element labels.
+        cross_pair_outer_scale
+            Multiplier applied to the larger of the two source
+            ``pair_outer`` values when populating cross-target entries.
+        label
+            Optional label; defaults to ``"composite(" + keys + ")"``.
+        """
+        from dataclasses import replace as _dc_replace  # noqa: F401
+
+        if len(targets) == 0:
+            raise ValueError("from_targets requires at least one target.")
+        keys = list(targets.keys())
+        first = targets[keys[0]]
+        phi_num_bins = int(first.phi_num_bins)
+        for key in keys[1:]:
+            t = targets[key]
+            if int(t.phi_num_bins) != phi_num_bins:
+                raise ValueError(
+                    f"All targets must share phi_num_bins; got "
+                    f"{phi_num_bins} (from {keys[0]!r}) and "
+                    f"{int(t.phi_num_bins)} (from {key!r})."
+                )
+
+        # Per-source species counts and global offsets.
+        src_species_counts = [int(np.asarray(targets[k].species).size) for k in keys]
+        offsets = np.zeros(len(keys) + 1, dtype=np.intp)
+        offsets[1:] = np.cumsum(src_species_counts)
+        num_species = int(offsets[-1])
+
+        # Track which source (key index) each global species belongs to.
+        species_source = np.zeros(num_species, dtype=np.intp)
+        for ki, count in enumerate(src_species_counts):
+            species_source[offsets[ki] : offsets[ki + 1]] = ki
+
+        # --- concat species + labels ---
+        species = np.zeros(num_species, dtype=np.int64)
+        species_labels: list[str] = []
+        for ki, key in enumerate(keys):
+            t = targets[key]
+            species[offsets[ki] : offsets[ki + 1]] = np.asarray(t.species, dtype=np.int64)
+            for sym in t.species_labels:
+                species_labels.append(f"{key}_{sym}")
+
+        # --- block-diagonal pair-array scaffold ---
+        pair_hard_min = np.zeros((num_species, num_species), dtype=np.float64)
+        pair_inner = np.zeros_like(pair_hard_min)
+        pair_peak = np.zeros_like(pair_hard_min)
+        pair_sigma = np.zeros_like(pair_hard_min)
+        pair_outer = np.zeros_like(pair_hard_min)
+        pair_mask = np.zeros_like(pair_hard_min, dtype=bool)
+        coordination_target = np.zeros_like(pair_hard_min)
+        coordination_std = np.zeros_like(pair_hard_min)
+        for ki, key in enumerate(keys):
+            t = targets[key]
+            a, b = int(offsets[ki]), int(offsets[ki + 1])
+            pair_hard_min[a:b, a:b] = np.asarray(t.pair_hard_min, dtype=np.float64)
+            pair_inner[a:b, a:b] = np.asarray(t.pair_inner, dtype=np.float64)
+            pair_peak[a:b, a:b] = np.asarray(t.pair_peak, dtype=np.float64)
+            pair_sigma[a:b, a:b] = np.asarray(t.pair_sigma, dtype=np.float64)
+            pair_outer[a:b, a:b] = np.asarray(t.pair_outer, dtype=np.float64)
+            pair_mask[a:b, a:b] = np.asarray(t.pair_mask, dtype=bool)
+            coordination_target[a:b, a:b] = np.asarray(t.coordination_target, dtype=np.float64)
+            coordination_std[a:b, a:b] = np.asarray(t.coordination_std, dtype=np.float64)
+
+        # --- cross-target pair entries (repulsion-only by default) ---
+        cross_peak_lookup: dict[tuple[str, str], float] = {}
+        if cross_pair_peak is not None:
+            for (ka, kb), v in cross_pair_peak.items():
+                cross_peak_lookup[(ka, kb)] = float(v)
+                cross_peak_lookup[(kb, ka)] = float(v)
+
+        for i in range(num_species):
+            for j in range(num_species):
+                if species_source[i] == species_source[j]:
+                    continue
+                # Use the source's own self-pair as a proxy for the
+                # same-element repulsion wall on each side.
+                ki, kj = int(species_source[i]), int(species_source[j])
+                key_a, key_b = keys[ki], keys[kj]
+                peak_a = float(pair_peak[i, i])
+                peak_b = float(pair_peak[j, j])
+                inner_a = float(pair_inner[i, i])
+                inner_b = float(pair_inner[j, j])
+                outer_a = float(pair_outer[i, i])
+                outer_b = float(pair_outer[j, j])
+                hmin_a = float(pair_hard_min[i, i])
+                hmin_b = float(pair_hard_min[j, j])
+                sig_a = float(pair_sigma[i, i])
+                sig_b = float(pair_sigma[j, j])
+                if (key_a, key_b) in cross_peak_lookup:
+                    peak_ij = cross_peak_lookup[(key_a, key_b)]
+                elif peak_a > 0 and peak_b > 0:
+                    peak_ij = 0.5 * (peak_a + peak_b)
+                else:
+                    peak_ij = max(peak_a, peak_b)
+                pair_peak[i, j] = peak_ij
+                pair_inner[i, j] = 0.5 * (inner_a + inner_b)
+                pair_outer[i, j] = max(outer_a, outer_b) * float(cross_pair_outer_scale)
+                pair_hard_min[i, j] = max(hmin_a, hmin_b)
+                pair_sigma[i, j] = max(sig_a, sig_b) if (sig_a + sig_b) > 0 else 0.05
+                pair_mask[i, j] = True
+                # coordination_target[i, j] stays 0 — no cross bonds.
+
+        # --- rebuild triplet index over the widened species set ---
+        angle_index_list: list[tuple[int, int, int]] = []
+        angle_lookup_new = -np.ones((num_species, num_species, num_species), dtype=np.intp)
+        for c in range(num_species):
+            for n1 in range(num_species):
+                for n2 in range(n1, num_species):
+                    idx = len(angle_index_list)
+                    angle_index_list.append((c, n1, n2))
+                    angle_lookup_new[c, n1, n2] = idx
+                    angle_lookup_new[c, n2, n1] = idx
+        angle_index_new = np.asarray(angle_index_list, dtype=np.intp)
+
+        angle_target = np.zeros((angle_index_new.shape[0], phi_num_bins), dtype=np.float64)
+        angle_pair_mass_target = np.zeros(angle_index_new.shape[0], dtype=np.float64)
+        angle_mode_deg = np.zeros(angle_index_new.shape[0], dtype=np.float64)
+
+        # Copy triplets where all three species come from the same source.
+        for ki, key in enumerate(keys):
+            t = targets[key]
+            a = int(offsets[ki])
+            src_angle_index = np.asarray(t.angle_index, dtype=np.intp)
+            src_angle_lookup = np.asarray(t.angle_lookup, dtype=np.intp)
+            src_angle_target = np.asarray(t.angle_target, dtype=np.float64)
+            src_angle_mass = np.asarray(t.angle_pair_mass_target, dtype=np.float64)
+            src_angle_mode = np.asarray(t.angle_mode_deg, dtype=np.float64)
+            for local_t, (lc, ln1, ln2) in enumerate(src_angle_index):
+                gc = int(a + lc)
+                gn1 = int(a + ln1)
+                gn2 = int(a + ln2)
+                new_t = int(angle_lookup_new[gc, gn1, gn2])
+                angle_target[new_t] = src_angle_target[local_t]
+                angle_pair_mass_target[new_t] = float(src_angle_mass[local_t])
+                angle_mode_deg[new_t] = float(src_angle_mode[local_t])
+            # angle_lookup entries for cross-source triplets remain at
+            # the default (-1 replaced by a valid idx during enumeration,
+            # but those triplets carry zero mass / mode and no spring
+            # because coordination_target[cross] == 0.)
+            del src_angle_lookup  # silence unused
+
+        # --- concatenate motif arrays with species remapping ---
+        motif_center_species_list: list[int] = []
+        motif_neighbor_species_list: list[np.ndarray] = []
+        motif_neighbor_vectors_list: list[np.ndarray] = []
+        for ki, key in enumerate(keys):
+            t = targets[key]
+            a = int(offsets[ki])
+            src_center = np.asarray(t.motif_center_species, dtype=np.intp)
+            for local_i, cs in enumerate(src_center):
+                motif_center_species_list.append(int(a + int(cs)))
+                ns = np.asarray(t.motif_neighbor_species[local_i], dtype=np.intp) + a
+                vs = np.asarray(t.motif_neighbor_vectors[local_i], dtype=np.float64)
+                motif_neighbor_species_list.append(ns)
+                motif_neighbor_vectors_list.append(vs)
+
+        max_pair_outer = float(np.max(pair_outer[pair_mask])) if np.any(pair_mask) else 0.0
+        max_pair_outer_by_center = np.zeros(num_species, dtype=np.float64)
+        for center_ind in range(num_species):
+            row = pair_outer[center_ind][pair_mask[center_ind]]
+            max_pair_outer_by_center[center_ind] = float(np.max(row)) if row.size else 0.0
+
+        phi_edges = np.asarray(first.phi_edges, dtype=np.float64)
+        phi = np.asarray(first.phi, dtype=np.float64)
+        phi_deg = np.asarray(first.phi_deg, dtype=np.float64)
+
+        summary = {
+            "composite": True,
+            "keys": tuple(keys),
+            "source_species_counts": tuple(int(c) for c in src_species_counts),
+            "phi_num_bins": phi_num_bins,
+            "num_species": num_species,
+            "num_triplets": int(angle_index_new.shape[0]),
+            "max_pair_outer": float(max_pair_outer),
+        }
+
+        composite_label = label or f"composite({'+'.join(keys)})"
+
+        return cls(
+            atoms=first.atoms,  # placeholder; not used by shell_relax
+            label=composite_label,
+            species=species,
+            species_labels=tuple(species_labels),
+            phi_num_bins=phi_num_bins,
+            phi_edges=phi_edges,
+            phi=phi,
+            phi_deg=phi_deg,
+            angle_index=angle_index_new,
+            angle_lookup=angle_lookup_new,
+            pair_hard_min=pair_hard_min,
+            pair_inner=pair_inner,
+            pair_peak=pair_peak,
+            pair_sigma=pair_sigma,
+            pair_outer=pair_outer,
+            pair_mask=pair_mask,
+            coordination_target=coordination_target,
+            coordination_std=coordination_std,
+            angle_target=angle_target,
+            angle_pair_mass_target=angle_pair_mass_target,
+            angle_mode_deg=angle_mode_deg,
+            motif_center_species=np.asarray(motif_center_species_list, dtype=np.intp),
+            motif_neighbor_species=tuple(motif_neighbor_species_list),
+            motif_neighbor_vectors=tuple(motif_neighbor_vectors_list),
+            max_pair_outer=max_pair_outer,
+            max_pair_outer_by_center=max_pair_outer_by_center,
+            summary=summary,
+        )
+
     def with_bonded_species_pairs(
         self,
         pairs: "list[tuple[str, str]]",

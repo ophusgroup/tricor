@@ -294,6 +294,7 @@ class _GrainMixin:
         crystalline_fraction: float = 1.0,
         displacement_sigma: float = 0.0,
         max_density_passes: int = 5,
+        grain_sources: "list[dict] | None" = None,
     ) -> Atoms:
         """Build a supercell with crystalline grains via Voronoi tiling.
 
@@ -324,12 +325,46 @@ class _GrainMixin:
         box_dim = np.diag(cell_mat)
         cell_inv = np.linalg.inv(cell_mat)
 
-        ref_cell = np.asarray(self.reference_atoms.cell.array, dtype=np.float64)
+        # Build the list of per-grain source crystals.  Default is a
+        # single source = the reference atoms on the supercell.  When
+        # ``grain_sources`` is supplied (e.g. for sp²/sp³ carbon
+        # blends), each grain samples a source by weight.  Each entry
+        # carries an ``atoms``, a ``species_offset`` (used to populate
+        # the per-atom virtual-species index for the relaxer), and a
+        # ``weight``.
+        if grain_sources is None:
+            sources = [
+                {
+                    "atoms": self.reference_atoms,
+                    "species_offset": 0,
+                    "weight": 1.0,
+                }
+            ]
+        else:
+            if len(grain_sources) == 0:
+                raise ValueError("grain_sources must be a non-empty list.")
+            sources = list(grain_sources)
+        source_weights = np.asarray(
+            [float(s.get("weight", 1.0)) for s in sources], dtype=np.float64
+        )
+        if not np.all(source_weights >= 0):
+            raise ValueError("grain_sources weights must be non-negative.")
+        if source_weights.sum() <= 0:
+            raise ValueError("grain_sources weights must sum to > 0.")
+        source_probs = source_weights / source_weights.sum()
+        multi_source = len(sources) > 1
+
+        # Legacy reference (used for density / padding / composition
+        # heuristics below).  We pick the first source by convention;
+        # it only drives stoichiometric rounding, not crystalline
+        # content.  For carbon sp²/sp³ both sources are pure C so this
+        # is fine.
+        ref_cell = np.asarray(sources[0]["atoms"].cell.array, dtype=np.float64)
         ref_basis_frac = np.asarray(
-            self.reference_atoms.get_scaled_positions(wrap=True),
+            sources[0]["atoms"].get_scaled_positions(wrap=True),
             dtype=np.float64,
         )
-        ref_numbers = np.asarray(self.reference_atoms.numbers, dtype=np.int64)
+        ref_numbers = np.asarray(sources[0]["atoms"].numbers, dtype=np.int64)
 
         # ---- 1. Seeds ----
         grain_radius_user = max(float(grain_size) * 0.5, 2.0)
@@ -341,11 +376,29 @@ class _GrainMixin:
         # ---- 2. Periodic Voronoi cells ----
         cells = _periodic_voronoi_3d(box_dim, seeds)
 
-        # ---- 3. Master atom block ----
+        # ---- 3. Master atom block (one per source) ----
         radius = _grain_radius_3d(cells)
-        master = _build_master_atom_block_3d(
-            ref_cell, ref_basis_frac, ref_numbers, radius,
-        )
+        masters: list[dict] = []
+        for src in sources:
+            src_cell = np.asarray(src["atoms"].cell.array, dtype=np.float64)
+            src_basis = np.asarray(
+                src["atoms"].get_scaled_positions(wrap=True), dtype=np.float64
+            )
+            src_numbers = np.asarray(src["atoms"].numbers, dtype=np.int64)
+            masters.append(
+                _build_master_atom_block_3d(src_cell, src_basis, src_numbers, radius)
+            )
+
+        # Per-grain source assignment: draw by weight (or uniform for
+        # legacy single-source).  Store on self so the trajectory
+        # exporter can introspect which grain is which type.
+        num_grains_total = len(cells)
+        if multi_source:
+            grain_source = self.rng.choice(
+                len(sources), size=num_grains_total, p=source_probs,
+            ).astype(np.intp)
+        else:
+            grain_source = np.zeros(num_grains_total, dtype=np.intp)
 
         # ---- 4. Decide which grains are crystalline ----
         crystalline_fraction = float(np.clip(crystalline_fraction, 0.0, 1.0))
@@ -384,16 +437,46 @@ class _GrainMixin:
         unique_species, species_counts = np.unique(ref_numbers, return_counts=True)
         species_probs = species_counts.astype(float) / float(species_counts.sum())
 
+        # For multi-source builds the exact-count enforcement below
+        # would otherwise trim every regime to sources[0]'s density,
+        # destroying the denser phase (e.g. diamond atoms trimmed down
+        # to graphite density when sources[0] is graphite).  Use a
+        # weight-averaged reference density and a weight-averaged
+        # formula-unit count so each regime's target atom count scales
+        # with its actual phase mix.
+        if multi_source:
+            weighted_density = 0.0
+            weighted_ref_volume = 0.0
+            weighted_formula_count = 0.0
+            for ki, src in enumerate(sources):
+                _sc = np.asarray(src["atoms"].cell.array, dtype=np.float64)
+                _svol = float(abs(np.linalg.det(_sc)))
+                _snum = int(len(src["atoms"].numbers))
+                _w = float(source_probs[ki])
+                weighted_density += _w * (_snum / max(_svol, _EPS))
+                weighted_ref_volume += _w * _svol
+                weighted_formula_count += _w * _snum
+            species_density = float(weighted_density)
+
         positions_all: list[np.ndarray] = []
         numbers_all: list[np.ndarray] = []
         grain_ids_all: list[np.ndarray] = []
+        shell_species_all: list[np.ndarray] = []
 
         for i, (seed, cell) in enumerate(zip(seeds, cells)):
+            src_idx = int(grain_source[i])
+            master = masters[src_idx]
+            src_offset = int(sources[src_idx]["species_offset"])
             if is_crystalline[i]:
                 rotated = master["positions"] @ rotations[i].T
                 keep = _points_in_cell(rotated, cell)
                 pos = rotated[keep]
                 num = master["numbers"][keep]
+                # All atoms from this grain get the source's species
+                # offset (plus 0 for single-species sources).
+                shell_species = np.full(
+                    len(pos), src_offset, dtype=np.intp
+                )
             else:
                 expected = species_density * cell["volume"]
                 n_atoms = int(np.floor(expected))
@@ -403,11 +486,15 @@ class _GrainMixin:
                 num = self.rng.choice(
                     unique_species, size=n_atoms, p=species_probs,
                 ).astype(np.int64)
+                shell_species = np.full(
+                    n_atoms, src_offset, dtype=np.intp
+                )
 
             pos = np.mod(pos + seed, box_dim)
             positions_all.append(pos)
             numbers_all.append(num)
             grain_ids_all.append(np.full(len(pos), i, dtype=np.intp))
+            shell_species_all.append(shell_species)
 
         positions = np.concatenate(positions_all, axis=0) if positions_all else (
             np.empty((0, 3), dtype=np.float64)
@@ -416,6 +503,9 @@ class _GrainMixin:
             np.empty(0, dtype=np.int64)
         )
         grain_ids = np.concatenate(grain_ids_all, axis=0) if grain_ids_all else (
+            np.empty(0, dtype=np.intp)
+        )
+        shell_species_idx = np.concatenate(shell_species_all, axis=0) if shell_species_all else (
             np.empty(0, dtype=np.intp)
         )
 
@@ -476,13 +566,23 @@ class _GrainMixin:
         # (matches Supercell._target_species_counts - critical for
         # multi-species compounds like SrTiO3 where simple per-species
         # rounding would drift off stoichiometry by an atom or two).
-        v_ratio = V_box / max(ref_volume, _EPS)
+        #
+        # For multi-source grain builds (e.g. graphite+diamond carbon),
+        # the ``species_density`` variable above was already
+        # weight-averaged across sources, so we scale the target total
+        # by that density directly (rather than by the sources[0]
+        # ref_volume alone).  For the single-source case both paths
+        # give the same answer.
         rel_density = float(getattr(self, "relative_density", 1.0))
         _reduced_counts = species_counts.astype(np.int64)
         _divisor = int(np.gcd.reduce(_reduced_counts)) if _reduced_counts.size else 1
         _reduced_counts = _reduced_counts // max(_divisor, 1)
         _atoms_per_formula = int(np.sum(_reduced_counts))
-        _target_total = float(len(ref_numbers)) * v_ratio * rel_density
+        if multi_source:
+            _target_total = float(species_density * V_box * rel_density)
+        else:
+            v_ratio = V_box / max(ref_volume, _EPS)
+            _target_total = float(len(ref_numbers)) * v_ratio * rel_density
         _num_formula_units = max(1, int(round(_target_total / max(_atoms_per_formula, 1))))
         target_by_z: dict[int, int] = {
             int(z): int(_reduced_counts[i] * _num_formula_units)
@@ -525,6 +625,7 @@ class _GrainMixin:
                 positions = positions[mask]
                 numbers = numbers[mask]
                 grain_ids = grain_ids[mask]
+                shell_species_idx = shell_species_idx[mask]
 
         # ---- 7b. Enforce exact per-species target counts ----
         # Bring each species to its reference-scaled target by randomly
@@ -559,6 +660,7 @@ class _GrainMixin:
                 positions = positions[keep]
                 numbers = numbers[keep]
                 grain_ids = grain_ids[keep]
+                shell_species_idx = shell_species_idx[keep]
             elif current < target and not skip_padding:
                 n_missing = target - current
                 added = np.empty((0, 3), dtype=np.float64)
@@ -597,6 +699,26 @@ class _GrainMixin:
                 grain_ids = np.concatenate(
                     [grain_ids, np.full(n_missing, -1, dtype=np.intp)],
                 )
+                # Padded atoms get assigned to the source of the
+                # nearest existing atom (for multi-source builds) or
+                # source 0 (single-source — unchanged behaviour).
+                if multi_source and len(positions) > n_missing:
+                    existing_pos = positions[:-n_missing]
+                    existing_shell = shell_species_idx
+                    pad_pos = added
+                    # Nearest existing atom per padded atom.
+                    delta = existing_pos[:, None, :] - pad_pos[None, :, :]
+                    frac = delta @ cell_inv_local
+                    frac -= np.round(frac)
+                    mi = frac @ cell_mat
+                    d2 = np.sum(mi * mi, axis=-1)
+                    nearest = np.argmin(d2, axis=0)
+                    pad_shell = existing_shell[nearest].astype(np.intp)
+                else:
+                    pad_shell = np.full(n_missing, 0, dtype=np.intp)
+                shell_species_idx = np.concatenate(
+                    [shell_species_idx, pad_shell]
+                )
 
         # ---- 7b.5. Push any residual close pairs apart ----
         # For crystalline grain builds, only push pairs below the tight
@@ -634,4 +756,15 @@ class _GrainMixin:
 
         self._grain_ids = grain_ids
         self._grain_seeds = seeds.copy()
+        # Publish the per-atom shell-species assignment so the
+        # relaxer can pull graphite grains toward sp² targets and
+        # diamond grains toward sp³ targets.  Only set when
+        # multi-source was requested; otherwise callers fall back to
+        # searchsorted on atomic numbers.
+        if multi_source:
+            self._atom_shell_species_index = shell_species_idx
+            self._grain_source = grain_source
+        else:
+            self._atom_shell_species_index = None
+            self._grain_source = None
         return atoms

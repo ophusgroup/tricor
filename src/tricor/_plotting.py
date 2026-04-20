@@ -29,6 +29,7 @@ def _detect_tetrahedra(
     bond_length_tol: float = 0.15,
     ideal_angle_deg: float = 109.47,
     angle_tol_deg: float = 25.0,
+    center_species_filter: "np.ndarray | None" = None,
 ) -> list[dict]:
     """Find center atoms whose 4 nearest vertex atoms form a tetrahedron.
 
@@ -67,6 +68,9 @@ def _detect_tetrahedra(
         & (bd_all >= bond_length * (1.0 - bond_length_tol))
         & (bd_all <= bond_length * (1.0 + bond_length_tol))
     )
+    if center_species_filter is not None:
+        filt = np.asarray(center_species_filter, dtype=bool)
+        keep &= filt[bi_all]
     if not np.any(keep):
         return []
     bi = bi_all[keep]
@@ -106,6 +110,103 @@ def _detect_tetrahedra(
                 }
             )
     return tetrahedra
+
+
+def _detect_triangles(
+    atoms,
+    *,
+    center_symbol: str = "C",
+    vertex_symbol: str = "C",
+    bond_length: float | None = None,
+    bond_length_tol: float = 0.15,
+    ideal_angle_deg: float = 120.0,
+    angle_tol_deg: float = 18.0,
+    center_species_filter: "np.ndarray | None" = None,
+) -> list[dict]:
+    """Find centres whose 3 nearest neighbours form a trigonal planar motif.
+
+    Mirrors :func:`_detect_tetrahedra` but enforces:
+
+    - exactly 3 neighbours within the bond-length window,
+    - all 3 pairwise (vertex)-(centre)-(vertex) angles within
+      ``angle_tol_deg`` of ``ideal_angle_deg`` (120° for sp\u00b2
+      graphene, 109.5° is NOT what you want here).
+
+    The three-120°-angles constraint implies coplanarity — no
+    separate planarity test is needed.
+
+    ``center_species_filter`` optionally restricts detection to
+    specific atom indices (e.g. the subset flagged as sp\u00b2 by
+    ``Supercell._atom_shell_species_index``).
+    """
+    from ase.data import atomic_numbers
+
+    Zc = atomic_numbers[center_symbol]
+    Zv = atomic_numbers[vertex_symbol]
+    numbers = np.asarray(atoms.numbers)
+
+    if bond_length is None:
+        bi, bj, bd = neighbor_list("ijd", atoms, 3.5)
+        mask = (numbers[bi] == Zc) & (numbers[bj] == Zv)
+        if not np.any(mask):
+            return []
+        bond_length = float(np.percentile(bd[mask], 10))
+
+    cutoff = float(bond_length) * (1.0 + float(bond_length_tol)) * 1.05
+    bi_all, bj_all, bd_all, bD_all = neighbor_list("ijdD", atoms, float(cutoff))
+
+    keep = (
+        (numbers[bi_all] == Zc)
+        & (numbers[bj_all] == Zv)
+        & (bd_all >= bond_length * (1.0 - bond_length_tol))
+        & (bd_all <= bond_length * (1.0 + bond_length_tol))
+    )
+    if center_species_filter is not None:
+        filt = np.asarray(center_species_filter, dtype=bool)
+        keep &= filt[bi_all]
+    if not np.any(keep):
+        return []
+    bi = bi_all[keep]
+    bj = bj_all[keep]
+    bd = bd_all[keep]
+    bD = bD_all[keep]
+
+    order = np.lexsort((bd, bi))
+    bi_s = bi[order]
+    bj_s = bj[order]
+    bD_s = bD[order]
+
+    ideal_rad = float(np.deg2rad(ideal_angle_deg))
+    tol_rad = float(np.deg2rad(angle_tol_deg))
+
+    unique_i, start_idx = np.unique(bi_s, return_index=True)
+    end_idx = np.concatenate([start_idx[1:], [bi_s.size]])
+
+    triangles: list[dict] = []
+    for u, s, e in zip(unique_i, start_idx, end_idx):
+        if int(e - s) < 3:
+            continue
+        js = bj_s[s : s + 3]
+        vs = bD_s[s : s + 3]
+        norms = np.linalg.norm(vs, axis=1)
+        if np.any(norms < 1e-6):
+            continue
+        unit = vs / norms[:, None]
+        cos_ab = np.clip(unit @ unit.T, -1.0, 1.0)
+        angles = np.arccos(cos_ab)
+        triu = np.triu_indices(3, k=1)
+        if float(np.max(np.abs(angles[triu] - ideal_rad))) <= tol_rad:
+            # Emit 4 vertices: [centre, j, k, l].  _TRI_FACES then
+            # fans three sub-triangles from the centre (vertex 0) to
+            # each pair of consecutive neighbours so the rendered mesh
+            # always anchors to the parent atom.
+            triangles.append(
+                {
+                    "center": int(u),
+                    "vertices": [int(u)] + [int(j) for j in js],
+                }
+            )
+    return triangles
 
 
 def _tetrahedra_vertex_coords(
@@ -151,6 +252,13 @@ _polyhedra_vertex_coords = _tetrahedra_vertex_coords
 # produced by ``_detect_tetrahedra`` / ``_detect_octahedra``.
 _TET_FACES = [[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]]
 _TET_EDGES = [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]]
+# Triangle motif (sp², 4 vertices).  Vertex 0 is the centre atom i,
+# vertices 1-3 are the three bonded neighbours j, k, l.  Three
+# sub-triangles all share the centre: (i,j,k), (i,k,l), (i,l,j), so
+# the rendered face always touches the parent atom even when the
+# bonds are at unequal scales after relaxation.
+_TRI_FACES = [[0, 1, 2], [0, 2, 3], [0, 3, 1]]
+_TRI_EDGES = [[0, 1], [0, 2], [0, 3], [1, 2], [2, 3], [3, 1]]
 # Octahedra: ``_detect_octahedra`` orders vertices so (0,1), (2,3),
 # (4,5) are antipodal; the 8 faces are all triples that take one vertex
 # from each antipodal pair, the 12 edges are every pair *except* the
@@ -166,10 +274,116 @@ _OCT_EDGES = [
 ]
 
 
+def _resolve_group_cfg(entry: dict) -> dict:
+    """Normalise one polyhedra_groups entry into the cfg dict shape.
+
+    Each entry is of the form
+    ``{"kind": "triangles"|"tetrahedra"|"octahedra"|"cuboctahedra",
+       "center_symbol", "vertex_symbol", ..., "virtual_species",
+       "color", "opacity"}``.
+    """
+    kind = entry.get("kind", "tetrahedra")
+    # Slot into the one-of-four branches of _resolve_polyhedra_cfg.
+    args = dict(triangles=None, tetrahedra=None, octahedra=None, cuboctahedra=None)
+    args[kind] = dict(entry)
+    return _resolve_polyhedra_cfg(**args)
+
+
+def _render_polyhedra_group(
+    atoms,
+    cfg: dict,
+    cell_obj=None,
+    *,
+    default_color=(0.25, 0.65, 0.95),
+    default_opacity: float = 0.35,
+) -> dict:
+    """Run the detector for ``cfg`` and produce a JSON-ready group dict.
+
+    ``cell_obj`` is the owning :class:`Supercell`; when set the
+    function will:
+
+    - use ``cell_obj._shell_target.pair_peak`` to auto-resolve
+      ``bond_length`` if not given;
+    - apply ``cfg['virtual_species']`` to the detector's
+      ``center_species_filter`` argument using
+      ``cell_obj._atom_shell_species_index``.
+    """
+    eff_bond_length = cfg["bond_length"]
+    if eff_bond_length is None and cell_obj is not None:
+        from ase.data import atomic_numbers as _an
+        st = getattr(cell_obj, "_shell_target", None)
+        if st is not None:
+            sp = np.asarray(st.species, dtype=np.int64)
+            try:
+                i = int(np.where(sp == _an[cfg["center_symbol"]])[0][0])
+                j = int(np.where(sp == _an[cfg["vertex_symbol"]])[0][0])
+                v = float(np.asarray(st.pair_peak, dtype=np.float64)[i, j])
+                if v > 0:
+                    eff_bond_length = v
+            except (IndexError, KeyError):
+                pass
+
+    species_filter = None
+    vsp = cfg.get("virtual_species")
+    if vsp is not None and cell_obj is not None:
+        asi = getattr(cell_obj, "_atom_shell_species_index", None)
+        if asi is not None:
+            species_filter = (np.asarray(asi, dtype=np.intp) == int(vsp))
+
+    detector_kwargs = dict(
+        center_symbol=cfg["center_symbol"],
+        vertex_symbol=cfg["vertex_symbol"],
+        bond_length=eff_bond_length,
+        bond_length_tol=cfg["bond_length_tol"],
+        ideal_angle_deg=cfg["ideal_angle_deg"],
+        angle_tol_deg=cfg["angle_tol_deg"],
+    )
+    # Only the newer detectors accept the filter kwarg; test by name.
+    try:
+        polys = cfg["detector"](
+            atoms,
+            center_species_filter=species_filter,
+            **detector_kwargs,
+        )
+    except TypeError:
+        polys = cfg["detector"](atoms, **detector_kwargs)
+
+    vertices_flat = _polyhedra_vertex_coords(
+        polys, atoms.positions, atoms.cell.array, scale=cfg["scale"]
+    )
+    vertices_flat = [round(v, 3) for v in vertices_flat]
+
+    if cfg["per_polyhedron_topology"]:
+        per_poly_faces = [p["faces"] for p in polys]
+        per_poly_edges = [p["edges"] for p in polys]
+    else:
+        per_poly_faces = []
+        per_poly_edges = []
+
+    color = cfg.get("color") or default_color
+    opacity = cfg.get("opacity")
+    if opacity is None:
+        opacity = default_opacity
+
+    return {
+        "n_vertices": int(cfg["n_vertices"]),
+        "vertices": vertices_flat,
+        "num": int(len(polys)),
+        "faces": cfg["faces"] if cfg["faces"] is not None else _TET_FACES,
+        "edges": cfg["edges"] if cfg["edges"] is not None else _TET_EDGES,
+        "color": list(color),
+        "opacity": float(opacity),
+        "per_polyhedron_topology": bool(cfg["per_polyhedron_topology"]),
+        "polyhedra_faces_per_poly": per_poly_faces,
+        "polyhedra_edges_per_poly": per_poly_edges,
+    }
+
+
 def _resolve_polyhedra_cfg(
     tetrahedra: "dict | None",
     octahedra: "dict | None",
     cuboctahedra: "dict | None" = None,
+    triangles: "dict | None" = None,
 ) -> "dict | None":
     """Normalise user-provided polyhedra dicts into a single config.
 
@@ -190,13 +404,22 @@ def _resolve_polyhedra_cfg(
       detector embeds its own tables)
     - ``detector``, ``per_polyhedron_topology`` (bool)
     """
-    provided = [x for x in (tetrahedra, octahedra, cuboctahedra) if x is not None]
+    provided = [x for x in (tetrahedra, octahedra, cuboctahedra, triangles) if x is not None]
     if len(provided) > 1:
         raise ValueError(
-            "Pass at most one of 'tetrahedra', 'octahedra', 'cuboctahedra'.",
+            "Pass at most one of 'tetrahedra', 'octahedra', 'cuboctahedra', 'triangles'.",
         )
     per_poly = False
-    if tetrahedra is not None:
+    if triangles is not None:
+        cfg = triangles
+        # 4 vertices: [centre, j, k, l] — see _TRI_FACES comment.
+        n_vertices = 4
+        faces, edges = _TRI_FACES, _TRI_EDGES
+        detector = _detect_triangles
+        ideal_default = 120.0
+        angle_tol_default = 18.0
+        scale_default = 0.5  # outer vertices at bond midpoints
+    elif tetrahedra is not None:
         cfg = tetrahedra
         n_vertices = 4
         faces, edges = _TET_FACES, _TET_EDGES
@@ -236,6 +459,13 @@ def _resolve_polyhedra_cfg(
         "edges": edges,
         "detector": detector,
         "per_polyhedron_topology": per_poly,
+        # Optional: restrict detection to atoms whose
+        # ``_atom_shell_species_index == virtual_species``.  Used for
+        # carbon sp²/sp³ blends where the sp² triangles should only
+        # decorate sp² atoms and sp³ tets only sp³ atoms.
+        "virtual_species": cfg.get("virtual_species"),
+        "color": cfg.get("color"),
+        "opacity": cfg.get("opacity"),
     }
 
 
@@ -742,6 +972,7 @@ def export_overview_html(
     cuboctahedra: dict | None = None,
     cuboctahedra_color=(0.55, 0.35, 0.85),
     cuboctahedra_opacity: float = 0.4,
+    polyhedra_groups: "list[dict] | None" = None,
 ) -> str:
     """Export a grid of static 3D structures as a self-contained HTML file.
 
@@ -780,6 +1011,13 @@ def export_overview_html(
     else:
         poly_color = tetrahedra_color
         poly_opacity = tetrahedra_opacity
+
+    # Multi-group polyhedra mode overrides the single-cfg path above.
+    # Each entry is a dict {kind, center_symbol, vertex_symbol, ...,
+    # color, opacity, virtual_species}.
+    groups_cfg: list[dict] | None = None
+    if polyhedra_groups:
+        groups_cfg = [_resolve_group_cfg(g) for g in polyhedra_groups]
 
     def _bond_length_from_shell_target(cell, center_sym, vertex_sym):
         from ase.data import atomic_numbers
@@ -915,6 +1153,24 @@ def export_overview_html(
             bi = np.zeros(0, dtype=np.int32)
             bj = np.zeros(0, dtype=np.int32)
 
+        # --- multi-group polyhedra payload (optional) ---
+        if groups_cfg:
+            groups_payload = [
+                _render_polyhedra_group(
+                    atoms, gcfg, cell_obj=cell,
+                    default_color=(0.25, 0.65, 0.95),
+                    default_opacity=0.35,
+                )
+                for gcfg in groups_cfg
+            ]
+            # Clear the legacy single-group fields: viewer will read
+            # polyhedra_groups in preference.
+            if groups_payload:
+                tet_vertices_flat = []
+                num_tets = 0
+        else:
+            groups_payload = []
+
         structures.append({
             "label": label,
             "num_atoms": int(len(atoms)),
@@ -929,6 +1185,7 @@ def export_overview_html(
             "num_tetrahedra": int(num_tets),
             "polyhedra_faces_per_poly": per_poly_faces,
             "polyhedra_edges_per_poly": per_poly_edges,
+            "polyhedra_groups": groups_payload,
         })
 
     data = {
@@ -959,6 +1216,7 @@ def export_overview_html(
             tetra_cfg and tetra_cfg["per_polyhedron_topology"]
         ),
         "polyhedra_scale": float(tetra_cfg["scale"]) if tetra_cfg else 1.0,
+        "polyhedra_multi_mode": bool(groups_cfg),
     }
 
     html = _OVERVIEW_HTML_TEMPLATE.replace(
@@ -1360,6 +1618,7 @@ class _PlottingMixin:
         cuboctahedra: dict | None = None,
         cuboctahedra_color=(0.55, 0.35, 0.85),
         cuboctahedra_opacity: float = 0.4,
+        polyhedra_groups: "list[dict] | None" = None,
         show_bonds: bool | None = None,
     ) -> str:
         """Export an interactive 3D trajectory viewer as a self-contained HTML file.
@@ -1465,8 +1724,10 @@ class _PlottingMixin:
 
         # Resolve show_bonds auto-default: bonds follow atoms when no
         # polyhedra are requested; polyhedra supersede bonds otherwise.
+        # Multi-group polyhedra_groups suppress bonds just like the
+        # legacy single-group tetrahedra= kwarg.
         if show_bonds is None:
-            show_bonds_eff = tetra_cfg is None
+            show_bonds_eff = tetra_cfg is None and not polyhedra_groups
         else:
             show_bonds_eff = bool(show_bonds)
 
@@ -1570,6 +1831,83 @@ class _PlottingMixin:
         data["polyhedra_faces_per_poly"] = per_poly_faces
         data["polyhedra_edges_per_poly"] = per_poly_edges
         data["polyhedra_scale"] = float(tetra_cfg["scale"]) if tetra_cfg else 1.0
+
+        # Multi-group polyhedra: emit a parallel ``polyhedra_groups``
+        # list, where each entry carries its own centers /
+        # vertex_indices / faces / edges / color / opacity.  Viewer
+        # prefers this when present.
+        groups_payload_traj: list[dict] = []
+        if polyhedra_groups:
+            from ase.data import atomic_numbers as _an_traj
+            for g in polyhedra_groups:
+                gcfg = _resolve_group_cfg(g)
+                # Resolve bond_length from shell_target if absent.
+                eff_bl = gcfg["bond_length"]
+                if eff_bl is None:
+                    _st = getattr(self, "_shell_target", None)
+                    if _st is not None:
+                        _sp = np.asarray(_st.species, dtype=np.int64)
+                        try:
+                            ci = int(np.where(_sp == _an_traj[gcfg["center_symbol"]])[0][0])
+                            vi = int(np.where(_sp == _an_traj[gcfg["vertex_symbol"]])[0][0])
+                            _v = float(np.asarray(_st.pair_peak, dtype=np.float64)[ci, vi])
+                            if _v > 0:
+                                eff_bl = _v
+                        except (IndexError, KeyError):
+                            pass
+                # Species filter.
+                species_filter = None
+                vsp = gcfg.get("virtual_species")
+                if vsp is not None:
+                    asi = getattr(self, "_atom_shell_species_index", None)
+                    if asi is not None:
+                        species_filter = (
+                            np.asarray(asi, dtype=np.intp) == int(vsp)
+                        )
+                detector_kwargs = dict(
+                    center_symbol=gcfg["center_symbol"],
+                    vertex_symbol=gcfg["vertex_symbol"],
+                    bond_length=eff_bl,
+                    bond_length_tol=gcfg["bond_length_tol"],
+                    ideal_angle_deg=gcfg["ideal_angle_deg"],
+                    angle_tol_deg=gcfg["angle_tol_deg"],
+                )
+                try:
+                    polys_g = gcfg["detector"](
+                        self.atoms,
+                        center_species_filter=species_filter,
+                        **detector_kwargs,
+                    )
+                except TypeError:
+                    polys_g = gcfg["detector"](self.atoms, **detector_kwargs)
+                g_centers = [t["center"] for t in polys_g]
+                g_vertex_idx = [v for t in polys_g for v in t["vertices"]]
+                if gcfg["per_polyhedron_topology"]:
+                    g_per_poly_faces = [p["faces"] for p in polys_g]
+                    g_per_poly_edges = [p["edges"] for p in polys_g]
+                else:
+                    g_per_poly_faces = []
+                    g_per_poly_edges = []
+                groups_payload_traj.append(
+                    {
+                        "n_vertices": int(gcfg["n_vertices"]),
+                        "centers": g_centers,
+                        "vertex_indices": g_vertex_idx,
+                        "num": len(polys_g),
+                        "faces": gcfg["faces"] if gcfg["faces"] is not None else _TET_FACES,
+                        "edges": gcfg["edges"] if gcfg["edges"] is not None else _TET_EDGES,
+                        "per_polyhedron_topology": bool(gcfg["per_polyhedron_topology"]),
+                        "faces_per_poly": g_per_poly_faces,
+                        "edges_per_poly": g_per_poly_edges,
+                        "scale": float(gcfg["scale"]),
+                        "color": list(gcfg.get("color") or (0.25, 0.65, 0.95)),
+                        "opacity": float(
+                            gcfg.get("opacity") if gcfg.get("opacity") is not None else 0.35
+                        ),
+                    }
+                )
+        data["polyhedra_groups"] = groups_payload_traj
+        data["polyhedra_multi_mode"] = bool(polyhedra_groups)
 
         html = _TRAJECTORY_HTML_TEMPLATE.replace(
             "__TRICOR_DATA_PLACEHOLDER__",
@@ -2034,7 +2372,11 @@ class _PlottingMixin:
 
         if shell_target is not None:
             coord_target = np.asarray(shell_target.coordination_target, dtype=np.float64)
-            species_idx = self._atom_species_index
+            species_idx = (
+                self._atom_shell_species_index
+                if getattr(self, "_atom_shell_species_index", None) is not None
+                else self._atom_species_index
+            )
             k_per_atom = np.array([
                 int(np.round(coord_target[species_idx[a]].sum()))
                 for a in range(num_atoms)

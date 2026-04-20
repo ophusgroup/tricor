@@ -6,10 +6,14 @@
 <style>
   html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; color: #333; }
   #container { display: grid; grid-template-rows: auto 1fr auto; height: 100vh; background: #f7f8f5; }
-  #title { padding: 8px 16px; font-weight: 600; font-size: 14px; border-bottom: 1px solid rgba(0,0,0,0.06); background: rgba(255,255,255,0.5); }
+  /* Explicit grid-row assignments so the layout stays correct when
+     #title is empty (its ``:empty { display: none }`` rule would
+     otherwise shift #canvas-wrap into the auto slot and let
+     #controls balloon into the 1fr slot). */
+  #title { grid-row: 1; padding: 8px 16px; font-weight: 600; font-size: 14px; border-bottom: 1px solid rgba(0,0,0,0.06); background: rgba(255,255,255,0.5); }
   #title:empty { display: none; }
-  #canvas-wrap { min-height: 0; position: relative; }
-  #controls { padding: 10px 16px; background: rgba(255,255,255,0.6); border-top: 1px solid rgba(0,0,0,0.06); display: flex; align-items: center; gap: 12px; font-size: 12px; }
+  #canvas-wrap { grid-row: 2; min-height: 0; position: relative; }
+  #controls { grid-row: 3; padding: 10px 16px; background: rgba(255,255,255,0.6); border-top: 1px solid rgba(0,0,0,0.06); display: flex; align-items: center; gap: 12px; font-size: 12px; }
   .btn { padding: 4px 12px; border-radius: 6px; border: 1px solid rgba(0,0,0,0.15); background: #fff; cursor: pointer; font-size: 12px; }
   .btn:hover { background: #eef2ea; }
   .btn.active { background: #2a6e4e; color: #fff; border-color: #2a6e4e; }
@@ -324,129 +328,162 @@ if (hasCost) {
   const dir = new THREE.Vector3();
   const quat = new THREE.Quaternion();
 
-  // Tetrahedra: precomputed topology (centre + 4 vertex indices per tet),
-  // geometry rebuilt each frame from current atom positions.
-  const tetraMode = !!DATA.tetrahedra_mode && (DATA.num_tetrahedra || 0) > 0;
-  let tetraPositions = null;
-  let tetraMesh = null;
-  let tetraEdgeGeo = null;
-  let tetraEdgePos = null;
-  const tetCenters = DATA.tetrahedra_centers || [];
-  const tetVertexIdx = DATA.tetrahedra_vertex_indices || [];
-  const nTets = DATA.num_tetrahedra || 0;
-  // Generic polyhedra topology (falls back to tetrahedron tables for
-  // backwards-compatible payloads that don't emit the polyhedra_* keys).
-  const POLY_N = DATA.polyhedra_n_vertices || 4;
-  const POLY_SCALE = (typeof DATA.polyhedra_scale === "number") ? DATA.polyhedra_scale : 1.0;
-  const POLY_FACES_SHARED = DATA.polyhedra_faces || [[0,1,2],[0,1,3],[0,2,3],[1,2,3]];
-  const POLY_EDGES_SHARED = DATA.polyhedra_edges || [[0,1],[0,2],[0,3],[1,2],[1,3],[2,3]];
-  const POLY_PERPOLY = !!DATA.polyhedra_per_polyhedron_topology;
-  const POLY_FACES_PER = DATA.polyhedra_faces_per_poly || [];
-  const POLY_EDGES_PER = DATA.polyhedra_edges_per_poly || [];
-  // Pre-compute face / edge counts per polyhedron (constant across
-  // frames since topology is fixed).
-  const facesByPoly = [];
-  const edgesByPoly = [];
-  let totalFaces = 0;
-  let totalEdges = 0;
-  if (POLY_PERPOLY) {
-    for (let t = 0; t < nTets; t++) {
-      facesByPoly.push(POLY_FACES_PER[t] || []);
-      edgesByPoly.push(POLY_EDGES_PER[t] || []);
-      totalFaces += facesByPoly[t].length;
-      totalEdges += edgesByPoly[t].length;
+  // Polyhedra groups: either
+  //   - a new-style multi-group payload (DATA.polyhedra_groups), or
+  //   - the legacy single-group payload (DATA.tetrahedra_*).
+  // Both paths end up in a single `polyhedraGroups` array; each
+  // element has its own mesh / edgeGeo / positions buffer, so we
+  // can render triangles AND tetrahedra simultaneously for carbon.
+  const polyhedraGroups = [];
+  function _buildPolyGroup(groupCfg) {
+    const nVerts = groupCfg.n_vertices;
+    const centers = groupCfg.centers || [];
+    const vertexIdx = groupCfg.vertex_indices || [];
+    const numPoly = groupCfg.num || 0;
+    const sharedFaces = groupCfg.faces || [[0,1,2],[0,1,3],[0,2,3],[1,2,3]];
+    const sharedEdges = groupCfg.edges || [[0,1],[0,2],[0,3],[1,2],[1,3],[2,3]];
+    const perPoly = !!groupCfg.per_polyhedron_topology;
+    const facesPerPoly = groupCfg.faces_per_poly || [];
+    const edgesPerPoly = groupCfg.edges_per_poly || [];
+    const scale = (typeof groupCfg.scale === "number") ? groupCfg.scale : 1.0;
+    const color = groupCfg.color || [0.25, 0.65, 0.95];
+    const opacity = (typeof groupCfg.opacity === "number") ? groupCfg.opacity : 0.35;
+
+    const facesByPoly = [];
+    const edgesByPoly = [];
+    let totalFaces = 0;
+    let totalEdges = 0;
+    if (perPoly) {
+      for (let t = 0; t < numPoly; t++) {
+        facesByPoly.push(facesPerPoly[t] || []);
+        edgesByPoly.push(edgesPerPoly[t] || []);
+        totalFaces += facesByPoly[t].length;
+        totalEdges += edgesByPoly[t].length;
+      }
+    } else {
+      for (let t = 0; t < numPoly; t++) {
+        facesByPoly.push(sharedFaces);
+        edgesByPoly.push(sharedEdges);
+      }
+      totalFaces = numPoly * sharedFaces.length;
+      totalEdges = numPoly * sharedEdges.length;
     }
-  } else {
-    for (let t = 0; t < nTets; t++) {
-      facesByPoly.push(POLY_FACES_SHARED);
-      edgesByPoly.push(POLY_EDGES_SHARED);
-    }
-    totalFaces = nTets * POLY_FACES_SHARED.length;
-    totalEdges = nTets * POLY_EDGES_SHARED.length;
-  }
-  if (tetraMode) {
-    tetraPositions = new Float32Array(totalFaces * 3 * 3);
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute("position", new THREE.BufferAttribute(tetraPositions, 3));
-    const tetColor = DATA.tetrahedra_color || [0.25, 0.65, 0.95];
-    const tetOpacity = DATA.tetrahedra_opacity != null ? DATA.tetrahedra_opacity : 0.35;
+    if (numPoly === 0) return null;
+
+    const facePositions = new Float32Array(totalFaces * 3 * 3);
+    const faceGeo = new THREE.BufferGeometry();
+    faceGeo.setAttribute("position", new THREE.BufferAttribute(facePositions, 3));
     const mat = new THREE.MeshPhongMaterial({
-      color: new THREE.Color(tetColor[0], tetColor[1], tetColor[2]),
+      color: new THREE.Color(color[0], color[1], color[2]),
       shininess: 20,
       specular: 0x888888,
       transparent: true,
-      opacity: tetOpacity,
+      opacity: opacity,
       side: THREE.DoubleSide,
       depthWrite: false,
     });
-    tetraMesh = new THREE.Mesh(geo, mat);
-    tetraMesh.frustumCulled = false;
-    scene.add(tetraMesh);
+    const mesh = new THREE.Mesh(faceGeo, mat);
+    mesh.frustumCulled = false;
+    scene.add(mesh);
 
-    tetraEdgePos = new Float32Array(totalEdges * 2 * 3);
-    tetraEdgeGeo = new THREE.BufferGeometry();
-    tetraEdgeGeo.setAttribute("position", new THREE.BufferAttribute(tetraEdgePos, 3));
+    const edgePositions = new Float32Array(totalEdges * 2 * 3);
+    const edgeGeo = new THREE.BufferGeometry();
+    edgeGeo.setAttribute("position", new THREE.BufferAttribute(edgePositions, 3));
     const edgeMat = new THREE.LineBasicMaterial({
       color: 0x111111,
       transparent: true,
       opacity: 0.55,
     });
-    scene.add(new THREE.LineSegments(tetraEdgeGeo, edgeMat));
+    scene.add(new THREE.LineSegments(edgeGeo, edgeMat));
+    return {
+      nVerts, centers, vertexIdx, numPoly,
+      facesByPoly, edgesByPoly,
+      scale,
+      mesh, faceGeo, facePositions,
+      edgeGeo, edgePositions,
+    };
+  }
+
+  const legacyTetraMode = !!DATA.tetrahedra_mode && (DATA.num_tetrahedra || 0) > 0;
+  const multiMode = !!DATA.polyhedra_multi_mode && Array.isArray(DATA.polyhedra_groups);
+  if (multiMode) {
+    for (const g of DATA.polyhedra_groups) {
+      const built = _buildPolyGroup(g);
+      if (built) polyhedraGroups.push(built);
+    }
+  } else if (legacyTetraMode) {
+    const legacyGroup = {
+      n_vertices: DATA.polyhedra_n_vertices || 4,
+      centers: DATA.tetrahedra_centers || [],
+      vertex_indices: DATA.tetrahedra_vertex_indices || [],
+      num: DATA.num_tetrahedra || 0,
+      faces: DATA.polyhedra_faces || [[0,1,2],[0,1,3],[0,2,3],[1,2,3]],
+      edges: DATA.polyhedra_edges || [[0,1],[0,2],[0,3],[1,2],[1,3],[2,3]],
+      per_polyhedron_topology: !!DATA.polyhedra_per_polyhedron_topology,
+      faces_per_poly: DATA.polyhedra_faces_per_poly || [],
+      edges_per_poly: DATA.polyhedra_edges_per_poly || [],
+      scale: (typeof DATA.polyhedra_scale === "number") ? DATA.polyhedra_scale : 1.0,
+      color: DATA.tetrahedra_color || [0.25, 0.65, 0.95],
+      opacity: DATA.tetrahedra_opacity != null ? DATA.tetrahedra_opacity : 0.35,
+    };
+    const built = _buildPolyGroup(legacyGroup);
+    if (built) polyhedraGroups.push(built);
   }
 
   function updateTetrahedra(frameOffset) {
-    if (!tetraMode) return;
-    // Scratch: POLY_N min-image-wrapped vertex positions per polyhedron.
-    const V = [];
-    for (let v = 0; v < POLY_N; v++) V.push(new Array(3));
-    let faceOut = 0;
-    let edgeOut = 0;
-    for (let t = 0; t < nTets; t++) {
-      const ci = tetCenters[t];
-      const cx = positions[frameOffset + ci*3];
-      const cy = positions[frameOffset + ci*3 + 1];
-      const cz = positions[frameOffset + ci*3 + 2];
-      for (let v = 0; v < POLY_N; v++) {
-        const vi = tetVertexIdx[t*POLY_N + v];
-        const vx = positions[frameOffset + vi*3];
-        const vy = positions[frameOffset + vi*3 + 1];
-        const vz = positions[frameOffset + vi*3 + 2];
-        const mi = minImage(vx - cx, vy - cy, vz - cz);
-        V[v][0] = cx + POLY_SCALE * mi[0];
-        V[v][1] = cy + POLY_SCALE * mi[1];
-        V[v][2] = cz + POLY_SCALE * mi[2];
+    if (polyhedraGroups.length === 0) return;
+    for (const group of polyhedraGroups) {
+      const V = [];
+      for (let v = 0; v < group.nVerts; v++) V.push(new Array(3));
+      let faceOut = 0;
+      let edgeOut = 0;
+      for (let t = 0; t < group.numPoly; t++) {
+        const ci = group.centers[t];
+        const cx = positions[frameOffset + ci*3];
+        const cy = positions[frameOffset + ci*3 + 1];
+        const cz = positions[frameOffset + ci*3 + 2];
+        for (let v = 0; v < group.nVerts; v++) {
+          const vi = group.vertexIdx[t*group.nVerts + v];
+          const vx = positions[frameOffset + vi*3];
+          const vy = positions[frameOffset + vi*3 + 1];
+          const vz = positions[frameOffset + vi*3 + 2];
+          const mi = minImage(vx - cx, vy - cy, vz - cz);
+          V[v][0] = cx + group.scale * mi[0];
+          V[v][1] = cy + group.scale * mi[1];
+          V[v][2] = cz + group.scale * mi[2];
+        }
+        const faces = group.facesByPoly[t];
+        for (let f = 0; f < faces.length; f++) {
+          const [a, b, cc] = faces[f];
+          const outBase = faceOut * 9;
+          group.facePositions[outBase+0] = V[a][0];
+          group.facePositions[outBase+1] = V[a][1];
+          group.facePositions[outBase+2] = V[a][2];
+          group.facePositions[outBase+3] = V[b][0];
+          group.facePositions[outBase+4] = V[b][1];
+          group.facePositions[outBase+5] = V[b][2];
+          group.facePositions[outBase+6] = V[cc][0];
+          group.facePositions[outBase+7] = V[cc][1];
+          group.facePositions[outBase+8] = V[cc][2];
+          faceOut++;
+        }
+        const edges = group.edgesByPoly[t];
+        for (let e = 0; e < edges.length; e++) {
+          const [a, b] = edges[e];
+          const outBase = edgeOut * 6;
+          group.edgePositions[outBase+0] = V[a][0];
+          group.edgePositions[outBase+1] = V[a][1];
+          group.edgePositions[outBase+2] = V[a][2];
+          group.edgePositions[outBase+3] = V[b][0];
+          group.edgePositions[outBase+4] = V[b][1];
+          group.edgePositions[outBase+5] = V[b][2];
+          edgeOut++;
+        }
       }
-      const faces = facesByPoly[t];
-      for (let f = 0; f < faces.length; f++) {
-        const [a, b, cc] = faces[f];
-        const outBase = faceOut * 9;
-        tetraPositions[outBase+0] = V[a][0];
-        tetraPositions[outBase+1] = V[a][1];
-        tetraPositions[outBase+2] = V[a][2];
-        tetraPositions[outBase+3] = V[b][0];
-        tetraPositions[outBase+4] = V[b][1];
-        tetraPositions[outBase+5] = V[b][2];
-        tetraPositions[outBase+6] = V[cc][0];
-        tetraPositions[outBase+7] = V[cc][1];
-        tetraPositions[outBase+8] = V[cc][2];
-        faceOut++;
-      }
-      const edges = edgesByPoly[t];
-      for (let e = 0; e < edges.length; e++) {
-        const [a, b] = edges[e];
-        const outBase = edgeOut * 6;
-        tetraEdgePos[outBase+0] = V[a][0];
-        tetraEdgePos[outBase+1] = V[a][1];
-        tetraEdgePos[outBase+2] = V[a][2];
-        tetraEdgePos[outBase+3] = V[b][0];
-        tetraEdgePos[outBase+4] = V[b][1];
-        tetraEdgePos[outBase+5] = V[b][2];
-        edgeOut++;
-      }
+      group.mesh.geometry.attributes.position.needsUpdate = true;
+      group.mesh.geometry.computeVertexNormals();
+      group.edgeGeo.attributes.position.needsUpdate = true;
     }
-    tetraMesh.geometry.attributes.position.needsUpdate = true;
-    tetraMesh.geometry.computeVertexNormals();
-    tetraEdgeGeo.attributes.position.needsUpdate = true;
   }
 
   function renderFrame(frameIdx) {

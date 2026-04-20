@@ -145,9 +145,11 @@ function drawProfile() {
   let yMax, offsetStep;
   if (IS_COMPARE && drawSpec.length > 1) {
     // Each curve gets its own slot of height perCurveMax; offsets
-    // stack them bottom-to-top with a tiny gap so crests don't touch
-    // the next series' trough.
-    offsetStep = perCurveMax * 0.35;
+    // stack them bottom-to-top.  The step has to be close to
+    // perCurveMax itself (not ~0.35× it) to keep sharp first-shell
+    // peaks — graphite's in-plane C-C peak reaches ~6× the bulk
+    // average — from crashing into adjacent series.
+    offsetStep = perCurveMax * 0.85;
     yMax = perCurveMax + offsetStep * (drawSpec.length - 1);
   } else {
     offsetStep = 0;

@@ -152,6 +152,15 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         ]
         self._flat_triplet_size = self._r_num * self._r_num * self._phi_num_bins
         self._atom_species_index = np.searchsorted(self._species, self.atoms.numbers)
+        # Optional override: when a composite shell target has more
+        # virtual species than the atomic-number species (e.g. sp2_C
+        # and sp3_C sharing atomic number 6), the relaxer and the
+        # polyhedra-friendly plotting paths consult this array instead
+        # of ``_atom_species_index``.  Set from ``_build_grain_atoms``
+        # when ``grain_sources`` is supplied, or manually via
+        # ``Supercell.generate(..., atom_species_index=...)``.
+        self._atom_shell_species_index: np.ndarray | None = None
+        self._grain_source: np.ndarray | None = None
         self._g3_rr_weights_flat = self._build_g3_rr_weights()
         self._spatial_offset_cache: dict[tuple[int, int, int], np.ndarray] = {}
         self._rebuild_spatial_index()
@@ -446,6 +455,8 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         hard_core_scale: float = 1.0,
         nonbond_push_scale: float = 1.0,
         displacement_sigma: float = 0.0,
+        atom_species_index: np.ndarray | None = None,
+        grain_sources: "list[dict] | None" = None,
         show_progress: bool = True,
         **shell_relax_kwargs: Any,
     ) -> dict[str, Any]:
@@ -502,6 +513,7 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
                 grain_size=float(grain_size),
                 crystalline_fraction=crystalline_fraction,
                 displacement_sigma=displacement_sigma,
+                grain_sources=grain_sources,
             )
 
             # Refresh cached arrays after rebuilding atoms
@@ -511,6 +523,20 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
                 self._species, self.atoms.numbers,
             )
             self._rebuild_spatial_index()
+            # If the caller passed an explicit per-atom virtual species
+            # index, it takes precedence over whatever _build_grain_atoms
+            # set.  (The grain builder writes an index when grain_sources
+            # is non-None; an explicit kwarg here lets the caller
+            # override that.)
+            if atom_species_index is not None:
+                asp = np.asarray(atom_species_index, dtype=np.intp)
+                if asp.shape[0] != len(self.atoms):
+                    raise ValueError(
+                        f"atom_species_index length ({asp.shape[0]}) must "
+                        f"match atom count ({len(self.atoms)}) after "
+                        f"grain construction."
+                    )
+                self._atom_shell_species_index = asp
         else:
             # Liquid path: atoms came from _build_random_atoms() at init
             # time with purely-random positions.  Pre-separate only
@@ -534,6 +560,14 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
                 max_iter=40,
             )
             self._rebuild_spatial_index()
+            if atom_species_index is not None:
+                asp = np.asarray(atom_species_index, dtype=np.intp)
+                if asp.shape[0] != len(self.atoms):
+                    raise ValueError(
+                        f"atom_species_index length ({asp.shape[0]}) must "
+                        f"match atom count ({len(self.atoms)})."
+                    )
+                self._atom_shell_species_index = asp
 
         # --- relax ---
         summary = self.shell_relax(
