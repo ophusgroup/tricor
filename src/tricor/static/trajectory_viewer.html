@@ -589,9 +589,10 @@ if (hasCost) {
   const cellHalfX = 0.5 * Math.abs(cell[0]);
   const cellHalfY = 0.5 * Math.abs(cell[4]);
   const cellHalfZ = 0.5 * Math.abs(cell[8]);
-  // Fit tolerance: smaller = tighter zoom.  0.81 gives roughly a 10%
-  // zoom-in versus the "just fits" edge-to-edge framing.
-  const FRAME_FIT = 0.81;
+  // Fit tolerance: smaller = tighter zoom, larger = more margin.
+  // 1.0 gives ~20% padding around the cell so sp² triangles and
+  // sp³ tetrahedra at the box faces stay in the viewport.
+  const FRAME_FIT = 1.0;
 
   function framedCameraDistance(aspect) {
     const fovV = camera.fov * Math.PI / 180;
