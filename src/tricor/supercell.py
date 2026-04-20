@@ -425,13 +425,7 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
             hard_core_scale=0.95, nonbond_push_scale=0.9,
             displacement_sigma=0.04,
         ),
-        "nanocrystalline_10": dict(
-            num_steps=200,
-            grain_size=15.0,
-            bond_weight=2.8, angle_weight=1.3,
-            displacement_sigma=0.02,
-        ),
-        "nanocrystalline_20": dict(
+        "nanocrystalline": dict(
             num_steps=150,
             grain_size=20.0,
             bond_weight=3.0, angle_weight=1.5,
