@@ -84,6 +84,38 @@ class StructureWidget(anywidget.AnyWidget):
     show_bonds = traitlets.Bool(True).tag(sync=True)
     show_cell = traitlets.Bool(True).tag(sync=True)
 
+    # --- polyhedra (tetrahedra / octahedra / cuboctahedra) ---
+    show_polyhedra = traitlets.Bool(False).tag(sync=True)
+    polyhedra_kind = traitlets.Unicode("tetrahedra").tag(sync=True)
+    polyhedra_center_symbol = traitlets.Unicode("Si").tag(sync=True)
+    polyhedra_vertex_symbol = traitlets.Unicode("O").tag(sync=True)
+    polyhedra_bond_length = traitlets.Float(1.61).tag(sync=True)
+    polyhedra_bond_length_tol = traitlets.Float(0.15).tag(sync=True)
+    polyhedra_angle_tol_deg = traitlets.Float(25.0).tag(sync=True)
+    polyhedra_scale = traitlets.Float(1.0).tag(sync=True)
+    polyhedra_color = traitlets.List(trait=traitlets.Float(),
+        default_value=[0.28, 0.62, 0.95]).tag(sync=True)
+    polyhedra_opacity = traitlets.Float(0.2).tag(sync=True)
+    # Synced polyhedra topology (per-polyhedron faces/edges for cuboctahedra,
+    # shared tables for tets/octa)
+    polyhedra_n_vertices = traitlets.Int(4).tag(sync=True)
+    polyhedra_faces = traitlets.List(
+        trait=traitlets.List(trait=traitlets.Int())).tag(sync=True)
+    polyhedra_edges = traitlets.List(
+        trait=traitlets.List(trait=traitlets.Int())).tag(sync=True)
+    polyhedra_per_poly_topology = traitlets.Bool(False).tag(sync=True)
+    polyhedra_faces_per_poly = traitlets.List(
+        trait=traitlets.List(trait=traitlets.List(trait=traitlets.Int()))
+    ).tag(sync=True)
+    polyhedra_edges_per_poly = traitlets.List(
+        trait=traitlets.List(trait=traitlets.List(trait=traitlets.Int()))
+    ).tag(sync=True)
+    # Per-polyhedron flattened vertex positions in world space
+    # (min-image wrt centre, box-centred, scaled by polyhedra_scale).
+    polyhedra_vertex_positions = traitlets.List(
+        trait=traitlets.Float()).tag(sync=True)
+    num_polyhedra = traitlets.Int(0).tag(sync=True)
+
     # --- slab selection (fractional 0-1) ---
     slab_x_min = traitlets.Float(0.0).tag(sync=True)
     slab_x_max = traitlets.Float(1.0).tag(sync=True)
@@ -94,21 +126,24 @@ class StructureWidget(anywidget.AnyWidget):
 
     # --- display ---
     background_color = traitlets.Unicode("#f7f8f5").tag(sync=True)
+    orthographic = traitlets.Bool(False).tag(sync=True)
 
     def __init__(
         self,
         atoms: Atoms,
         shell_target: Any | None = None,
         *,
-        atom_scale: float = 0.4,
+        atom_scale: float = 0.2,
         bond_cutoff: float | None = None,
         bond_radius: float = 0.08,
-        show_bonds: bool = True,
+        show_bonds: bool = False,
         show_cell: bool = True,
+        orthographic: bool = False,
         slab_x: tuple[float, float] = (0.0, 1.0),
         slab_y: tuple[float, float] = (0.0, 1.0),
         slab_z: tuple[float, float] = (0.0, 1.0),
         grain_ids: np.ndarray | None = None,
+        polyhedra: dict | bool | None = None,
     ):
         # Store references
         self._atoms = atoms.copy()
@@ -180,6 +215,7 @@ class StructureWidget(anywidget.AnyWidget):
             bond_cutoff_max=float(bond_cutoff * 2.0),
             show_bonds=show_bonds,
             show_cell=show_cell,
+            orthographic=orthographic,
             cell_vertices=corners.ravel().tolist(),
             cell_edges=edge_pairs,
             species_labels=sp_labels,
@@ -197,7 +233,19 @@ class StructureWidget(anywidget.AnyWidget):
         bond_data = self._compute_bonds(bond_cutoff)
         kwargs.update(bond_data)
 
+        # --- polyhedra: auto-pick kind + settings ---
+        poly_cfg = self._resolve_polyhedra_config(
+            polyhedra, atoms, shell_target, sp_labels,
+        )
+        kwargs.update(poly_cfg)
+
         super().__init__(**kwargs)
+
+        # Compute polyhedra if enabled
+        if kwargs.get("show_polyhedra"):
+            poly_data = self._compute_polyhedra()
+            for k, v in poly_data.items():
+                self.set_trait(k, v)
 
         # Observers
         self.observe(self._on_slab_change, names=[
@@ -206,6 +254,12 @@ class StructureWidget(anywidget.AnyWidget):
         ])
         self.observe(self._on_bond_cutoff_change, names=["bond_cutoff"])
         self.observe(self._on_bond_pair_visible_change, names=["bond_pair_visible"])
+        self.observe(self._on_polyhedra_config_change, names=[
+            "show_polyhedra", "polyhedra_kind",
+            "polyhedra_center_symbol", "polyhedra_vertex_symbol",
+            "polyhedra_bond_length", "polyhedra_bond_length_tol",
+            "polyhedra_angle_tol_deg", "polyhedra_scale",
+        ])
 
     def _compute_bonds(self, cutoff: float) -> dict[str, Any]:
         """Compute bonds and return traitlet update dict."""
@@ -302,3 +356,179 @@ class StructureWidget(anywidget.AnyWidget):
             if not pair_vis[self._bond_pair_indices_arr[k]]:
                 bvis[k] = False
         self.bond_visible = bvis.tolist()
+
+    # ---------------------------------------------------------------
+    # Polyhedra (tetrahedra / octahedra / cuboctahedra)
+    # ---------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_polyhedra_config(
+        user_cfg: "dict | bool | None",
+        atoms: Atoms,
+        shell_target: Any | None,
+        sp_labels: list[str],
+    ) -> dict[str, Any]:
+        """Decide which polyhedron to draw + defaults for each setting.
+
+        User-side ``polyhedra`` can be:
+
+        * ``None`` (default): auto-pick based on species - Si/C single
+          element -> tetrahedra at half-scale; binary with Si or Ti ->
+          tets or octa around the cation; single metal -> cuboctahedra
+          at half-scale.  Leaves ``show_polyhedra=False`` by default so
+          the classic bond view is shown unless the user opts in.
+        * ``True`` / ``False``: same as ``None`` for the detection
+          logic but flips ``show_polyhedra`` accordingly.
+        * dict: explicit override, merged on top of the auto-detected
+          config.
+        """
+        cfg: dict[str, Any] = dict(show_polyhedra=False)
+        auto_kind = None
+        auto_center = None
+        auto_vertex = None
+        auto_bl = None
+        auto_scale = 1.0
+        auto_color = [0.28, 0.62, 0.95]
+
+        symbols = set(sp_labels)
+        # Auto-pick based on species
+        if symbols == {"Si"}:
+            auto_kind = "tetrahedra"
+            auto_center, auto_vertex = "Si", "Si"
+            auto_bl = 2.352
+            auto_scale = 0.5
+            auto_color = [0.35, 0.45, 0.95]
+        elif symbols == {"C"}:
+            auto_kind = "tetrahedra"
+            auto_center, auto_vertex = "C", "C"
+            auto_bl = 1.54
+            auto_scale = 0.5
+            auto_color = [0.35, 0.35, 0.35]
+        elif symbols == {"Cu"}:
+            auto_kind = "cuboctahedra"
+            auto_center, auto_vertex = "Cu", "Cu"
+            auto_bl = 2.556
+            auto_scale = 0.5
+            auto_color = [0.85, 0.45, 0.20]
+        elif {"Si", "O"}.issubset(symbols):
+            auto_kind = "tetrahedra"
+            auto_center, auto_vertex = "Si", "O"
+            auto_bl = 1.61
+            auto_scale = 1.0
+            auto_color = [0.28, 0.62, 0.95]
+        elif {"Ti", "O"}.issubset(symbols):
+            auto_kind = "octahedra"
+            auto_center, auto_vertex = "Ti", "O"
+            auto_bl = 1.956
+            auto_scale = 1.0
+            auto_color = [0.95, 0.55, 0.25]
+
+        # Try to refine bond_length from shell_target pair_peak
+        if shell_target is not None and auto_center is not None:
+            try:
+                import numpy as _np
+                sp = _np.asarray(shell_target.species, dtype=_np.int64)
+                ci = int(_np.where(sp == atomic_numbers[auto_center])[0][0])
+                vi = int(_np.where(sp == atomic_numbers[auto_vertex])[0][0])
+                val = float(_np.asarray(shell_target.pair_peak, dtype=_np.float64)[ci, vi])
+                if val > 0:
+                    auto_bl = val
+            except (IndexError, KeyError, AttributeError):
+                pass
+
+        if auto_kind is not None:
+            cfg["polyhedra_kind"] = auto_kind
+            cfg["polyhedra_center_symbol"] = auto_center
+            cfg["polyhedra_vertex_symbol"] = auto_vertex
+            cfg["polyhedra_bond_length"] = float(auto_bl)
+            cfg["polyhedra_scale"] = float(auto_scale)
+            cfg["polyhedra_color"] = auto_color
+
+        # Apply user overrides
+        if user_cfg is True:
+            cfg["show_polyhedra"] = auto_kind is not None
+        elif user_cfg is False:
+            cfg["show_polyhedra"] = False
+        elif isinstance(user_cfg, dict):
+            cfg["show_polyhedra"] = True
+            for k, v in user_cfg.items():
+                tr_name = (
+                    k if k.startswith("polyhedra_") or k == "show_polyhedra"
+                    else f"polyhedra_{k}"
+                )
+                cfg[tr_name] = v
+        return cfg
+
+    def _compute_polyhedra(self) -> dict[str, Any]:
+        """Run the appropriate polyhedron detector and return traitlets
+        update dict with vertex positions, face/edge topology, count."""
+        from ._plotting import (
+            _detect_tetrahedra, _detect_octahedra, _detect_cuboctahedra,
+            _polyhedra_vertex_coords,
+            _TET_FACES, _TET_EDGES, _OCT_FACES, _OCT_EDGES,
+        )
+        kind = self.polyhedra_kind
+        args = dict(
+            center_symbol=self.polyhedra_center_symbol,
+            vertex_symbol=self.polyhedra_vertex_symbol,
+            bond_length=float(self.polyhedra_bond_length),
+            bond_length_tol=float(self.polyhedra_bond_length_tol),
+            angle_tol_deg=float(self.polyhedra_angle_tol_deg),
+        )
+        per_poly = False
+        if kind == "octahedra":
+            detector = _detect_octahedra
+            args["ideal_angle_deg"] = 90.0
+            faces, edges = _OCT_FACES, _OCT_EDGES
+            n_vertices = 6
+        elif kind == "cuboctahedra":
+            detector = _detect_cuboctahedra
+            faces, edges = [], []
+            n_vertices = 12
+            per_poly = True
+        else:  # tetrahedra default
+            detector = _detect_tetrahedra
+            args["ideal_angle_deg"] = 109.47
+            faces, edges = _TET_FACES, _TET_EDGES
+            n_vertices = 4
+
+        polys = detector(self._atoms, **args)
+        verts = _polyhedra_vertex_coords(
+            polys, self._atoms.positions, self._atoms.cell.array,
+            scale=float(self.polyhedra_scale),
+        )
+        verts = [round(v, 3) for v in verts]
+
+        out: dict[str, Any] = dict(
+            polyhedra_vertex_positions=verts,
+            num_polyhedra=len(polys),
+            polyhedra_n_vertices=n_vertices,
+            polyhedra_per_poly_topology=per_poly,
+            polyhedra_faces=[list(f) for f in faces],
+            polyhedra_edges=[list(e) for e in edges],
+        )
+        if per_poly:
+            out["polyhedra_faces_per_poly"] = [
+                [list(f) for f in p["faces"]] for p in polys
+            ]
+            out["polyhedra_edges_per_poly"] = [
+                [list(e) for e in p["edges"]] for p in polys
+            ]
+        else:
+            out["polyhedra_faces_per_poly"] = []
+            out["polyhedra_edges_per_poly"] = []
+        return out
+
+    def _on_polyhedra_config_change(self, change: dict) -> None:
+        """Recompute polyhedra whenever any setting changes."""
+        if not self.show_polyhedra:
+            # When turning off, we still emit an empty payload so the
+            # viewer can clear the mesh.
+            self.set_trait("polyhedra_vertex_positions", [])
+            self.set_trait("num_polyhedra", 0)
+            return
+        data = self._compute_polyhedra()
+        # Use hold_trait_notifications to batch updates.
+        with self.hold_trait_notifications():
+            for k, v in data.items():
+                self.set_trait(k, v)

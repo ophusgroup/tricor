@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 _STATIC_DIR = _Path(__file__).parent / "static"
 _TRAJECTORY_HTML_TEMPLATE = (_STATIC_DIR / "trajectory_viewer.html").read_text()
 _G3_HTML_TEMPLATE = (_STATIC_DIR / "g3_viewer.html").read_text()
+_G2_HTML_TEMPLATE = (_STATIC_DIR / "g2_viewer.html").read_text()
 _OVERVIEW_HTML_TEMPLATE = (_STATIC_DIR / "overview_viewer.html").read_text()
 
 
@@ -953,20 +954,42 @@ class _PlottingMixin:
     def view_structure(
         self: "Supercell",
         shell_target: "CoordinationShellTarget | None" = None,
+        *,
+        polyhedra: "dict | bool | None" = True,
         **kwargs,
     ):
         """Return an interactive 3D structure viewer widget.
 
-        Renders atoms as spheres (coloured by element) and bonds as
-        cylinders inside the periodic cell outline.  Uses Three.js
-        WebGL with OrbitControls for drag-to-rotate / scroll-to-zoom.
+        Renders atoms as spheres (coloured by element).  Two overlay
+        modes, independently toggle-able in the widget:
+
+        * Bonds - cylinders between atoms within a radial cutoff.
+        * Polyhedra - translucent tetrahedra / octahedra /
+          cuboctahedra around atoms that pass a distance + angle
+          tolerance check (see
+          :meth:`export_trajectory_html` / :func:`_detect_tetrahedra`
+          for the underlying algorithm).  Enabled by default for
+          materials whose coordination polyhedron we can auto-detect
+          (Si / C tetrahedra at half-scale, Cu cuboctahedra, SiO2
+          tetrahedra, SrTiO3 octahedra).
+
+        Sliders in the side panel let you tune the radial tolerance,
+        angular tolerance, centre-vertex bond length, and polyhedra
+        scale (0.5 places vertices at bond midpoints, 1.0 at atoms).
 
         Parameters
         ----------
         shell_target
-            Sets the default bond cutoff from
-            ``shell_target.max_pair_outer``.  If ``None``, uses the
-            shell_target stored from the last :meth:`generate` call.
+            Sets the default bond cutoff and bond_length from
+            ``shell_target.max_pair_outer`` / ``pair_peak``.  If
+            ``None``, uses the shell_target stored from the last
+            :meth:`generate` call.
+        polyhedra
+            Polyhedra config.  ``True`` / ``None`` (default) auto-pick
+            kind + settings from species; ``False`` disables polyhedra;
+            a ``dict`` overrides individual settings - e.g.
+            ``{'kind': 'octahedra', 'center_symbol': 'Ti',
+            'vertex_symbol': 'O', 'bond_length': 1.96}``.
         **kwargs
             Forwarded to :class:`StructureWidget` (e.g. ``atom_scale``,
             ``bond_cutoff``, ``show_bonds``, ``slab_x``, etc.).
@@ -985,6 +1008,7 @@ class _PlottingMixin:
             self.atoms,
             shell_target=shell_target,
             grain_ids=self._grain_ids,
+            polyhedra=polyhedra,
             **kwargs,
         )
 
@@ -1478,6 +1502,207 @@ class _PlottingMixin:
         with open(output_path, "w") as f:
             f.write(html)
         return output_path
+
+    def export_g2_html(
+        self: "Supercell",
+        output_path: "str | None" = None,
+        *,
+        r_max: float = 10.0,
+        r_step: float = 0.05,
+        background_color: str = "#f7f8f5",
+        title: str = "",
+        show_progress: bool = False,
+    ) -> str:
+        """Export a standalone interactive 2D g(r) viewer.
+
+        Shows the per-species-pair pair-correlation function g_{AB}(r) as
+        a single g(r) plot with a dropdown to switch species pair, and
+        an "overlay all" checkbox to compare all pairs on one axis.
+        Essentially the bottom panel of :meth:`export_g3_html` lifted
+        out on its own with a species-pair selector - useful as a
+        quick 2-body PDF viewer without any angular content.
+
+        Parameters
+        ----------
+        output_path
+            Path to write the HTML file.  When ``None`` the HTML is not
+            written to disk; the raw HTML string is still returned so
+            the caller can embed it directly (for example via
+            :func:`IPython.display.HTML`) - see also :meth:`plot_g2`
+            for a ready-made Jupyter wrapper.
+        r_max, r_step
+            Radial grid for the measurement.  A finer ``r_step`` (default
+            0.05 \u00c5) gives smoother curves than the coarse 0.1 \u00c5
+            grid used by the g3 viewer.
+        background_color, title
+            Cosmetic.
+        show_progress
+            Forwarded to the underlying :meth:`measure_g3` call (this
+            exporter reuses the g3 machinery because the g2 array is
+            a by-product; ``phi_num_bins`` is set low for speed).
+
+        Returns
+        -------
+        str
+            The resolved output path when ``output_path`` was provided,
+            otherwise the HTML source string.
+        """
+        import json
+
+        from .g3 import G3Distribution
+        from ase.data import chemical_symbols
+
+        dist = G3Distribution(self.atoms, label=f"{self.label}-export-g2")
+        # Low phi_num_bins because we don't use the angular data here;
+        # the speedup is significant for large boxes.
+        dist.measure_g3(
+            r_max=r_max,
+            r_step=r_step,
+            phi_num_bins=12,
+            show_progress=show_progress,
+        )
+        if dist.g2 is None:
+            raise ValueError("Measured distribution has no g2 array.")
+
+        r = np.asarray(dist.r, dtype=np.float64)
+        r_edges = np.asarray(dist.bin_edges, dtype=np.float64)
+
+        species = np.asarray(dist.species, dtype=np.int64)
+        sp_labels = [chemical_symbols[int(z)] for z in species]
+
+        # g2[ci, vi] is the pair-specific RDF; (ci, vi) and (vi, ci)
+        # differ by a constant prefactor but are otherwise identical.
+        # Emit one curve per unique (ci <= vi) pair and drop the
+        # symmetric duplicate.
+        num_species = len(species)
+        g2 = np.asarray(dist.g2, dtype=np.float64)
+
+        # Normalise each pair profile so the tail converges to 1.0
+        # (consistent with the g3 viewer's profile panel).
+        def _norm_profile(y: np.ndarray, r_arr: np.ndarray) -> np.ndarray:
+            y = y / np.maximum(r_arr * r_arr, _EPS)
+            tail_start = 0.7 * float(r_arr[-1])
+            tail_mask = r_arr >= tail_start
+            if not np.any(tail_mask):
+                tail_mask = np.zeros_like(r_arr, dtype=bool)
+                tail_mask[-max(1, r_arr.size // 4):] = True
+            tail = y[tail_mask]
+            finite = tail[np.isfinite(tail)]
+            scale = float(np.mean(finite)) if finite.size else 1.0
+            if scale <= _EPS:
+                scale = 1.0
+            return (y / scale).astype(np.float32)
+
+        pair_labels: list[str] = []
+        profiles: list[list[float]] = []
+        pair_peaks: list[float] = []
+        shell_target = getattr(self, "_shell_target", None)
+        pair_peak_matrix = None
+        if shell_target is not None:
+            pair_peak_matrix = np.asarray(
+                shell_target.pair_peak, dtype=np.float64
+            )
+
+        # Resolve a shell-target species index for each dist species.
+        st_species_index: dict[int, int] = {}
+        if shell_target is not None:
+            st_species = np.asarray(shell_target.species, dtype=np.int64)
+            for ci_dist, z in enumerate(species):
+                match = np.where(st_species == int(z))[0]
+                if match.size:
+                    st_species_index[ci_dist] = int(match[0])
+
+        for ci in range(num_species):
+            for vi in range(ci, num_species):
+                prof = _norm_profile(g2[ci, vi], r)
+                pair_labels.append(f"{sp_labels[ci]}-{sp_labels[vi]}")
+                profiles.append(prof.tolist())
+                peak = 0.0
+                if pair_peak_matrix is not None:
+                    ci_st = st_species_index.get(ci)
+                    vi_st = st_species_index.get(vi)
+                    if ci_st is not None and vi_st is not None:
+                        v = float(pair_peak_matrix[ci_st, vi_st])
+                        if np.isfinite(v) and v > 0:
+                            peak = v
+                pair_peaks.append(peak)
+
+        # Default pair: prefer shortest-bond cross-species if available,
+        # else first pair.
+        default_pair = 0
+        if pair_peaks:
+            # Exclude self-pairs with zero peak; pick the smallest positive peak.
+            positive = [(i, p) for i, p in enumerate(pair_peaks) if p > 0]
+            if positive:
+                default_pair = min(positive, key=lambda x: x[1])[0]
+
+        data = {
+            "num_r": int(r.size),
+            "num_pairs": len(pair_labels),
+            "r_centers": r.tolist(),
+            "r_edges": r_edges.tolist(),
+            "pair_labels": pair_labels,
+            "pair_peaks": pair_peaks,
+            "profiles": profiles,
+            "default_pair": int(default_pair),
+            "background_color": background_color,
+            "title": title,
+        }
+
+        html = _G2_HTML_TEMPLATE.replace(
+            "__TRICOR_DATA_PLACEHOLDER__",
+            json.dumps(data),
+        )
+        if output_path is None:
+            return html
+        output_path = str(output_path)
+        with open(output_path, "w") as f:
+            f.write(html)
+        return output_path
+
+    def plot_g2(
+        self: "Supercell",
+        *,
+        r_max: float = 10.0,
+        r_step: float = 0.05,
+        title: str = "",
+        height: int = 420,
+        show_progress: bool = False,
+    ):
+        """Return an inline Jupyter display of the g(r) pair-correlation
+        viewer.
+
+        Convenience wrapper around :meth:`export_g2_html` that packages
+        the HTML as an :class:`IPython.display.HTML` object so you can
+        just do ``cells['MRO'].plot_g2()`` in a notebook cell.  The
+        viewer is embedded via a ``srcdoc`` iframe so it renders
+        isolated from the surrounding notebook CSS / JS.
+
+        Parameters
+        ----------
+        r_max, r_step, title, show_progress
+            Forwarded to :meth:`export_g2_html`.
+        height
+            Iframe height in pixels.
+        """
+        from IPython.display import HTML
+        html = self.export_g2_html(
+            None, r_max=r_max, r_step=r_step,
+            title=title, show_progress=show_progress,
+        )
+        import html as _html
+        escaped = _html.escape(html, quote=True)
+        # Wrap the iframe in a <div> so IPython's HTML helper doesn't
+        # trigger its "Consider using IPython.display.IFrame instead"
+        # warning - IFrame requires a URL or file path and can't embed
+        # our self-contained HTML directly, so srcdoc is what we want.
+        return HTML(
+            f'<div class="tricor-g2-wrapper" style="width:100%">'
+            f'<iframe srcdoc="{escaped}" '
+            f'style="width:100%; height:{int(height)}px; '
+            f'border:1px solid rgba(0,0,0,0.1); border-radius:6px;"></iframe>'
+            f'</div>'
+        )
 
     def plot_structure(
         self: "Supercell",

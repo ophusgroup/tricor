@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>tricor g2 viewer</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; color: #333; }
+  #container { display: grid; grid-template-rows: auto 1fr auto; height: 100vh; background: #f7f8f5; }
+  #title { padding: 8px 16px; font-weight: 600; font-size: 14px; border-bottom: 1px solid rgba(0,0,0,0.06); background: rgba(255,255,255,0.5); }
+  #title:empty { display: none; }
+  #main { padding: 12px 16px; min-height: 0; position: relative; }
+  #profile-wrap { position: relative; height: 100%; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #controls {
+    padding: 8px 16px; background: rgba(255,255,255,0.6);
+    border-top: 1px solid rgba(0,0,0,0.06);
+    display: flex; align-items: center; gap: 16px; font-size: 12px;
+    flex-wrap: wrap;
+  }
+  select { font: inherit; padding: 3px 6px; border-radius: 4px; border: 1px solid rgba(0,0,0,0.2); background: #fff; }
+  .tricor-checkbox-row { display: flex; align-items: center; gap: 6px; }
+  #controls label { display: flex; align-items: center; gap: 6px; }
+</style>
+</head>
+<body>
+<div id="container">
+  <div id="title"></div>
+  <div id="main"><div id="profile-wrap"><canvas id="profile"></canvas></div></div>
+  <div id="controls">
+    <label>pair
+      <select id="pair-select"></select>
+    </label>
+    <label class="tricor-checkbox-row">
+      <input type="checkbox" id="overlay-all"/>
+      overlay all pairs
+    </label>
+    <span id="info" style="opacity: 0.65;"></span>
+  </div>
+</div>
+<script>
+const DATA = __TRICOR_DATA_PLACEHOLDER__;
+
+document.getElementById("title").textContent = DATA.title || "";
+document.getElementById("container").style.background = DATA.background_color || "#f7f8f5";
+
+const pairLabels = DATA.pair_labels;            // e.g. ["Si-Si", "Si-O", "O-O"]
+const pairPeaks = DATA.pair_peaks || [];         // per-pair first-shell peak r, optional
+const profiles = DATA.profiles.map(a => new Float32Array(a));
+const rCenters = DATA.r_centers;
+const rEdges = DATA.r_edges;
+
+const rAxisMax = rCenters[rCenters.length - 1] + 0.5 * (rCenters[1] - rCenters[0]);
+
+let currentPair = (typeof DATA.default_pair === "number")
+  ? Math.max(0, Math.min(pairLabels.length - 1, DATA.default_pair))
+  : 0;
+let overlayAll = false;
+
+// A palette for the overlay-all mode
+const PALETTE = [
+  "#2a6e4e", "#b4553b", "#4a6fa5", "#a24f8a",
+  "#7a8a3a", "#3a7a9a", "#9a6a2a", "#5a5a8a",
+  "#8b3a5a", "#3a8a6a", "#8a8a3a", "#6a3a8a",
+];
+
+const profileCanvas = document.getElementById("profile");
+const profileCtx = profileCanvas.getContext("2d");
+const PAD_L = 54, PAD_R = 16;
+const PAD_T = 10, PAD_B = 28;
+
+function fitCanvas(canvas, wrap) {
+  const w = wrap.clientWidth;
+  const h = wrap.clientHeight;
+  if (w === 0 || h === 0) return null;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  canvas.style.width = `${w}px`;
+  canvas.style.height = `${h}px`;
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  return { w, h };
+}
+
+function drawProfile() {
+  const wrap = document.getElementById("profile-wrap");
+  const fit = fitCanvas(profileCanvas, wrap);
+  if (!fit) return;
+  const { w, h } = fit;
+  const plotW = Math.max(0, w - PAD_L - PAD_R);
+  const plotH = Math.max(0, h - PAD_T - PAD_B);
+
+  profileCtx.fillStyle = "#fff";
+  profileCtx.fillRect(PAD_L, PAD_T, plotW, plotH);
+
+  // Determine the profiles we're drawing + global y-range.
+  const drawIndices = overlayAll
+    ? pairLabels.map((_, i) => i)
+    : [currentPair];
+  let yMax = 0;
+  for (const i of drawIndices) {
+    const p = profiles[i];
+    for (let k = 0; k < p.length; k++) {
+      if (isFinite(p[k]) && p[k] > yMax) yMax = p[k];
+    }
+  }
+  yMax = Math.max(yMax * 1.1, 1.5);
+
+  // g(r) = 1 reference
+  const yOne = PAD_T + plotH - (1.0 / yMax) * plotH;
+  profileCtx.strokeStyle = "rgba(0,0,0,0.25)";
+  profileCtx.lineWidth = 1;
+  profileCtx.setLineDash([4, 3]);
+  profileCtx.beginPath();
+  profileCtx.moveTo(PAD_L, yOne);
+  profileCtx.lineTo(PAD_L + plotW, yOne);
+  profileCtx.stroke();
+  profileCtx.setLineDash([]);
+
+  // Draw each profile
+  drawIndices.forEach((idx, slot) => {
+    const profile = profiles[idx];
+    const color = overlayAll ? PALETTE[slot % PALETTE.length] : "#2a6e4e";
+    profileCtx.strokeStyle = color;
+    profileCtx.lineWidth = 1.6;
+    profileCtx.beginPath();
+    for (let k = 0; k < profile.length; k++) {
+      const rC = rCenters[k];
+      const v = profile[k];
+      const x = PAD_L + (rC / rAxisMax) * plotW;
+      const y = PAD_T + plotH - Math.max(0, Math.min(1, v / yMax)) * plotH;
+      if (k === 0) profileCtx.moveTo(x, y);
+      else profileCtx.lineTo(x, y);
+    }
+    profileCtx.stroke();
+
+    // Optional pair-peak marker
+    if (pairPeaks[idx] && pairPeaks[idx] > 0) {
+      const px = PAD_L + (pairPeaks[idx] / rAxisMax) * plotW;
+      profileCtx.strokeStyle = color;
+      profileCtx.globalAlpha = 0.4;
+      profileCtx.setLineDash([3, 3]);
+      profileCtx.beginPath();
+      profileCtx.moveTo(px, PAD_T);
+      profileCtx.lineTo(px, PAD_T + plotH);
+      profileCtx.stroke();
+      profileCtx.setLineDash([]);
+      profileCtx.globalAlpha = 1.0;
+    }
+  });
+
+  // Frame
+  profileCtx.strokeStyle = "#333";
+  profileCtx.lineWidth = 1;
+  profileCtx.strokeRect(PAD_L, PAD_T, plotW, plotH);
+
+  // Axes text
+  profileCtx.fillStyle = "#333";
+  profileCtx.font = "11px ui-sans-serif, system-ui";
+
+  // X ticks (r)
+  const xTicks = [0, 2, 4, 6, 8, 10, 12].filter(t => t <= rAxisMax + 1e-6);
+  profileCtx.textAlign = "center";
+  profileCtx.textBaseline = "top";
+  for (const t of xTicks) {
+    const x = PAD_L + (t / rAxisMax) * plotW;
+    profileCtx.beginPath();
+    profileCtx.moveTo(x, PAD_T + plotH);
+    profileCtx.lineTo(x, PAD_T + plotH + 4);
+    profileCtx.stroke();
+    profileCtx.fillText(String(t), x, PAD_T + plotH + 5);
+  }
+  profileCtx.textBaseline = "alphabetic";
+  profileCtx.fillText("r (Å)", PAD_L + plotW / 2, h - 4);
+
+  // Y ticks
+  profileCtx.textAlign = "right";
+  profileCtx.textBaseline = "middle";
+  const yDecimals = yMax >= 10 ? 0 : 1;
+  const yTicks = [0, 1.0, yMax];
+  for (const t of yTicks) {
+    const y = PAD_T + plotH - (t / yMax) * plotH;
+    profileCtx.beginPath();
+    profileCtx.moveTo(PAD_L, y);
+    profileCtx.lineTo(PAD_L - 4, y);
+    profileCtx.stroke();
+    profileCtx.fillText(t.toFixed(yDecimals), PAD_L - 6, y);
+  }
+  profileCtx.save();
+  profileCtx.translate(16, PAD_T + plotH / 2);
+  profileCtx.rotate(-Math.PI / 2);
+  profileCtx.textAlign = "center";
+  profileCtx.textBaseline = "alphabetic";
+  profileCtx.fillText(overlayAll ? "g(r)" : `g(r) ${pairLabels[currentPair]}`, 0, 0);
+  profileCtx.restore();
+
+  // Legend in overlay mode
+  if (overlayAll) {
+    const lx = PAD_L + 12;
+    const ly = PAD_T + 14;
+    const lineH = 16;
+    profileCtx.font = "11px ui-sans-serif, system-ui";
+    drawIndices.forEach((idx, slot) => {
+      const color = PALETTE[slot % PALETTE.length];
+      const y = ly + slot * lineH;
+      profileCtx.strokeStyle = color;
+      profileCtx.lineWidth = 2;
+      profileCtx.beginPath();
+      profileCtx.moveTo(lx, y);
+      profileCtx.lineTo(lx + 18, y);
+      profileCtx.stroke();
+      profileCtx.fillStyle = "#333";
+      profileCtx.textAlign = "left";
+      profileCtx.textBaseline = "middle";
+      profileCtx.fillText(pairLabels[idx], lx + 22, y);
+    });
+  }
+}
+
+// Populate dropdown
+const sel = document.getElementById("pair-select");
+pairLabels.forEach((label, i) => {
+  const opt = document.createElement("option");
+  opt.value = String(i);
+  opt.textContent = label;
+  sel.appendChild(opt);
+});
+sel.value = String(currentPair);
+sel.addEventListener("change", () => {
+  currentPair = parseInt(sel.value, 10);
+  drawProfile();
+});
+
+const overlayCb = document.getElementById("overlay-all");
+overlayCb.addEventListener("change", () => {
+  overlayAll = overlayCb.checked;
+  sel.disabled = overlayAll;
+  drawProfile();
+});
+
+const info = document.getElementById("info");
+info.textContent = `${pairLabels.length} pair${pairLabels.length === 1 ? "" : "s"} | ${profiles[0].length} radial bins`;
+
+new ResizeObserver(drawProfile).observe(document.getElementById("main"));
+drawProfile();
+</script>
+</body>
+</html>
