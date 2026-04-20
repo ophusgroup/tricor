@@ -58,9 +58,11 @@ for (let i = 0; i < DATA.structures.length; i++) {
   renderer.setScissorTest(true);
   renderer.setClearColor(new THREE.Color(DATA.background_color || "#f7f8f5"), 1.0);
 
-  // Camera shared across all panels.  Position is determined by the bounding
-  // radius of the largest structure so every panel fits.
-  const camera = new THREE.PerspectiveCamera(28, 1, 0.1, 2000);
+  // Narrow-FOV perspective (fov=14) shared across all panels.  Roughly
+  // "halfway" between the original fov=28 cartoon perspective and fully
+  // orthographic: parallel lattice planes still read as parallel in
+  // crystalline panels but the scene keeps a subtle depth cue.
+  const camera = new THREE.PerspectiveCamera(14, 1, 0.1, 8000);
 
   // Shared scratch
   const sphereGeo = new THREE.SphereGeometry(1, 16, 12);
@@ -237,25 +239,46 @@ for (let i = 0; i < DATA.structures.length; i++) {
       scene.add(bondMesh);
       scene.add(bondOutlineMesh);
     } else {
-      // Translucent tetrahedra.  Each tet has 4 pre-computed vertex
-      // positions (already min-image wrt the centre and centred); expand
-      // them into 4 triangular faces.
+      // Translucent polyhedra (tets / octahedra / cuboctahedra). Each
+      // polyhedron has POLY_N pre-computed vertex positions (min-image
+      // wrt the centre, box-centred, possibly shrunk via polyhedra_scale);
+      // expand into triangular faces.
       const tetVerts = new Float32Array(s.tetrahedra_vertices || []);
       const nTets = s.num_tetrahedra || 0;
+      const POLY_N = DATA.polyhedra_n_vertices || 4;
+      const POLY_FACES_SHARED = DATA.polyhedra_faces || [[0,1,2],[0,1,3],[0,2,3],[1,2,3]];
+      const POLY_EDGES_SHARED = DATA.polyhedra_edges || [[0,1],[0,2],[0,3],[1,2],[1,3],[2,3]];
+      // Per-polyhedron topology (required for cuboctahedra because
+      // random grain rotations break any shared-vertex-ordering
+      // assumption; optional for tets / octahedra).
+      const PERPOLY = !!DATA.polyhedra_per_polyhedron_topology;
+      const facesPerPoly = s.polyhedra_faces_per_poly || [];
+      const edgesPerPoly = s.polyhedra_edges_per_poly || [];
       if (nTets > 0) {
-        const positionsAttr = new Float32Array(nTets * 4 * 3 * 3);
-        const faceIdx = [[0,1,2],[0,1,3],[0,2,3],[1,2,3]];
+        const stride = POLY_N * 3;   // floats per polyhedron
+        // First pass: count total triangle faces (varies per poly when PERPOLY).
+        let totalFaces = 0;
+        if (PERPOLY) {
+          for (let t = 0; t < nTets; t++) totalFaces += (facesPerPoly[t] || []).length;
+        } else {
+          totalFaces = nTets * POLY_FACES_SHARED.length;
+        }
+        const positionsAttr = new Float32Array(totalFaces * 3 * 3);
+        let outFace = 0;
         for (let t = 0; t < nTets; t++) {
-          const base = t * 12;
-          const V = [
-            [tetVerts[base+0],  tetVerts[base+1],  tetVerts[base+2]],
-            [tetVerts[base+3],  tetVerts[base+4],  tetVerts[base+5]],
-            [tetVerts[base+6],  tetVerts[base+7],  tetVerts[base+8]],
-            [tetVerts[base+9],  tetVerts[base+10], tetVerts[base+11]],
-          ];
-          for (let f = 0; f < 4; f++) {
-            const [a, b, c_] = faceIdx[f];
-            const outBase = (t * 4 + f) * 9;
+          const base = t * stride;
+          const V = [];
+          for (let v = 0; v < POLY_N; v++) {
+            V.push([
+              tetVerts[base + v*3 + 0],
+              tetVerts[base + v*3 + 1],
+              tetVerts[base + v*3 + 2],
+            ]);
+          }
+          const faces = PERPOLY ? (facesPerPoly[t] || []) : POLY_FACES_SHARED;
+          for (let f = 0; f < faces.length; f++) {
+            const [a, b, c_] = faces[f];
+            const outBase = outFace * 9;
             positionsAttr[outBase+0] = V[a][0];
             positionsAttr[outBase+1] = V[a][1];
             positionsAttr[outBase+2] = V[a][2];
@@ -265,6 +288,7 @@ for (let i = 0; i < DATA.structures.length; i++) {
             positionsAttr[outBase+6] = V[c_][0];
             positionsAttr[outBase+7] = V[c_][1];
             positionsAttr[outBase+8] = V[c_][2];
+            outFace++;
           }
         }
         const geo = new THREE.BufferGeometry();
@@ -283,23 +307,24 @@ for (let i = 0; i < DATA.structures.length; i++) {
         });
         scene.add(new THREE.Mesh(geo, mat));
 
-        // Edge wireframe for legibility.
         const edgeMat = new THREE.LineBasicMaterial({
           color: 0x111111,
           transparent: true,
           opacity: 0.55,
         });
         const edgeVerts = [];
-        const tetEdges = [[0,1],[0,2],[0,3],[1,2],[1,3],[2,3]];
         for (let t = 0; t < nTets; t++) {
-          const base = t * 12;
-          const V = [
-            [tetVerts[base+0],  tetVerts[base+1],  tetVerts[base+2]],
-            [tetVerts[base+3],  tetVerts[base+4],  tetVerts[base+5]],
-            [tetVerts[base+6],  tetVerts[base+7],  tetVerts[base+8]],
-            [tetVerts[base+9],  tetVerts[base+10], tetVerts[base+11]],
-          ];
-          for (const [a,b] of tetEdges) {
+          const base = t * stride;
+          const V = [];
+          for (let v = 0; v < POLY_N; v++) {
+            V.push([
+              tetVerts[base + v*3 + 0],
+              tetVerts[base + v*3 + 1],
+              tetVerts[base + v*3 + 2],
+            ]);
+          }
+          const edges = PERPOLY ? (edgesPerPoly[t] || []) : POLY_EDGES_SHARED;
+          for (const [a,b] of edges) {
             edgeVerts.push(...V[a], ...V[b]);
           }
         }
@@ -341,13 +366,17 @@ for (let i = 0; i < DATA.structures.length; i++) {
 
   // Camera framing: fit the cube's bounding sphere in whichever direction
   // (vertical or horizontal) is tighter for the current panel aspect.
+  // FIT factor < 1 zooms in (0.81 gives ~10% zoom-in vs just-fit).
   const radius = maxHalfDim * Math.sqrt(3);
+  // FRAME_FIT < 1 zooms in.  0.85 keeps panels just-clear of the grid
+  // gutter at 6-panel layouts (0.81 was slightly overlapping).
+  const FRAME_FIT = 0.85;
   const fovV = camera.fov * Math.PI / 180;
   function computeCamDist(aspect) {
     const halfV = fovV / 2;
     const halfH = Math.atan(aspect * Math.tan(halfV));
     const limit = Math.min(halfV, halfH);
-    return radius / Math.tan(limit) * 0.9;
+    return radius / Math.tan(limit) * FRAME_FIT;
   }
   let camDist = computeCamDist(1.0);  // rough initial value
 

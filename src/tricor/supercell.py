@@ -517,6 +517,29 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
                 self._species, self.atoms.numbers,
             )
             self._rebuild_spatial_index()
+        else:
+            # Liquid path: atoms came from _build_random_atoms() at init
+            # time with purely-random positions.  Apply a close-pair
+            # push matched to this regime's repulsion wall
+            # (hard_core_scale * hard_min), so truly-overlapping pairs
+            # get pre-separated without imposing a sharp pseudo-shell
+            # at exactly hard_min.  Without this step shell_relax can
+            # get pinned by sub-wall pairs that the bond springs hold
+            # in place.
+            from ._grain import _push_close_pairs_apart
+            hard_min = float(np.min(
+                np.asarray(shell_target.pair_hard_min, dtype=np.float64)
+            ))
+            push_cutoff = float(hard_core_scale) * hard_min
+            self.atoms.positions = _push_close_pairs_apart(
+                self.atoms.positions,
+                self.atoms.numbers,
+                self.atoms.cell.array,
+                pbc=self.atoms.pbc,
+                push_cutoff=push_cutoff,
+                max_iter=40,
+            )
+            self._rebuild_spatial_index()
 
         # --- relax ---
         summary = self.shell_relax(

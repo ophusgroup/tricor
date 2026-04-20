@@ -111,9 +111,16 @@ def _tetrahedra_vertex_coords(
     tetrahedra: list[dict],
     positions: np.ndarray,
     cell_matrix: np.ndarray,
+    scale: float = 1.0,
 ) -> list[float]:
-    """Flat list: for each tet, 4 vertex positions (min-image wrt the
-    centre), already centred so the box centre sits at the origin."""
+    """Flat list of vertex positions (min-image wrt centre, box-centred).
+
+    When ``scale < 1`` the polyhedron is shrunk toward its centre -
+    ``scale=0.5`` puts the rendered vertices exactly at the midpoints
+    of the centre-vertex bonds, which is what we want for single-
+    element polyhedra (Si tets, Cu cuboctahedra) where the vertex
+    atoms are the same species as the centre.
+    """
     if not tetrahedra:
         return []
     cell = np.asarray(cell_matrix, dtype=np.float64)
@@ -128,9 +135,354 @@ def _tetrahedra_vertex_coords(
             frac = disp @ cell_inv
             frac -= np.round(frac)
             disp_w = frac @ cell
-            adj = c_pos + disp_w - centre
+            adj = c_pos + float(scale) * disp_w - centre
             out.extend(float(x) for x in adj)
     return out
+
+
+# _polyhedra_vertex_coords is the generalised name; kept as an alias so
+# the rest of the module (and external callers) can use either form.
+_polyhedra_vertex_coords = _tetrahedra_vertex_coords
+
+
+# Face / edge topology tables used by the viewers to build translucent
+# polyhedra meshes.  Indices refer into the per-polyhedron vertex list
+# produced by ``_detect_tetrahedra`` / ``_detect_octahedra``.
+_TET_FACES = [[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]]
+_TET_EDGES = [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]]
+# Octahedra: ``_detect_octahedra`` orders vertices so (0,1), (2,3),
+# (4,5) are antipodal; the 8 faces are all triples that take one vertex
+# from each antipodal pair, the 12 edges are every pair *except* the
+# three antipodal ones.
+_OCT_FACES = [
+    [0, 2, 4], [0, 2, 5], [0, 3, 4], [0, 3, 5],
+    [1, 2, 4], [1, 2, 5], [1, 3, 4], [1, 3, 5],
+]
+_OCT_EDGES = [
+    [0, 2], [0, 3], [0, 4], [0, 5],
+    [1, 2], [1, 3], [1, 4], [1, 5],
+    [2, 4], [2, 5], [3, 4], [3, 5],
+]
+
+
+def _resolve_polyhedra_cfg(
+    tetrahedra: "dict | None",
+    octahedra: "dict | None",
+    cuboctahedra: "dict | None" = None,
+) -> "dict | None":
+    """Normalise user-provided polyhedra dicts into a single config.
+
+    At most one of ``tetrahedra`` / ``octahedra`` / ``cuboctahedra`` may
+    be provided.  Returns ``None`` when none are given.  The returned
+    dict carries:
+
+    - ``center_symbol``, ``vertex_symbol``, ``bond_length``,
+      ``bond_length_tol``, ``ideal_angle_deg``, ``angle_tol_deg`` -
+      detector-level config
+    - ``scale`` - render-time polyhedron shrinkage (1.0 = vertices at
+      actual atom positions, 0.5 = vertices at bond midpoints; handy for
+      single-element polyhedra where corners otherwise sit directly on
+      neighbouring atoms)
+    - ``n_vertices`` (4 / 6 / 12)
+    - ``faces``, ``edges`` - shared face / edge tables (``None`` when
+      topology is per-polyhedron, e.g. cuboctahedra, in which case the
+      detector embeds its own tables)
+    - ``detector``, ``per_polyhedron_topology`` (bool)
+    """
+    provided = [x for x in (tetrahedra, octahedra, cuboctahedra) if x is not None]
+    if len(provided) > 1:
+        raise ValueError(
+            "Pass at most one of 'tetrahedra', 'octahedra', 'cuboctahedra'.",
+        )
+    per_poly = False
+    if tetrahedra is not None:
+        cfg = tetrahedra
+        n_vertices = 4
+        faces, edges = _TET_FACES, _TET_EDGES
+        detector = _detect_tetrahedra
+        ideal_default = 109.47
+        angle_tol_default = 25.0
+        scale_default = 1.0
+    elif octahedra is not None:
+        cfg = octahedra
+        n_vertices = 6
+        faces, edges = _OCT_FACES, _OCT_EDGES
+        detector = _detect_octahedra
+        ideal_default = 90.0
+        angle_tol_default = 18.0
+        scale_default = 1.0
+    elif cuboctahedra is not None:
+        cfg = cuboctahedra
+        n_vertices = 12
+        faces, edges = None, None  # per-polyhedron (embedded in each dict)
+        detector = _detect_cuboctahedra
+        ideal_default = 60.0   # nominal nearest-neighbour angle
+        angle_tol_default = 18.0
+        scale_default = 0.5     # default to half-size for single-element
+        per_poly = True
+    else:
+        return None
+    return {
+        "center_symbol": cfg.get("center_symbol", "Si"),
+        "vertex_symbol": cfg.get("vertex_symbol", "O"),
+        "bond_length": cfg.get("bond_length"),
+        "bond_length_tol": float(cfg.get("bond_length_tol", 0.15)),
+        "ideal_angle_deg": float(cfg.get("ideal_angle_deg", ideal_default)),
+        "angle_tol_deg": float(cfg.get("angle_tol_deg", angle_tol_default)),
+        "scale": float(cfg.get("scale", scale_default)),
+        "n_vertices": n_vertices,
+        "faces": faces,
+        "edges": edges,
+        "detector": detector,
+        "per_polyhedron_topology": per_poly,
+    }
+
+
+def _detect_octahedra(
+    atoms,
+    *,
+    center_symbol: str = "Ti",
+    vertex_symbol: str = "O",
+    bond_length: float | None = None,
+    bond_length_tol: float = 0.18,
+    ideal_angle_deg: float = 90.0,
+    angle_tol_deg: float = 18.0,
+) -> list[dict]:
+    """Find center atoms whose 6 nearest vertex atoms form an octahedron.
+
+    Returns a list of dicts ``{center: int, vertices: list[int]}``.  The
+    six vertex indices are written so pairs (0, 1), (2, 3), (4, 5) are
+    antipodal - i.e. the octahedron is oriented as (±x, ±y, ±z) about
+    the center, which the viewer uses to build the 8 triangular faces
+    ``[[0,2,4],[0,2,5],[0,3,4],[0,3,5],[1,2,4],[1,2,5],[1,3,4],[1,3,5]]``
+    and 12 edges (every pair except the 3 antipodal pairs).
+
+    Acceptance criteria for a candidate centre:
+
+    * Exactly 6 vertex neighbours sit within ``bond_length * (1 \u00b1 tol)``.
+    * Among the 15 pairwise centre-vertex unit-vector angles, 3 are
+      within ``angle_tol_deg`` of 180\u00b0 (the antipodal pairs) and the
+      remaining 12 are within ``angle_tol_deg`` of 90\u00b0.
+
+    When ``bond_length`` is ``None``, the 10th percentile of all
+    centre-vertex distances inside 3.5 \u00c5 is used as an estimate.
+    """
+    from ase.data import atomic_numbers
+
+    Zc = atomic_numbers[center_symbol]
+    Zv = atomic_numbers[vertex_symbol]
+    numbers = np.asarray(atoms.numbers)
+
+    if bond_length is None:
+        bi, bj, bd = neighbor_list("ijd", atoms, 3.5)
+        mask = (numbers[bi] == Zc) & (numbers[bj] == Zv)
+        if not np.any(mask):
+            return []
+        bond_length = float(np.percentile(bd[mask], 10))
+
+    cutoff = float(bond_length) * (1.0 + float(bond_length_tol)) * 1.05
+    bi_all, bj_all, bd_all, bD_all = neighbor_list("ijdD", atoms, float(cutoff))
+
+    keep = (
+        (numbers[bi_all] == Zc)
+        & (numbers[bj_all] == Zv)
+        & (bd_all >= bond_length * (1.0 - bond_length_tol))
+        & (bd_all <= bond_length * (1.0 + bond_length_tol))
+    )
+    if not np.any(keep):
+        return []
+    bi = bi_all[keep]
+    bj = bj_all[keep]
+    bd = bd_all[keep]
+    bD = bD_all[keep]
+
+    order = np.lexsort((bd, bi))
+    bi_s = bi[order]
+    bj_s = bj[order]
+    bD_s = bD[order]
+
+    ideal_rad_90 = float(np.deg2rad(ideal_angle_deg))
+    ideal_rad_180 = float(np.deg2rad(180.0))
+    tol_rad = float(np.deg2rad(angle_tol_deg))
+
+    unique_i, start_idx = np.unique(bi_s, return_index=True)
+    end_idx = np.concatenate([start_idx[1:], [bi_s.size]])
+
+    octahedra: list[dict] = []
+    for u, s, e in zip(unique_i, start_idx, end_idx):
+        if int(e - s) < 6:
+            continue
+        js = bj_s[s : s + 6]
+        vs = bD_s[s : s + 6]
+        norms = np.linalg.norm(vs, axis=1)
+        if np.any(norms < 1e-6):
+            continue
+        unit = vs / norms[:, None]
+        cos_ab = np.clip(unit @ unit.T, -1.0, 1.0)
+        angles = np.arccos(cos_ab)
+        triu_i, triu_j = np.triu_indices(6, k=1)
+        pair_angles = angles[triu_i, triu_j]
+
+        # Identify the 3 antipodal pairs (angle ~ 180).
+        anti_mask = np.abs(pair_angles - ideal_rad_180) <= tol_rad
+        if int(np.sum(anti_mask)) != 3:
+            continue
+
+        anti_pairs = list(zip(triu_i[anti_mask].tolist(), triu_j[anti_mask].tolist()))
+        # Every vertex must appear in exactly one antipodal pair.
+        anti_of = [-1] * 6
+        ok = True
+        for a, b in anti_pairs:
+            if anti_of[a] != -1 or anti_of[b] != -1:
+                ok = False
+                break
+            anti_of[a] = b
+            anti_of[b] = a
+        if not ok or -1 in anti_of:
+            continue
+
+        # Remaining 12 angles must all be ~ 90.
+        rem_mask = ~anti_mask
+        if float(np.max(np.abs(pair_angles[rem_mask] - ideal_rad_90))) > tol_rad:
+            continue
+
+        # Re-order so (0,1), (2,3), (4,5) are the antipodal pairs.
+        order_local: list[int] = []
+        visited = [False] * 6
+        for v in range(6):
+            if visited[v]:
+                continue
+            w = anti_of[v]
+            order_local.extend([v, w])
+            visited[v] = True
+            visited[w] = True
+
+        verts = [int(js[k]) for k in order_local]
+        octahedra.append({"center": int(u), "vertices": verts})
+    return octahedra
+
+
+def _detect_cuboctahedra(
+    atoms,
+    *,
+    center_symbol: str = "Cu",
+    vertex_symbol: str = "Cu",
+    bond_length: float | None = None,
+    bond_length_tol: float = 0.15,
+    ideal_angle_deg: float | None = None,   # unused (API parity)
+    angle_tol_deg: float = 18.0,
+    distance_tol: float = 0.15,
+) -> list[dict]:
+    """Find centers with 12 nearest vertex neighbours forming a
+    close-packed (FCC) cuboctahedron.
+
+    Acceptance:
+
+    * Exactly 12 vertex neighbours within ``bond_length * (1 \u00b1 tol)``.
+    * Max/min of the 12 centre-vertex distances must be within
+      ``distance_tol`` of the mean (catches 13th-nearest-neighbour
+      interlopers).
+    * 60\u00b0 / 90\u00b0 / 120\u00b0 / 180\u00b0 angular spectrum is expected but not
+      strictly enforced; instead the per-polyhedron face / edge topology
+      is recomputed from the convex hull of the 12 unit vectors so the
+      filter stays permissive for slightly-rotated shells.
+
+    Each returned dict carries its own ``faces`` (20 triangles, two per
+    square face plus the eight corner triangles) and ``edges`` (24
+    cuboctahedron edges, square-face diagonals filtered out by length).
+    """
+    from ase.data import atomic_numbers
+    from scipy.spatial import ConvexHull
+
+    Zc = atomic_numbers[center_symbol]
+    Zv = atomic_numbers[vertex_symbol]
+    numbers = np.asarray(atoms.numbers)
+
+    if bond_length is None:
+        bi0, bj0, bd0 = neighbor_list("ijd", atoms, 4.0)
+        mask0 = (numbers[bi0] == Zc) & (numbers[bj0] == Zv)
+        if not np.any(mask0):
+            return []
+        bond_length = float(np.percentile(bd0[mask0], 10))
+
+    cutoff = float(bond_length) * (1.0 + float(bond_length_tol)) * 1.05
+    bi_all, bj_all, bd_all, bD_all = neighbor_list("ijdD", atoms, float(cutoff))
+    keep = (
+        (numbers[bi_all] == Zc)
+        & (numbers[bj_all] == Zv)
+        & (bd_all >= bond_length * (1.0 - bond_length_tol))
+        & (bd_all <= bond_length * (1.0 + bond_length_tol))
+    )
+    if not np.any(keep):
+        return []
+    bi = bi_all[keep]
+    bj = bj_all[keep]
+    bd = bd_all[keep]
+    bD = bD_all[keep]
+
+    order = np.lexsort((bd, bi))
+    bi_s = bi[order]
+    bj_s = bj[order]
+    bd_s = bd[order]
+    bD_s = bD[order]
+
+    unique_i, start_idx = np.unique(bi_s, return_index=True)
+    end_idx = np.concatenate([start_idx[1:], [bi_s.size]])
+
+    cubocta: list[dict] = []
+    for u, s, e in zip(unique_i, start_idx, end_idx):
+        n = int(e - s)
+        if n < 12:
+            continue
+        js = bj_s[s : s + 12]
+        vs = bD_s[s : s + 12]
+        ds = bd_s[s : s + 12]
+        norms = np.linalg.norm(vs, axis=1)
+        if np.any(norms < 1e-6):
+            continue
+        mean_d = float(np.mean(ds))
+        if (ds.max() - ds.min()) / max(mean_d, 1e-6) > 2.0 * distance_tol:
+            continue
+
+        unit = vs / norms[:, None]
+        # Convex-hull triangulation of the 12 unit directions gives 20
+        # triangles (8 corner tris + 12 split-square tris) on an ideal
+        # cuboctahedron.  Works for distorted shells too.
+        try:
+            hull = ConvexHull(unit)
+        except Exception:
+            continue
+        simplices = hull.simplices.tolist()
+
+        # Build edge set from simplices, filter out square-face
+        # diagonals by length (diagonals ~ sqrt(2) vs real edges ~ 1).
+        edge_set: dict[tuple[int, int], float] = {}
+        for tri in simplices:
+            for a, b in [
+                (tri[0], tri[1]),
+                (tri[1], tri[2]),
+                (tri[0], tri[2]),
+            ]:
+                key = (min(a, b), max(a, b))
+                if key in edge_set:
+                    continue
+                edge_set[key] = float(np.linalg.norm(unit[a] - unit[b]))
+        if not edge_set:
+            continue
+        min_edge = min(edge_set.values())
+        edges = [
+            [int(a), int(b)]
+            for (a, b), length in edge_set.items()
+            if length <= min_edge * 1.25
+        ]
+
+        cubocta.append({
+            "center": int(u),
+            "vertices": [int(j) for j in js],
+            "faces": [[int(x) for x in tri] for tri in simplices],
+            "edges": edges,
+        })
+    return cubocta
 
 
 def export_overview_html(
@@ -152,6 +504,12 @@ def export_overview_html(
     tetrahedra: dict | None = None,
     tetrahedra_color=(0.25, 0.65, 0.95),
     tetrahedra_opacity: float = 0.35,
+    octahedra: dict | None = None,
+    octahedra_color=(0.95, 0.55, 0.25),
+    octahedra_opacity: float = 0.4,
+    cuboctahedra: dict | None = None,
+    cuboctahedra_color=(0.55, 0.35, 0.85),
+    cuboctahedra_opacity: float = 0.4,
 ) -> str:
     """Export a grid of static 3D structures as a self-contained HTML file.
 
@@ -160,8 +518,10 @@ def export_overview_html(
     camera that auto-rotates; dragging any panel pauses the rotation and
     orbits manually.
 
-    Passing a ``tetrahedra`` dict switches the per-panel rendering from
-    bonds to translucent polyhedra.  Keys:
+    Passing a ``tetrahedra``, ``octahedra``, or ``cuboctahedra`` dict
+    switches the per-panel rendering from bonds to translucent polyhedra
+    (4-vertex tets, 6-vertex octahedra, or 12-vertex FCC close-packed
+    cuboctahedra respectively).  Keys for either dict:
 
     - ``center_symbol`` (default ``"Si"``) - element at the centre
     - ``vertex_symbol`` (default ``"O"``)  - element at each vertex
@@ -177,16 +537,17 @@ def export_overview_html(
     from ase.data import covalent_radii
     from ase.data.colors import jmol_colors
 
-    tetra_cfg = None
-    if tetrahedra is not None:
-        tetra_cfg = {
-            "center_symbol": tetrahedra.get("center_symbol", "Si"),
-            "vertex_symbol": tetrahedra.get("vertex_symbol", "O"),
-            "bond_length": tetrahedra.get("bond_length"),
-            "bond_length_tol": float(tetrahedra.get("bond_length_tol", 0.15)),
-            "ideal_angle_deg": float(tetrahedra.get("ideal_angle_deg", 109.47)),
-            "angle_tol_deg": float(tetrahedra.get("angle_tol_deg", 25.0)),
-        }
+    tetra_cfg = _resolve_polyhedra_cfg(tetrahedra, octahedra, cuboctahedra)
+    # Pick the right colour/opacity based on which kwarg was supplied.
+    if cuboctahedra is not None:
+        poly_color = cuboctahedra_color
+        poly_opacity = cuboctahedra_opacity
+    elif octahedra is not None:
+        poly_color = octahedra_color
+        poly_opacity = octahedra_opacity
+    else:
+        poly_color = tetrahedra_color
+        poly_opacity = tetrahedra_opacity
 
     def _bond_length_from_shell_target(cell, center_sym, vertex_sym):
         from ase.data import atomic_numbers
@@ -289,14 +650,16 @@ def export_overview_html(
                 bj = np.zeros(0, dtype=np.int32)
             tet_vertices_flat: list[float] = []
             num_tets = 0
+            per_poly_faces: list[list[list[int]]] = []
+            per_poly_edges: list[list[list[int]]] = []
         else:
-            # Tetrahedron mode: skip bonds, find polyhedra.
+            # Polyhedra mode: skip bonds, detect tets / octa / cubocta.
             effective_bond_length = tetra_cfg["bond_length"]
             if effective_bond_length is None:
                 effective_bond_length = _bond_length_from_shell_target(
                     cell, tetra_cfg["center_symbol"], tetra_cfg["vertex_symbol"],
                 )
-            tets = _detect_tetrahedra(
+            polys = tetra_cfg["detector"](
                 atoms,
                 center_symbol=tetra_cfg["center_symbol"],
                 vertex_symbol=tetra_cfg["vertex_symbol"],
@@ -305,11 +668,18 @@ def export_overview_html(
                 ideal_angle_deg=tetra_cfg["ideal_angle_deg"],
                 angle_tol_deg=tetra_cfg["angle_tol_deg"],
             )
-            tet_vertices_flat = _tetrahedra_vertex_coords(
-                tets, atoms.positions, atoms.cell.array,
+            tet_vertices_flat = _polyhedra_vertex_coords(
+                polys, atoms.positions, atoms.cell.array,
+                scale=tetra_cfg["scale"],
             )
             tet_vertices_flat = [round(v, 3) for v in tet_vertices_flat]
-            num_tets = len(tets)
+            num_tets = len(polys)
+            if tetra_cfg["per_polyhedron_topology"]:
+                per_poly_faces = [p["faces"] for p in polys]
+                per_poly_edges = [p["edges"] for p in polys]
+            else:
+                per_poly_faces = []
+                per_poly_edges = []
             bi = np.zeros(0, dtype=np.int32)
             bj = np.zeros(0, dtype=np.int32)
 
@@ -325,6 +695,8 @@ def export_overview_html(
             "cell_matrix": np.round(cell_mat, 3).ravel().tolist(),
             "tetrahedra_vertices": tet_vertices_flat,
             "num_tetrahedra": int(num_tets),
+            "polyhedra_faces_per_poly": per_poly_faces,
+            "polyhedra_edges_per_poly": per_poly_edges,
         })
 
     data = {
@@ -338,8 +710,23 @@ def export_overview_html(
         "title": title,
         "subtitle": subtitle,
         "tetrahedra_mode": tetra_cfg is not None,
-        "tetrahedra_color": list(tetrahedra_color),
-        "tetrahedra_opacity": float(tetrahedra_opacity),
+        "tetrahedra_color": list(poly_color),
+        "tetrahedra_opacity": float(poly_opacity),
+        # Generic polyhedra topology so the viewer can render either
+        # tets (n=4) or octahedra (n=6) without hard-coded tables.
+        "polyhedra_n_vertices": int(tetra_cfg["n_vertices"]) if tetra_cfg else 4,
+        "polyhedra_faces": (
+            tetra_cfg["faces"] if (tetra_cfg and tetra_cfg["faces"] is not None)
+            else _TET_FACES
+        ),
+        "polyhedra_edges": (
+            tetra_cfg["edges"] if (tetra_cfg and tetra_cfg["edges"] is not None)
+            else _TET_EDGES
+        ),
+        "polyhedra_per_polyhedron_topology": bool(
+            tetra_cfg and tetra_cfg["per_polyhedron_topology"]
+        ),
+        "polyhedra_scale": float(tetra_cfg["scale"]) if tetra_cfg else 1.0,
     }
 
     html = _OVERVIEW_HTML_TEMPLATE.replace(
@@ -697,6 +1084,12 @@ class _PlottingMixin:
         tetrahedra: dict | None = None,
         tetrahedra_color=(0.25, 0.65, 0.95),
         tetrahedra_opacity: float = 0.35,
+        octahedra: dict | None = None,
+        octahedra_color=(0.95, 0.55, 0.25),
+        octahedra_opacity: float = 0.4,
+        cuboctahedra: dict | None = None,
+        cuboctahedra_color=(0.55, 0.35, 0.85),
+        cuboctahedra_opacity: float = 0.4,
         show_bonds: bool | None = None,
     ) -> str:
         """Export an interactive 3D trajectory viewer as a self-contained HTML file.
@@ -774,23 +1167,25 @@ class _PlottingMixin:
             else:
                 bond_cutoff = 3.0
 
-        # Tetrahedra topology (from final frame) if requested; disables bonds.
-        tetra_cfg = None
-        if tetrahedra is not None:
-            tetra_cfg = {
-                "center_symbol": tetrahedra.get("center_symbol", "Si"),
-                "vertex_symbol": tetrahedra.get("vertex_symbol", "O"),
-                "bond_length": tetrahedra.get("bond_length"),
-                "bond_length_tol": float(tetrahedra.get("bond_length_tol", 0.15)),
-                "ideal_angle_deg": float(tetrahedra.get("ideal_angle_deg", 109.47)),
-                "angle_tol_deg": float(tetrahedra.get("angle_tol_deg", 25.0)),
-            }
+        # Polyhedra topology (from final frame) if requested; disables bonds.
+        tetra_cfg = _resolve_polyhedra_cfg(tetrahedra, octahedra, cuboctahedra)
+        if cuboctahedra is not None:
+            poly_color = cuboctahedra_color
+            poly_opacity = cuboctahedra_opacity
+        elif octahedra is not None:
+            poly_color = octahedra_color
+            poly_opacity = octahedra_opacity
+        else:
+            poly_color = tetrahedra_color
+            poly_opacity = tetrahedra_opacity
 
         tet_centers: list[int] = []
         tet_vertex_idx: list[int] = []
+        per_poly_faces: list[list[list[int]]] = []
+        per_poly_edges: list[list[list[int]]] = []
 
         # Resolve show_bonds auto-default: bonds follow atoms when no
-        # tetrahedra are requested; tetrahedra supersede bonds otherwise.
+        # polyhedra are requested; polyhedra supersede bonds otherwise.
         if show_bonds is None:
             show_bonds_eff = tetra_cfg is None
         else:
@@ -811,7 +1206,7 @@ class _PlottingMixin:
                             effective_bond_length = v
                     except (IndexError, KeyError):
                         pass
-            tets = _detect_tetrahedra(
+            polys = tetra_cfg["detector"](
                 self.atoms,
                 center_symbol=tetra_cfg["center_symbol"],
                 vertex_symbol=tetra_cfg["vertex_symbol"],
@@ -820,8 +1215,11 @@ class _PlottingMixin:
                 ideal_angle_deg=tetra_cfg["ideal_angle_deg"],
                 angle_tol_deg=tetra_cfg["angle_tol_deg"],
             )
-            tet_centers = [t["center"] for t in tets]
-            tet_vertex_idx = [v for t in tets for v in t["vertices"]]
+            tet_centers = [t["center"] for t in polys]
+            tet_vertex_idx = [v for t in polys for v in t["vertices"]]
+            if tetra_cfg["per_polyhedron_topology"]:
+                per_poly_faces = [p["faces"] for p in polys]
+                per_poly_edges = [p["edges"] for p in polys]
 
         if show_bonds_eff:
             bi_all, bj_all, bd_all = neighbor_list(
@@ -872,8 +1270,27 @@ class _PlottingMixin:
         data["tetrahedra_centers"] = list(tet_centers)
         data["tetrahedra_vertex_indices"] = list(tet_vertex_idx)
         data["num_tetrahedra"] = len(tet_centers)
-        data["tetrahedra_color"] = list(tetrahedra_color)
-        data["tetrahedra_opacity"] = float(tetrahedra_opacity)
+        data["tetrahedra_color"] = list(poly_color)
+        data["tetrahedra_opacity"] = float(poly_opacity)
+        # Generic polyhedra topology so the viewer can render tets
+        # (n=4), octahedra (n=6), or cuboctahedra (n=12).
+        data["polyhedra_n_vertices"] = (
+            int(tetra_cfg["n_vertices"]) if tetra_cfg else 4
+        )
+        data["polyhedra_faces"] = (
+            tetra_cfg["faces"] if (tetra_cfg and tetra_cfg["faces"] is not None)
+            else _TET_FACES
+        )
+        data["polyhedra_edges"] = (
+            tetra_cfg["edges"] if (tetra_cfg and tetra_cfg["edges"] is not None)
+            else _TET_EDGES
+        )
+        data["polyhedra_per_polyhedron_topology"] = bool(
+            tetra_cfg and tetra_cfg["per_polyhedron_topology"]
+        )
+        data["polyhedra_faces_per_poly"] = per_poly_faces
+        data["polyhedra_edges_per_poly"] = per_poly_edges
+        data["polyhedra_scale"] = float(tetra_cfg["scale"]) if tetra_cfg else 1.0
 
         html = _TRAJECTORY_HTML_TEMPLATE.replace(
             "__TRICOR_DATA_PLACEHOLDER__",

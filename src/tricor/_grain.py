@@ -225,6 +225,62 @@ def _random_rotation_matrices(num_grains: int, rng: np.random.Generator) -> np.n
     return matrices
 
 
+def _push_close_pairs_apart(
+    positions: np.ndarray,
+    numbers: np.ndarray,
+    cell_mat: np.ndarray,
+    *,
+    pbc,
+    push_cutoff: float,
+    max_iter: int = 40,
+) -> np.ndarray:
+    """Iteratively push any pair closer than ``push_cutoff`` out to
+    ``push_cutoff`` along the pair axis, wrapping positions back into
+    the cell after each iteration.
+
+    Cheap geometric pre-conditioner used BEFORE shell_relax.  Without
+    it, close pairs introduced by Voronoi-grain overlap padding or by
+    random placement at near-target density can sit below the hard-
+    core wall deep enough that shell_relax never escapes them (the
+    surrounding bond springs hold them in).
+
+    Returns a new positions array.
+    """
+    from ase.neighborlist import neighbor_list as _nl
+
+    if len(positions) == 0 or push_cutoff <= 0:
+        return positions
+    positions = np.asarray(positions, dtype=np.float64).copy()
+    cell_mat = np.asarray(cell_mat, dtype=np.float64)
+    cell_inv = np.linalg.inv(cell_mat)
+    numbers = np.asarray(numbers, dtype=np.int64)
+    for _ in range(int(max_iter)):
+        probe = Atoms(
+            numbers=numbers, positions=positions,
+            cell=cell_mat, pbc=pbc,
+        )
+        ii, jj, dd, DD = _nl("ijdD", probe, float(push_cutoff))
+        if ii.size == 0:
+            break
+        mask_pair = ii < jj
+        if not np.any(mask_pair):
+            break
+        ii = ii[mask_pair]
+        jj = jj[mask_pair]
+        dd = dd[mask_pair]
+        DD = DD[mask_pair]
+        needed = push_cutoff - dd
+        d_safe = np.maximum(dd, 1e-6)
+        unit = DD / d_safe[:, None]
+        step = 0.5 * needed[:, None] * unit
+        np.add.at(positions, jj, step)
+        np.add.at(positions, ii, -step)
+        frac = positions @ cell_inv
+        frac %= 1.0
+        positions = frac @ cell_mat
+    return positions
+
+
 # --------------------------------------------------------------------------
 # Mixin
 # --------------------------------------------------------------------------
@@ -356,27 +412,41 @@ class _GrainMixin:
         )
 
         # ---- 7a. Remove grain-boundary overlaps ----
-        # Rotated neighbouring grains can leave two atoms within << 1 A
+        # Rotated neighbouring grains can leave two atoms almost on top
         # of each other at their shared face; delete one of each such
         # pair.  We prefer to delete the atom whose species is most in
-        # excess of its reference-scaled target; that keeps step 7c
+        # excess of its reference-scaled target; that keeps step 7b
         # (exact target enforcement) from doing extra work, and tends
-        # to preserve stoichiometry at boundaries.  Threshold = 0.9 x
-        # the reference's smallest hard-core distance.
+        # to preserve stoichiometry at boundaries.  Threshold = 0.55 x
+        # the reference's smallest hard-core distance - aggressive
+        # enough to catch real overlaps but lax enough that "merely
+        # distorted" pairs at ~0.7 x hard_min survive to be relaxed by
+        # shell_relax, keeping the initial atom count close to target
+        # and avoiding the close pairs that random padding would
+        # otherwise introduce when the box is already packed.
         hard_min_scalar = float(
             np.min(np.asarray(shell_target.pair_hard_min, dtype=np.float64))
         )
         dup_cutoff = max(0.5, 0.9 * hard_min_scalar)
+        pad_min_sep = dup_cutoff
 
         # Target per-species counts: reference stoichiometry scaled by
-        # (V_box / V_ref) * relative_density.  Matches the liquid path
-        # (Supercell._target_species_counts), so liquid / amorphous /
-        # crystalline regimes all land at the same Si and O counts.
+        # (V_box / V_ref) * relative_density.  Rounding is done via
+        # formula-unit count so the ratio across species stays exact
+        # (matches Supercell._target_species_counts - critical for
+        # multi-species compounds like SrTiO3 where simple per-species
+        # rounding would drift off stoichiometry by an atom or two).
         v_ratio = V_box / max(ref_volume, _EPS)
         rel_density = float(getattr(self, "relative_density", 1.0))
+        _reduced_counts = species_counts.astype(np.int64)
+        _divisor = int(np.gcd.reduce(_reduced_counts)) if _reduced_counts.size else 1
+        _reduced_counts = _reduced_counts // max(_divisor, 1)
+        _atoms_per_formula = int(np.sum(_reduced_counts))
+        _target_total = float(len(ref_numbers)) * v_ratio * rel_density
+        _num_formula_units = max(1, int(round(_target_total / max(_atoms_per_formula, 1))))
         target_by_z: dict[int, int] = {
-            int(z): int(round(float(c) * v_ratio * rel_density))
-            for z, c in zip(unique_species, species_counts)
+            int(z): int(_reduced_counts[i] * _num_formula_units)
+            for i, z in enumerate(unique_species)
         }
 
         if len(positions) > 0:
@@ -450,14 +520,14 @@ class _GrainMixin:
                         frac = delta @ cell_inv_local
                         frac -= np.round(frac)
                         mi = frac @ cell_mat
-                        if float(np.min(np.sum(mi * mi, axis=1))) < dup_cutoff ** 2:
+                        if float(np.min(np.sum(mi * mi, axis=1))) < pad_min_sep ** 2:
                             ok = False
                     if ok and len(added) > 0:
                         delta = added - trial
                         frac = delta @ cell_inv_local
                         frac -= np.round(frac)
                         mi = frac @ cell_mat
-                        if float(np.min(np.sum(mi * mi, axis=1))) < dup_cutoff ** 2:
+                        if float(np.min(np.sum(mi * mi, axis=1))) < pad_min_sep ** 2:
                             ok = False
                     if ok:
                         added = np.vstack([added, trial])
@@ -472,6 +542,17 @@ class _GrainMixin:
                 grain_ids = np.concatenate(
                     [grain_ids, np.full(n_missing, -1, dtype=np.intp)],
                 )
+
+        # ---- 7b.5. Push any residual close pairs apart ----
+        # If padding hit the retry cap and placed atoms in crowded
+        # spots, shell_relax may never escape those local wells.  A few
+        # iterations of pair-repulsion push any pair below hard_min
+        # out to hard_min.  Cheap and pre-empts the "g(r) spike at
+        # half the bond length" failure mode.
+        positions = _push_close_pairs_apart(
+            positions, numbers, cell_mat, pbc=self.reference_atoms.pbc,
+            push_cutoff=hard_min_scalar, max_iter=40,
+        )
 
         # ---- 7c. Optional thermal displacement ----
         if displacement_sigma > _EPS and len(positions) > 0:

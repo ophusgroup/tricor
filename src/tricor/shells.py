@@ -430,6 +430,51 @@ class CoordinationShellTarget:
             summary=summary,
         )
 
+    def with_bonded_species_pairs(
+        self,
+        pairs: "list[tuple[str, str]]",
+    ) -> "CoordinationShellTarget":
+        """Return a copy whose ``coordination_target`` is zero everywhere
+        *except* the given symmetric species pairs.
+
+        Useful for materials with spectator ions: perovskites like
+        SrTiO\u2083 want only Ti-O bonds considered by
+        :meth:`Supercell.shell_relax`, since Sr-O, Sr-Ti, O-O, Ti-Ti, etc.
+        would either install spurious angle springs (``angle_mode_deg``
+        is a geometric artefact for non-bond triplets) or pin atoms via
+        bond springs to distances that are really second-shell
+        separations, not chemical bonds.
+
+        Examples
+        --------
+
+        .. code-block:: python
+
+            # SrTiO3: preserve only TiO6 octahedra
+            st.with_bonded_species_pairs([('Ti', 'O')])
+
+            # SiO2: equivalent to ``with_cross_species_bonds_only`` for a
+            # binary, but explicit about what a bond is
+            st.with_bonded_species_pairs([('Si', 'O')])
+        """
+        from dataclasses import replace as _dc_replace
+        from ase.data import atomic_numbers as _an
+
+        ct = np.zeros_like(np.asarray(self.coordination_target, dtype=np.float64))
+        sp = np.asarray(self.species, dtype=np.int64)
+        orig = np.asarray(self.coordination_target, dtype=np.float64)
+        for sa, sb in pairs:
+            za = int(_an[sa])
+            zb = int(_an[sb])
+            ia_arr = np.where(sp == za)[0]
+            ib_arr = np.where(sp == zb)[0]
+            if ia_arr.size == 0 or ib_arr.size == 0:
+                continue
+            ia, ib = int(ia_arr[0]), int(ib_arr[0])
+            ct[ia, ib] = orig[ia, ib]
+            ct[ib, ia] = orig[ib, ia]
+        return _dc_replace(self, coordination_target=ct)
+
     def with_cross_species_bonds_only(self) -> "CoordinationShellTarget":
         """Return a copy where same-species ``coordination_target`` entries
         are zeroed.
