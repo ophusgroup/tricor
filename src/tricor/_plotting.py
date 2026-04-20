@@ -368,10 +368,10 @@ def _detect_cuboctahedra(
     center_symbol: str = "Cu",
     vertex_symbol: str = "Cu",
     bond_length: float | None = None,
-    bond_length_tol: float = 0.15,
+    bond_length_tol: float = 0.12,
     ideal_angle_deg: float | None = None,   # unused (API parity)
-    angle_tol_deg: float = 18.0,
-    distance_tol: float = 0.15,
+    angle_tol_deg: float = 22.0,
+    distance_tol: float = 0.10,
 ) -> list[dict]:
     """Find centers with 12 nearest vertex neighbours forming a
     close-packed (FCC) cuboctahedron.
@@ -382,10 +382,13 @@ def _detect_cuboctahedra(
     * Max/min of the 12 centre-vertex distances must be within
       ``distance_tol`` of the mean (catches 13th-nearest-neighbour
       interlopers).
-    * 60\u00b0 / 90\u00b0 / 120\u00b0 / 180\u00b0 angular spectrum is expected but not
-      strictly enforced; instead the per-polyhedron face / edge topology
-      is recomputed from the convex hull of the 12 unit vectors so the
-      filter stays permissive for slightly-rotated shells.
+    * All 66 pairwise centre-vertex unit-vector angles must lie within
+      ``angle_tol_deg`` of one of the four canonical FCC values
+      {60\u00b0, 90\u00b0, 120\u00b0, 180\u00b0}.  This is what distinguishes a real
+      cuboctahedron from a disordered close-packed shell whose atoms
+      happen to fall within the radial tolerance - without this test
+      the detector counts amorphous clusters as cuboctahedra because
+      they too have ~12 nearest neighbours.
 
     Each returned dict carries its own ``faces`` (20 triangles, two per
     square face plus the eight corner triangles) and ``edges`` (24
@@ -445,9 +448,20 @@ def _detect_cuboctahedra(
             continue
 
         unit = vs / norms[:, None]
+        # Angular spectrum check: every pairwise angle must be close
+        # to one of {60, 90, 120, 180} deg.  Amorphous close-packed
+        # clusters fail this test; real cuboctahedra pass.
+        cos_pairs = np.clip(unit @ unit.T, -1.0, 1.0)
+        triu_i, triu_j = np.triu_indices(12, k=1)
+        pair_angles_deg = np.rad2deg(np.arccos(cos_pairs[triu_i, triu_j]))
+        target_angles = np.array([60.0, 90.0, 120.0, 180.0])
+        # distance (in degrees) to the nearest target angle, per pair
+        dev = np.abs(pair_angles_deg[:, None] - target_angles[None, :]).min(axis=1)
+        if float(dev.max()) > angle_tol_deg:
+            continue
         # Convex-hull triangulation of the 12 unit directions gives 20
         # triangles (8 corner tris + 12 split-square tris) on an ideal
-        # cuboctahedron.  Works for distorted shells too.
+        # cuboctahedron.  Works for slightly-distorted shells too.
         try:
             hull = ConvexHull(unit)
         except Exception:

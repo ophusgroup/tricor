@@ -364,6 +364,14 @@ class _GrainMixin:
         )
         if single_box_grain:
             rotations = np.broadcast_to(np.eye(3), (num_grains, 3, 3)).copy()
+            # Every grain shares the same seed offset so that the tiles
+            # produced by the (identity-rotated) master block match at
+            # the Voronoi cell boundaries - without this, each grain
+            # has a different random offset and adjacent grains produce
+            # mismatched copies of the same lattice, creating boundary
+            # distortions that ruin the crystalline structure.
+            shared_seed = seeds[0].copy()
+            seeds = np.broadcast_to(shared_seed, seeds.shape).copy()
         else:
             rotations = _random_rotation_matrices(num_grains, self.rng)
 
@@ -427,8 +435,32 @@ class _GrainMixin:
         hard_min_scalar = float(
             np.min(np.asarray(shell_target.pair_hard_min, dtype=np.float64))
         )
-        dup_cutoff = max(0.5, 0.9 * hard_min_scalar)
-        pad_min_sep = dup_cutoff
+        # For single-box-grain (a single coherent tile covering the
+        # whole supercell), skip overlap removal + random padding
+        # entirely: the only "close pairs" are PBC-wrap artefacts where
+        # the reference lattice is incommensurate with the supercell.
+        # Deleting them wrecks the FCC geometry (we'd have to
+        # random-pad the shortfall back in); instead we rely on step
+        # 7b.5's push pass.
+        #
+        # For multi-grain *crystalline* builds, keep overlap removal
+        # but use a much tighter cutoff so we only delete genuine
+        # atom-on-atom collisions from adjacent rotated grains, not
+        # merely-distorted boundary neighbours.  Pairs at ~0.7-0.9 x
+        # hard_min are boundary distortions that the push step +
+        # shell_relax can fix without destroying the crystalline
+        # interiors.  pad_min_sep stays at the old tight value so any
+        # random padding still respects the hard-core exclusion.
+        skip_overlap_removal = bool(single_box_grain)
+        is_crystalline_build = (
+            int(np.sum(is_crystalline)) > 0
+            and crystalline_fraction >= 0.9
+        )
+        if is_crystalline_build:
+            dup_cutoff = max(0.5, 0.7 * hard_min_scalar)
+        else:
+            dup_cutoff = max(0.5, 0.9 * hard_min_scalar)
+        pad_min_sep = max(0.5, 0.9 * hard_min_scalar)
 
         # Target per-species counts: reference stoichiometry scaled by
         # (V_box / V_ref) * relative_density.  Rounding is done via
@@ -449,7 +481,7 @@ class _GrainMixin:
             for i, z in enumerate(unique_species)
         }
 
-        if len(positions) > 0:
+        if len(positions) > 0 and not skip_overlap_removal:
             from ase.neighborlist import neighbor_list
 
             probe = Atoms(
@@ -491,10 +523,21 @@ class _GrainMixin:
         # dropping surplus or padding with new random atoms.  Padding
         # atoms try to respect the hard-core separation but accept
         # looser placement if the retry budget is exhausted (rare for
-        # small shortfalls).  This guarantees identical Si and O counts
-        # across every SiO2 regime so direct g3 / relax comparisons are
-        # apples-to-apples.
+        # small shortfalls).  Skipped for single-box-grain where the
+        # coherent FCC tile should be preserved intact: random padding
+        # would break the FCC order at the padded positions, and the
+        # visible atom count differs from the liquid-path target by at
+        # most a few percent (incommensurate-box wrap artefact), which
+        # we accept.
         cell_inv_local = np.linalg.inv(cell_mat)
+        # Skip random padding for any crystalline grain build.  We keep
+        # the drop-surplus side of exact-count enforcement so the atom
+        # count doesn't drift upward, but we don't inject random atoms
+        # into a near-full box - that was the main source of sub-
+        # hard_min pairs that shell_relax couldn't escape.
+        skip_padding = skip_overlap_removal or is_crystalline_build
+        if skip_overlap_removal:
+            target_by_z = {}   # skip exact-count adjustment
         for z, target in target_by_z.items():
             idx = np.where(numbers == z)[0]
             current = int(len(idx))
@@ -507,7 +550,7 @@ class _GrainMixin:
                 positions = positions[keep]
                 numbers = numbers[keep]
                 grain_ids = grain_ids[keep]
-            elif current < target:
+            elif current < target and not skip_padding:
                 n_missing = target - current
                 added = np.empty((0, 3), dtype=np.float64)
                 tries = 0
@@ -544,14 +587,15 @@ class _GrainMixin:
                 )
 
         # ---- 7b.5. Push any residual close pairs apart ----
-        # If padding hit the retry cap and placed atoms in crowded
-        # spots, shell_relax may never escape those local wells.  A few
-        # iterations of pair-repulsion push any pair below hard_min
-        # out to hard_min.  Cheap and pre-empts the "g(r) spike at
-        # half the bond length" failure mode.
+        # For crystalline grain builds, only push pairs below the tight
+        # dup_cutoff so boundary distortions (at 0.5-0.9 x hard_min)
+        # survive the pre-conditioner and get resolved by shell_relax
+        # via bond + repulsion springs.  For non-crystalline / liquid-
+        # path cases we still push to hard_min.
+        push_cutoff = dup_cutoff if is_crystalline_build else hard_min_scalar
         positions = _push_close_pairs_apart(
             positions, numbers, cell_mat, pbc=self.reference_atoms.pbc,
-            push_cutoff=hard_min_scalar, max_iter=40,
+            push_cutoff=push_cutoff, max_iter=40,
         )
 
         # ---- 7c. Optional thermal displacement ----
