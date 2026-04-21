@@ -131,6 +131,12 @@ class CoordinationShellTarget:
     angle_target: np.ndarray
     angle_pair_mass_target: np.ndarray
     angle_mode_deg: np.ndarray
+    # Per-triplet mask that controls whether ``shell_relax`` installs an
+    # angle spring for that triplet type.  Bond-distance springs are
+    # unaffected.  Useful for multi-modal shells (SrO\u2081\u2082
+    # cuboctahedron, Sr-O-Sr triplets in SrTiO\u2083) where forcing a
+    # single ``angle_mode_deg`` would strain pairs at the other modes.
+    angle_enabled_mask: np.ndarray
     motif_center_species: np.ndarray
     motif_neighbor_species: tuple[np.ndarray, ...]
     motif_neighbor_vectors: tuple[np.ndarray, ...]
@@ -270,6 +276,10 @@ class CoordinationShellTarget:
         angle_target = np.zeros((angle_index.shape[0], phi_num_bins), dtype=np.float64)
         angle_pair_mass_target = np.zeros(angle_index.shape[0], dtype=np.float64)
         angle_mode_deg = np.zeros(angle_index.shape[0], dtype=np.float64)
+        # Default: angle springs enabled for every triplet type.  Use
+        # ``with_angle_triplets`` / ``without_angle_triplets`` to mask
+        # specific triplets for multi-modal shells.
+        angle_enabled_mask = np.ones(angle_index.shape[0], dtype=bool)
         motif_center_species: list[int] = []
         motif_neighbor_species: list[np.ndarray] = []
         motif_neighbor_vectors: list[np.ndarray] = []
@@ -422,6 +432,7 @@ class CoordinationShellTarget:
             angle_target=angle_target,
             angle_pair_mass_target=angle_pair_mass_target,
             angle_mode_deg=angle_mode_deg,
+            angle_enabled_mask=angle_enabled_mask,
             motif_center_species=np.asarray(motif_center_species, dtype=np.intp),
             motif_neighbor_species=tuple(motif_neighbor_species),
             motif_neighbor_vectors=tuple(motif_neighbor_vectors),
@@ -591,6 +602,9 @@ class CoordinationShellTarget:
         angle_target = np.zeros((angle_index_new.shape[0], phi_num_bins), dtype=np.float64)
         angle_pair_mass_target = np.zeros(angle_index_new.shape[0], dtype=np.float64)
         angle_mode_deg = np.zeros(angle_index_new.shape[0], dtype=np.float64)
+        # Default: True everywhere; cross-source triplets will never fire
+        # anyway because their coordination_target is zero.
+        angle_enabled_mask = np.ones(angle_index_new.shape[0], dtype=bool)
 
         # Copy triplets where all three species come from the same source.
         for ki, key in enumerate(keys):
@@ -601,6 +615,11 @@ class CoordinationShellTarget:
             src_angle_target = np.asarray(t.angle_target, dtype=np.float64)
             src_angle_mass = np.asarray(t.angle_pair_mass_target, dtype=np.float64)
             src_angle_mode = np.asarray(t.angle_mode_deg, dtype=np.float64)
+            src_angle_mask = np.asarray(
+                getattr(t, "angle_enabled_mask",
+                        np.ones(src_angle_index.shape[0], dtype=bool)),
+                dtype=bool,
+            )
             for local_t, (lc, ln1, ln2) in enumerate(src_angle_index):
                 gc = int(a + lc)
                 gn1 = int(a + ln1)
@@ -609,10 +628,7 @@ class CoordinationShellTarget:
                 angle_target[new_t] = src_angle_target[local_t]
                 angle_pair_mass_target[new_t] = float(src_angle_mass[local_t])
                 angle_mode_deg[new_t] = float(src_angle_mode[local_t])
-            # angle_lookup entries for cross-source triplets remain at
-            # the default (-1 replaced by a valid idx during enumeration,
-            # but those triplets carry zero mass / mode and no spring
-            # because coordination_target[cross] == 0.)
+                angle_enabled_mask[new_t] = bool(src_angle_mask[local_t])
             del src_angle_lookup  # silence unused
 
         # --- concatenate motif arrays with species remapping ---
@@ -674,6 +690,7 @@ class CoordinationShellTarget:
             angle_target=angle_target,
             angle_pair_mass_target=angle_pair_mass_target,
             angle_mode_deg=angle_mode_deg,
+            angle_enabled_mask=angle_enabled_mask,
             motif_center_species=np.asarray(motif_center_species_list, dtype=np.intp),
             motif_neighbor_species=tuple(motif_neighbor_species_list),
             motif_neighbor_vectors=tuple(motif_neighbor_vectors_list),
@@ -746,6 +763,89 @@ class CoordinationShellTarget:
         for i in range(ct.shape[0]):
             ct[i, i] = 0.0
         return _dc_replace(self, coordination_target=ct)
+
+    def with_angle_triplets(
+        self,
+        triplets: "list[tuple[str, str, str]]",
+    ) -> "CoordinationShellTarget":
+        """Return a copy whose angle-spring mask is enabled *only* for
+        the listed triplet types; all other angle springs are disabled.
+
+        Each triplet is ``(centre_symbol, neighbour_1_symbol,
+        neighbour_2_symbol)``; both (n1, n2) and (n2, n1) are enabled
+        automatically.  Bond-distance springs are untouched — only the
+        angle springs installed during ``shell_relax`` are filtered.
+
+        Useful for multi-modal shells where the extracted
+        ``angle_mode_deg`` picks one peak of a bimodal / quadrimodal
+        distribution; enforcing it would strain the other modes.
+        SrTiO\u2083's SrO\u2081\u2082 cuboctahedron (O-Sr-O angles at
+        60°/90°/120°/180°) is the canonical example.
+
+        .. code-block:: python
+
+            # Keep Ti-centered 90° and linear O-Ti-Ti 180° angle
+            # springs; silence every Sr-centered or Sr-in-triplet
+            # angle spring.
+            st.with_angle_triplets([
+                ('Ti', 'O', 'O'),
+                ('O',  'Ti', 'Ti'),
+            ])
+        """
+        from dataclasses import replace as _dc_replace
+        from ase.data import atomic_numbers as _an
+
+        sp = np.asarray(self.species, dtype=np.int64)
+        ai = np.asarray(self.angle_index, dtype=np.intp)
+        mask = np.zeros(ai.shape[0], dtype=bool)
+
+        def _species_slots(sym: str) -> np.ndarray:
+            return np.where(sp == int(_an[sym]))[0]
+
+        for centre_sym, n1_sym, n2_sym in triplets:
+            c_idx = _species_slots(centre_sym)
+            n1_idx = _species_slots(n1_sym)
+            n2_idx = _species_slots(n2_sym)
+            if c_idx.size == 0 or n1_idx.size == 0 or n2_idx.size == 0:
+                continue
+            for ci in c_idx:
+                for a_i in n1_idx:
+                    for b_i in n2_idx:
+                        # Canonical order: neigh_1 <= neigh_2.
+                        lo, hi = (int(a_i), int(b_i)) if a_i <= b_i else (int(b_i), int(a_i))
+                        t = int(self.angle_lookup[int(ci), lo, hi])
+                        if t >= 0:
+                            mask[t] = True
+        return _dc_replace(self, angle_enabled_mask=mask)
+
+    def without_angle_triplets(
+        self,
+        triplets: "list[tuple[str, str, str]]",
+    ) -> "CoordinationShellTarget":
+        """Return a copy with the angle mask disabled for the listed
+        triplets (inverse of :meth:`with_angle_triplets`).
+        """
+        from dataclasses import replace as _dc_replace
+        from ase.data import atomic_numbers as _an
+
+        sp = np.asarray(self.species, dtype=np.int64)
+        mask = np.asarray(self.angle_enabled_mask, dtype=bool).copy()
+
+        def _species_slots(sym: str) -> np.ndarray:
+            return np.where(sp == int(_an[sym]))[0]
+
+        for centre_sym, n1_sym, n2_sym in triplets:
+            c_idx = _species_slots(centre_sym)
+            n1_idx = _species_slots(n1_sym)
+            n2_idx = _species_slots(n2_sym)
+            for ci in c_idx:
+                for a_i in n1_idx:
+                    for b_i in n2_idx:
+                        lo, hi = (int(a_i), int(b_i)) if a_i <= b_i else (int(b_i), int(a_i))
+                        t = int(self.angle_lookup[int(ci), lo, hi])
+                        if t >= 0:
+                            mask[t] = False
+        return _dc_replace(self, angle_enabled_mask=mask)
 
     @property
     def pair_labels(self) -> list[str]:

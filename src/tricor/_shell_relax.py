@@ -108,6 +108,14 @@ class _ShellRelaxMixin:
             np.asarray(shell_target.angle_mode_deg, dtype=np.float64)
         )
         angle_lookup = np.asarray(shell_target.angle_lookup, dtype=np.intp)
+        # Per-triplet angle-spring mask.  Defaults to all-True for
+        # shell targets produced by older builds that predate the
+        # field, so back-compat is preserved.
+        _default_mask = np.ones(angle_mode_rad.size, dtype=bool)
+        angle_enabled_mask = np.asarray(
+            getattr(shell_target, "angle_enabled_mask", _default_mask),
+            dtype=bool,
+        )
         cutoff = float(shell_target.max_pair_outer * neighbor_cutoff_scale)
 
         # K nearest neighbors per atom, both total and per-species-pair
@@ -354,6 +362,11 @@ class _ShellRelaxMixin:
                             triplet_idx = int(angle_lookup[s_center, s_a, s_b])
                         else:
                             triplet_idx = int(angle_lookup[s_center, s_b, s_a])
+                        # Skip triplets whose angle spring is masked
+                        # off (multi-modal shells; see
+                        # ``CoordinationShellTarget.with_angle_triplets``).
+                        if not angle_enabled_mask[triplet_idx]:
+                            continue
                         phi_t = float(angle_mode_rad[triplet_idx])
                         _tc.append(atom)
                         _ta.append(int(bn[ia]))
