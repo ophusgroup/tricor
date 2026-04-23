@@ -32,6 +32,7 @@ class _ShellRelaxMixin:
         neighbor_update_interval: int = 10,
         neighbor_cutoff_scale: float = 1.5,
         max_force_clip: float = 2.0,
+        capture_trajectory: bool = False,
         show_progress: bool = True,
         save_trajectory: bool = False,
         trajectory_stride: int = 1,
@@ -89,7 +90,15 @@ class _ShellRelaxMixin:
             Summary with parameters and final/initial loss values.
         """
         num_atoms = len(self.atoms)
-        species_idx = self._atom_species_index  # (num_atoms,) int
+        # Prefer the composite-target virtual species mapping if the
+        # caller set one (e.g. sp²/sp³ carbon blends where atomic
+        # number alone can't distinguish the two chemistries);
+        # otherwise fall back to the atomic-number mapping.
+        species_idx = (
+            self._atom_shell_species_index
+            if getattr(self, "_atom_shell_species_index", None) is not None
+            else self._atom_species_index
+        )  # (num_atoms,) int
         cell_inv = self._cell_inverse
         cell_mat = self._cell_matrix
 
@@ -101,6 +110,14 @@ class _ShellRelaxMixin:
             np.asarray(shell_target.angle_mode_deg, dtype=np.float64)
         )
         angle_lookup = np.asarray(shell_target.angle_lookup, dtype=np.intp)
+        # Per-triplet angle-spring mask.  Defaults to all-True for
+        # shell targets produced by older builds that predate the
+        # field, so back-compat is preserved.
+        _default_mask = np.ones(angle_mode_rad.size, dtype=bool)
+        angle_enabled_mask = np.asarray(
+            getattr(shell_target, "angle_enabled_mask", _default_mask),
+            dtype=bool,
+        )
         cutoff = float(shell_target.max_pair_outer * neighbor_cutoff_scale)
 
         # K nearest neighbors per atom, both total and per-species-pair
@@ -347,6 +364,11 @@ class _ShellRelaxMixin:
                             triplet_idx = int(angle_lookup[s_center, s_a, s_b])
                         else:
                             triplet_idx = int(angle_lookup[s_center, s_b, s_a])
+                        # Skip triplets whose angle spring is masked
+                        # off (multi-modal shells; see
+                        # ``CoordinationShellTarget.with_angle_triplets``).
+                        if not angle_enabled_mask[triplet_idx]:
+                            continue
                         phi_t = float(angle_mode_rad[triplet_idx])
                         _tc.append(atom)
                         _ta.append(int(bn[ia]))
@@ -364,6 +386,17 @@ class _ShellRelaxMixin:
         bond_loss_history = np.zeros(num_steps + 1, dtype=np.float64)
         angle_loss_history = np.zeros(num_steps + 1, dtype=np.float64)
         repulsion_loss_history = np.zeros(num_steps + 1, dtype=np.float64)
+
+        if capture_trajectory:
+            trajectory = np.zeros(
+                (num_steps + 1, num_atoms, 3), dtype=np.float32,
+            )
+            atom_cost_history = np.zeros(
+                (num_steps + 1, num_atoms), dtype=np.float32,
+            )
+        else:
+            trajectory = None
+            atom_cost_history = None
 
         current_step = float(step_size)
         velocity = np.zeros((num_atoms, 3), dtype=np.float64)
@@ -397,6 +430,10 @@ class _ShellRelaxMixin:
 
             # ---------- compute forces ----------
             force = np.zeros((num_atoms, 3), dtype=np.float64)
+            if atom_cost_history is not None:
+                atom_cost = np.zeros(num_atoms, dtype=np.float64)
+            else:
+                atom_cost = None
 
             # 1) Bond springs
             bond_loss = 0.0
@@ -410,6 +447,18 @@ class _ShellRelaxMixin:
                 f_bond = (bond_weight * delta_r)[:, None] * bond_hat
                 np.add.at(force, bond_i, f_bond)
                 np.add.at(force, bond_j, -f_bond)
+                if atom_cost is not None:
+                    # Spring-energy contribution: 0.5 * k * delta_r^2
+                    # with k = bond_weight.  Before this the cost
+                    # stored just delta_r^2/2 (unscaled), so weak-
+                    # relax liquids with large residual delta_r
+                    # reported spuriously enormous per-atom costs in
+                    # the trajectory viewer (e.g. Cu liquid with
+                    # bond_weight=0.05 showed cost_max=100 vs Si's
+                    # bond_weight=0.4 showing cost_max=4).
+                    half_bond_cost = 0.5 * float(bond_weight) * delta_r ** 2
+                    np.add.at(atom_cost, bond_i, half_bond_cost)
+                    np.add.at(atom_cost, bond_j, half_bond_cost)
 
             # 2) Angle springs
             angle_loss = 0.0
@@ -431,6 +480,16 @@ class _ShellRelaxMixin:
 
                 delta_phi = phi - tri_phi_target
                 angle_loss = float(np.mean(delta_phi ** 2))
+                if atom_cost is not None:
+                    # 0.5 * angle_weight * delta_phi^2 split 1/3 to
+                    # each of the three triplet atoms.  Same scaling
+                    # rationale as the bond cost above.
+                    third_angle_cost = (
+                        0.5 * float(angle_weight) * delta_phi ** 2 / 3.0
+                    )
+                    np.add.at(atom_cost, tri_center, third_angle_cost)
+                    np.add.at(atom_cost, tri_a, third_angle_cost)
+                    np.add.at(atom_cost, tri_b, third_angle_cost)
 
                 perp_a = (hat_b - cos_phi[:, None] * hat_a) / sin_phi_safe[:, None]
                 perp_b = (hat_a - cos_phi[:, None] * hat_b) / sin_phi_safe[:, None]
@@ -488,12 +547,25 @@ class _ShellRelaxMixin:
                     np.add.at(force, rep_i_all, -f_rep)
                     np.add.at(force, rep_j_all, f_rep)
 
+                if atom_cost is not None and np.any(active):
+                    # Cost = hard-mask indicator + 0.1 * nonbond indicator, split 0.5 / 0.5
+                    per_pair_cost = 0.5 * (
+                        hard_mask.astype(np.float64)
+                        + 0.1 * nonbond_mask.astype(np.float64)
+                    )
+                    np.add.at(atom_cost, rep_i_all, per_pair_cost)
+                    np.add.at(atom_cost, rep_j_all, per_pair_cost)
+
             # ---------- record loss ----------
             total_loss = bond_loss + angle_loss + repulsion_loss / max(num_atoms, 1)
             loss_history[step] = total_loss
             bond_loss_history[step] = bond_loss
             angle_loss_history[step] = angle_loss
             repulsion_loss_history[step] = repulsion_loss
+            if trajectory is not None:
+                trajectory[step] = pos.astype(np.float32)
+            if atom_cost_history is not None and atom_cost is not None:
+                atom_cost_history[step] = atom_cost.astype(np.float32)
             if total_loss < best_loss:
                 best_loss = total_loss
                 best_positions = pos.copy()

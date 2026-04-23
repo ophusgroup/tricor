@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>tricor g2 viewer</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; color: #333; }
+  #container { display: grid; grid-template-rows: auto 1fr auto; height: 100vh; background: #f7f8f5; }
+  #title { padding: 8px 16px; font-weight: 600; font-size: 14px; border-bottom: 1px solid rgba(0,0,0,0.06); background: rgba(255,255,255,0.5); }
+  #title:empty { display: none; }
+  #main { padding: 12px 16px; min-height: 0; position: relative; }
+  #profile-wrap { position: relative; height: 100%; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #controls {
+    padding: 8px 16px; background: rgba(255,255,255,0.6);
+    border-top: 1px solid rgba(0,0,0,0.06);
+    display: flex; align-items: center; gap: 16px; font-size: 12px;
+    flex-wrap: wrap;
+  }
+  select { font: inherit; padding: 3px 6px; border-radius: 4px; border: 1px solid rgba(0,0,0,0.2); background: #fff; }
+  .tricor-checkbox-row { display: flex; align-items: center; gap: 6px; }
+  #controls label { display: flex; align-items: center; gap: 6px; }
+</style>
+</head>
+<body>
+<div id="container">
+  <div id="title"></div>
+  <div id="main"><div id="profile-wrap"><canvas id="profile"></canvas></div></div>
+  <div id="controls">
+    <label>pair
+      <select id="pair-select"></select>
+    </label>
+    <label class="tricor-checkbox-row">
+      <input type="checkbox" id="overlay-all"/>
+      overlay all pairs
+    </label>
+    <span id="info" style="opacity: 0.65;"></span>
+  </div>
+</div>
+<script>
+const DATA = __TRICOR_DATA_PLACEHOLDER__;
+
+document.getElementById("title").textContent = DATA.title || "";
+document.getElementById("container").style.background = DATA.background_color || "#f7f8f5";
+
+const pairLabels = DATA.pair_labels;            // e.g. ["Si-Si", "Si-O", "O-O"]
+const pairPeaks = DATA.pair_peaks || [];         // per-pair first-shell peak r, optional
+const rCenters = DATA.r_centers;
+const rEdges = DATA.r_edges;
+
+// Data shape:
+//  - single-cell mode: profiles = [prof_pair_0, prof_pair_1, ...]
+//  - compare mode:     series = [{label, profiles:[pair_0, pair_1, ...]}, ...]
+// The compare mode renders one curve per series for the currently
+// selected pair (legend shows the series labels).  The single-cell
+// "overlay all pairs" checkbox is hidden when compare mode is active.
+const IS_COMPARE = Array.isArray(DATA.series) && DATA.series.length > 0;
+const seriesLabels = IS_COMPARE ? DATA.series.map(s => s.label) : [""];
+const seriesProfiles = IS_COMPARE
+  ? DATA.series.map(s => s.profiles.map(p => new Float32Array(p)))
+  : [DATA.profiles.map(a => new Float32Array(a))];
+
+const rAxisMax = rCenters[rCenters.length - 1] + 0.5 * (rCenters[1] - rCenters[0]);
+
+let currentPair = (typeof DATA.default_pair === "number")
+  ? Math.max(0, Math.min(pairLabels.length - 1, DATA.default_pair))
+  : 0;
+let overlayAll = false;
+
+// A palette for the overlay-all mode
+const PALETTE = [
+  "#2a6e4e", "#b4553b", "#4a6fa5", "#a24f8a",
+  "#7a8a3a", "#3a7a9a", "#9a6a2a", "#5a5a8a",
+  "#8b3a5a", "#3a8a6a", "#8a8a3a", "#6a3a8a",
+];
+
+const profileCanvas = document.getElementById("profile");
+const profileCtx = profileCanvas.getContext("2d");
+const PAD_L = 54, PAD_R = 16;
+const PAD_T = 10, PAD_B = 28;
+
+function fitCanvas(canvas, wrap) {
+  const w = wrap.clientWidth;
+  const h = wrap.clientHeight;
+  if (w === 0 || h === 0) return null;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  canvas.style.width = `${w}px`;
+  canvas.style.height = `${h}px`;
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  return { w, h };
+}
+
+function drawProfile() {
+  const wrap = document.getElementById("profile-wrap");
+  const fit = fitCanvas(profileCanvas, wrap);
+  if (!fit) return;
+  const { w, h } = fit;
+  const plotW = Math.max(0, w - PAD_L - PAD_R);
+  const plotH = Math.max(0, h - PAD_T - PAD_B);
+
+  profileCtx.fillStyle = "#fff";
+  profileCtx.fillRect(PAD_L, PAD_T, plotW, plotH);
+
+  // In compare mode we draw one curve per SERIES for the current pair.
+  // In single-cell mode, we either draw one curve (current pair) or
+  // all pairs of the one series (overlay-all-pairs checkbox).
+  let drawSpec;  // array of {profile, color, label}
+  if (IS_COMPARE) {
+    drawSpec = seriesLabels.map((lab, si) => ({
+      profile: seriesProfiles[si][currentPair],
+      color: PALETTE[si % PALETTE.length],
+      label: lab,
+    }));
+  } else if (overlayAll) {
+    drawSpec = pairLabels.map((lab, i) => ({
+      profile: seriesProfiles[0][i],
+      color: PALETTE[i % PALETTE.length],
+      label: lab,
+    }));
+  } else {
+    drawSpec = [{
+      profile: seriesProfiles[0][currentPair],
+      color: "#2a6e4e",
+      label: pairLabels[currentPair],
+    }];
+  }
+
+  // Compute per-curve y-range.  In compare mode we stack the curves:
+  // each series is shifted vertically by `offsetStep` so the six
+  // overlaid curves don't smear together.  The order is input order;
+  // the regen scripts pass liquid->nano, so the bottom curve is the
+  // most disordered and the top is the most ordered.
+  let perCurveMax = 0;
+  for (const { profile } of drawSpec) {
+    for (let k = 0; k < profile.length; k++) {
+      if (isFinite(profile[k]) && profile[k] > perCurveMax) perCurveMax = profile[k];
+    }
+  }
+  perCurveMax = Math.max(perCurveMax * 1.1, 1.5);
+
+  let yMax, offsetStep;
+  if (IS_COMPARE && drawSpec.length > 1) {
+    // Each curve gets its own slot of height perCurveMax; offsets
+    // stack them bottom-to-top.  0.42 is tight enough that adjacent
+    // curves visibly overlap at sharp first-shell peaks (desirable:
+    // makes small shifts between regimes easier to eyeball) but wide
+    // enough to keep each curve's baseline and ~2× bulk-average
+    // amplitude readable.
+    offsetStep = perCurveMax * 0.42;
+    yMax = perCurveMax + offsetStep * (drawSpec.length - 1);
+  } else {
+    offsetStep = 0;
+    yMax = perCurveMax;
+  }
+
+  // g(r) = 1 reference - one faint line per curve in stacked mode,
+  // one global line in single-curve mode.
+  profileCtx.strokeStyle = "rgba(0,0,0,0.22)";
+  profileCtx.lineWidth = 1;
+  profileCtx.setLineDash([4, 3]);
+  const refCount = IS_COMPARE && drawSpec.length > 1 ? drawSpec.length : 1;
+  for (let i = 0; i < refCount; i++) {
+    const offY = i * offsetStep;
+    const y = PAD_T + plotH - ((1.0 + offY) / yMax) * plotH;
+    profileCtx.beginPath();
+    profileCtx.moveTo(PAD_L, y);
+    profileCtx.lineTo(PAD_L + plotW, y);
+    profileCtx.stroke();
+  }
+  profileCtx.setLineDash([]);
+
+  // Draw each profile at its stacked offset; remember the label anchor
+  // point so we can write the series name just above the curve near r=0.
+  const labelAnchors = [];
+  drawSpec.forEach(({ profile, color, label }, si) => {
+    const offY = si * offsetStep;
+    profileCtx.strokeStyle = color;
+    profileCtx.lineWidth = 1.6;
+    profileCtx.beginPath();
+    let anchorX = 0, anchorY = 0, anchorSet = false;
+    for (let k = 0; k < profile.length; k++) {
+      const rC = rCenters[k];
+      const v = profile[k];
+      const x = PAD_L + (rC / rAxisMax) * plotW;
+      const shifted = Math.max(0, Math.min(1, (v + offY) / yMax));
+      const y = PAD_T + plotH - shifted * plotH;
+      if (k === 0) profileCtx.moveTo(x, y);
+      else profileCtx.lineTo(x, y);
+      // Pick anchor at the first r ~ 0.3 \u00c5 (sits in the "divergent"
+      // region near zero where labels don't overlap any structure).
+      if (!anchorSet && rC >= 0.3) {
+        anchorX = x;
+        anchorY = y;
+        anchorSet = true;
+      }
+    }
+    profileCtx.stroke();
+    if (anchorSet) labelAnchors.push({ x: anchorX, y: anchorY, color, label });
+  });
+
+  // Inline labels for stacked compare mode: draw each series label
+  // just above its curve at the near-origin anchor.
+  if (IS_COMPARE && drawSpec.length > 1) {
+    profileCtx.font = "11px ui-sans-serif, system-ui";
+    profileCtx.textAlign = "left";
+    profileCtx.textBaseline = "bottom";
+    for (const { x, y, color, label } of labelAnchors) {
+      profileCtx.fillStyle = color;
+      profileCtx.fillText(label, x + 2, y - 3);
+    }
+  }
+
+  // Optional pair-peak marker for the currently-displayed pair
+  if (pairPeaks[currentPair] && pairPeaks[currentPair] > 0) {
+    const px = PAD_L + (pairPeaks[currentPair] / rAxisMax) * plotW;
+    profileCtx.strokeStyle = "#777";
+    profileCtx.globalAlpha = 0.5;
+    profileCtx.setLineDash([3, 3]);
+    profileCtx.beginPath();
+    profileCtx.moveTo(px, PAD_T);
+    profileCtx.lineTo(px, PAD_T + plotH);
+    profileCtx.stroke();
+    profileCtx.setLineDash([]);
+    profileCtx.globalAlpha = 1.0;
+  }
+
+  // Frame
+  profileCtx.strokeStyle = "#333";
+  profileCtx.lineWidth = 1;
+  profileCtx.strokeRect(PAD_L, PAD_T, plotW, plotH);
+
+  // Axes text
+  profileCtx.fillStyle = "#333";
+  profileCtx.font = "11px ui-sans-serif, system-ui";
+
+  // X ticks (r)
+  const xTicks = [0, 2, 4, 6, 8, 10, 12].filter(t => t <= rAxisMax + 1e-6);
+  profileCtx.textAlign = "center";
+  profileCtx.textBaseline = "top";
+  for (const t of xTicks) {
+    const x = PAD_L + (t / rAxisMax) * plotW;
+    profileCtx.beginPath();
+    profileCtx.moveTo(x, PAD_T + plotH);
+    profileCtx.lineTo(x, PAD_T + plotH + 4);
+    profileCtx.stroke();
+    profileCtx.fillText(String(t), x, PAD_T + plotH + 5);
+  }
+  profileCtx.textBaseline = "alphabetic";
+  profileCtx.fillText("r (Å)", PAD_L + plotW / 2, h - 4);
+
+  // Y ticks: only meaningful when not stacked (in compare mode each
+  // curve has its own implicit baseline, so absolute y values on the
+  // axis stop mapping to one g(r) value).
+  const stacked = IS_COMPARE && drawSpec.length > 1;
+  if (!stacked) {
+    profileCtx.textAlign = "right";
+    profileCtx.textBaseline = "middle";
+    const yDecimals = yMax >= 10 ? 0 : 1;
+    const yTicks = [0, 1.0, yMax];
+    for (const t of yTicks) {
+      const y = PAD_T + plotH - (t / yMax) * plotH;
+      profileCtx.beginPath();
+      profileCtx.moveTo(PAD_L, y);
+      profileCtx.lineTo(PAD_L - 4, y);
+      profileCtx.stroke();
+      profileCtx.fillText(t.toFixed(yDecimals), PAD_L - 6, y);
+    }
+  }
+  profileCtx.save();
+  profileCtx.translate(16, PAD_T + plotH / 2);
+  profileCtx.rotate(-Math.PI / 2);
+  profileCtx.textAlign = "center";
+  profileCtx.textBaseline = "alphabetic";
+  // Y-axis label: in compare mode shows the pair; in single-cell mode
+  // shows either the pair or "g(r)" depending on overlay-all.
+  let yLabel;
+  if (IS_COMPARE) yLabel = `g(r) ${pairLabels[currentPair]}`;
+  else if (overlayAll) yLabel = "g(r)";
+  else yLabel = `g(r) ${pairLabels[currentPair]}`;
+  profileCtx.fillText(yLabel, 0, 0);
+  profileCtx.restore();
+
+  // Legend box: only for the single-cell "overlay all pairs" mode.
+  // The compare mode labels each curve inline above the near-origin
+  // anchor, so a separate legend would duplicate them.
+  if (!IS_COMPARE && drawSpec.length > 1) {
+    const lx = PAD_L + 12;
+    const ly = PAD_T + 14;
+    const lineH = 16;
+    profileCtx.font = "11px ui-sans-serif, system-ui";
+    drawSpec.forEach(({ color, label }, slot) => {
+      const y = ly + slot * lineH;
+      profileCtx.strokeStyle = color;
+      profileCtx.lineWidth = 2;
+      profileCtx.beginPath();
+      profileCtx.moveTo(lx, y);
+      profileCtx.lineTo(lx + 18, y);
+      profileCtx.stroke();
+      profileCtx.fillStyle = "#333";
+      profileCtx.textAlign = "left";
+      profileCtx.textBaseline = "middle";
+      profileCtx.fillText(label, lx + 22, y);
+    });
+  }
+}
+
+// Populate dropdown
+const sel = document.getElementById("pair-select");
+pairLabels.forEach((label, i) => {
+  const opt = document.createElement("option");
+  opt.value = String(i);
+  opt.textContent = label;
+  sel.appendChild(opt);
+});
+sel.value = String(currentPair);
+sel.addEventListener("change", () => {
+  currentPair = parseInt(sel.value, 10);
+  drawProfile();
+});
+
+const overlayCb = document.getElementById("overlay-all");
+if (IS_COMPARE) {
+  // "overlay all pairs" isn't meaningful in multi-series compare mode;
+  // the overlay IS the series axis.
+  overlayCb.parentElement.style.display = "none";
+} else {
+  overlayCb.addEventListener("change", () => {
+    overlayAll = overlayCb.checked;
+    sel.disabled = overlayAll;
+    drawProfile();
+  });
+}
+
+const info = document.getElementById("info");
+const nBins = seriesProfiles[0][0].length;
+info.textContent = IS_COMPARE
+  ? `${seriesLabels.length} cells | ${pairLabels.length} pair${pairLabels.length === 1 ? "" : "s"} | ${nBins} radial bins`
+  : `${pairLabels.length} pair${pairLabels.length === 1 ? "" : "s"} | ${nBins} radial bins`;
+
+new ResizeObserver(drawProfile).observe(document.getElementById("main"));
+drawProfile();
+</script>
+</body>
+</html>

@@ -1659,8 +1659,8 @@ wheels = [
 ]
 
 [[package]]
-name = "markdown-it-py"
-version = "3.0.0"
+name = "llvmlite"
+version = "0.47.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "mdurl" },
@@ -1843,11 +1843,13 @@ wheels = [
 ]
 
 [[package]]
-name = "mdit-py-plugins"
-version = "0.5.0"
+name = "numba"
+version = "0.65.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "markdown-it-py" },
+    { name = "llvmlite" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/b2/fd/a756d36c0bfba5f6e39a1cdbdbfdd448dc02692467d83816dff4592a1ebc/mdit_py_plugins-0.5.0.tar.gz", hash = "sha256:f4918cb50119f50446560513a8e311d574ff6aaed72606ddae6d35716fe809c6", size = 44655, upload-time = "2025-08-11T07:25:49.083Z" }
 wheels = [
@@ -3949,6 +3951,7 @@ dependencies = [
     { name = "ase" },
     { name = "lightning" },
     { name = "matplotlib" },
+    { name = "numba" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -3965,23 +3968,15 @@ data = [
     { name = "zarr", version = "2.18.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "zarr", version = "3.1.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
-docs = [
-    { name = "furo" },
-    { name = "myst-nb" },
-    { name = "myst-parser" },
-    { name = "sphinx" },
-]
 
 [package.metadata]
 requires-dist = [
     { name = "anywidget" },
     { name = "ase" },
-    { name = "furo", marker = "extra == 'docs'" },
     { name = "h5py", marker = "extra == 'data'" },
     { name = "lightning" },
     { name = "matplotlib" },
-    { name = "myst-nb", marker = "extra == 'docs'", specifier = ">=1.1,<1.2" },
-    { name = "myst-parser", marker = "extra == 'docs'", specifier = ">=2,<3" },
+    { name = "numba", specifier = ">=0.65.0" },
     { name = "numpy" },
     { name = "pandas" },
     { name = "scikit-learn" },
