@@ -471,7 +471,7 @@ class CoordinationShellTarget:
 
         Cross-target triplets (any of the three species drawn from a
         different source than the other two) get
-        ``coordination_target = 0`` and zero ``angle_mode_deg`` — the
+        ``coordination_target = 0`` and zero ``angle_mode_deg`` - the
         relaxer will never enumerate these triplets because no such
         bonds form.
 
@@ -585,7 +585,7 @@ class CoordinationShellTarget:
                 pair_hard_min[i, j] = max(hmin_a, hmin_b)
                 pair_sigma[i, j] = max(sig_a, sig_b) if (sig_a + sig_b) > 0 else 0.05
                 pair_mask[i, j] = True
-                # coordination_target[i, j] stays 0 — no cross bonds.
+                # coordination_target[i, j] stays 0 - no cross bonds.
 
         # --- rebuild triplet index over the widened species set ---
         angle_index_list: list[tuple[int, int, int]] = []
@@ -773,7 +773,7 @@ class CoordinationShellTarget:
 
         Each triplet is ``(centre_symbol, neighbour_1_symbol,
         neighbour_2_symbol)``; both (n1, n2) and (n2, n1) are enabled
-        automatically.  Bond-distance springs are untouched — only the
+        automatically.  Bond-distance springs are untouched - only the
         angle springs installed during ``shell_relax`` are filtered.
 
         Useful for multi-modal shells where the extracted

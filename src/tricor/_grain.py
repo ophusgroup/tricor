@@ -701,7 +701,7 @@ class _GrainMixin:
                 )
                 # Padded atoms get assigned to the source of the
                 # nearest existing atom (for multi-source builds) or
-                # source 0 (single-source — unchanged behaviour).
+                # source 0 (single-source - unchanged behaviour).
                 if multi_source and len(positions) > n_missing:
                     existing_pos = positions[:-n_missing]
                     existing_shell = shell_species_idx

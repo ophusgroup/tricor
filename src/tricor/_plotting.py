@@ -132,7 +132,7 @@ def _detect_triangles(
       ``angle_tol_deg`` of ``ideal_angle_deg`` (120° for sp\u00b2
       graphene, 109.5° is NOT what you want here).
 
-    The three-120°-angles constraint implies coplanarity — no
+    The three-120°-angles constraint implies coplanarity - no
     separate planarity test is needed.
 
     ``center_species_filter`` optionally restricts detection to
@@ -412,7 +412,7 @@ def _resolve_polyhedra_cfg(
     per_poly = False
     if triangles is not None:
         cfg = triangles
-        # 4 vertices: [centre, j, k, l] — see _TRI_FACES comment.
+        # 4 vertices: [centre, j, k, l] - see _TRI_FACES comment.
         n_vertices = 4
         faces, edges = _TRI_FACES, _TRI_EDGES
         detector = _detect_triangles
@@ -1235,8 +1235,18 @@ def _detect_shell_mask(
     *,
     pair_peak: float | None = None,
     smooth_sigma_r: float = 0.25,
+    dip_fraction: float = 0.5,
+    hi_cap_factor: float = 1.25,
 ) -> np.ndarray:
     """Auto-detect the first NN shell window over r for one triplet of g3.
+
+    Simple + robust variant: smooth the root-bond profile, seed the peak
+    on ``pair_peak`` (or a low-r-biased argmax otherwise), pin the left
+    edge at the first non-zero bin, walk right until the smoothed
+    profile drops below ``dip_fraction × peak``.  Always capped on the
+    right at ``hi_cap_factor × pair_peak`` so a near-flat valley (common
+    for crystalline nanocrystalline cells) can't runaway into the second
+    shell.
 
     Parameters
     ----------
@@ -1245,16 +1255,18 @@ def _detect_shell_mask(
     r
         Bin-centre radii (Å), shape ``(num_r,)``.
     pair_peak
-        Optional hint - the reference first-neighbour distance (Å) for this
-        triplet's root bond, typically ``shell_target.pair_peak[center,
-        neighbour]``.  When provided, the peak search is seeded here instead
-        of at the first local maximum, which is much more robust at small
-        cell sizes where g(r) is noisy.
+        Optional hint - reference first-neighbour distance (Å), typically
+        ``shell_target.pair_peak[center, neighbour]``.
     smooth_sigma_r
-        Gaussian standard deviation applied to g(r) before peak / minimum
-        detection, in Å.  Default 0.25 Å suppresses single-bin noise spikes
-        at the typical ``r_step = 0.1`` Å grid without blurring the first
-        shell.  Set to ``0`` to disable smoothing.
+        Gaussian standard deviation applied to g(r) before detection, in Å.
+    dip_fraction
+        The smoothed profile has to drop below ``dip_fraction × peak_val``
+        to count as "past the first shell".  0.5 works well for both
+        crystalline (narrow peak) and disordered (broad peak) cases.
+    hi_cap_factor
+        Absolute right-boundary cap, in units of ``pair_peak`` (or the
+        detected peak radius when pair_peak isn't given).  1.25 sits
+        comfortably before the second NN shell for all tested materials.
     """
     # Pair profile: collapse both angular-partner and phi dimensions.
     profile = triplet_data.sum(axis=(1, 2)) + triplet_data.sum(axis=(0, 2))
@@ -1265,8 +1277,7 @@ def _detect_shell_mask(
     if positive.size == 0:
         return mask
 
-    # Smooth before peak / minimum detection to avoid single-bin noise
-    # triggering a premature "first minimum" right after the peak.
+    # Smooth.
     r_step = float(r[1] - r[0]) if r.size > 1 else 1.0
     sigma_bins = max(0.0, float(smooth_sigma_r) / max(r_step, _EPS))
     if sigma_bins > 0.0:
@@ -1279,68 +1290,59 @@ def _detect_shell_mask(
     else:
         smoothed = finite
 
-    # Seed the peak search: prefer the user-supplied pair_peak, fall back to
-    # the first local maximum of the smoothed profile.
+    # --- Pick the peak ---
     if pair_peak is not None and np.isfinite(pair_peak) and pair_peak > 0:
         seed = int(np.argmin(np.abs(r - float(pair_peak))))
-        # Narrow search window (+/- 15%) so a weak-liquid low-r bump
-        # (atoms still close-packed from the random start) doesn't
-        # out-vote the true first-neighbour peak near pair_peak.
-        window_half = max(3, int(np.ceil(0.15 * float(pair_peak) / max(r_step, _EPS))))
-        lo = max(0, seed - window_half)
-        hi = min(smoothed.size, seed + window_half + 1)
-        peak_bin = int(lo + int(np.argmax(smoothed[lo:hi])))
+        # Search a ±15 % window around the reference peak so a weak
+        # low-r bump (atoms still close-packed from a random start)
+        # can't out-vote the true first-neighbour peak.
+        window_half = max(
+            3, int(np.ceil(0.15 * float(pair_peak) / max(r_step, _EPS)))
+        )
+        lo_search = max(0, seed - window_half)
+        hi_search = min(smoothed.size, seed + window_half + 1)
+        peak_bin = int(lo_search + int(np.argmax(smoothed[lo_search:hi_search])))
     else:
+        # Without pair_peak, bias the peak search toward low r so the
+        # second NN shell can't win the argmax in a clean crystal.  The
+        # exp(-r / 2 Å) weight falls off roughly 1.6x between first and
+        # second NN for typical materials, enough to pick the right peak.
         start = int(positive[0])
-        peak_bin = None
-        for idx in range(max(start, 1), smoothed.size - 1):
-            if smoothed[idx] >= smoothed[idx - 1] and smoothed[idx] > smoothed[idx + 1]:
-                peak_bin = idx
-                break
-        if peak_bin is None:
-            peak_bin = int(start + int(np.argmax(smoothed[start:])))
+        biased = smoothed * np.exp(-np.asarray(r, dtype=np.float64) / 2.0)
+        peak_bin = int(start + int(np.argmax(biased[start:])))
 
-    # Bound the search with pair_peak-relative limits so a flat or noisy
-    # profile never widens the window into the second shell (on the right)
-    # or into the tiny-r numerical divergence (on the left).  Defaults
-    # assume a first-shell width of roughly +/- 25% of pair_peak.
-    if pair_peak is not None and np.isfinite(pair_peak) and pair_peak > 0:
-        lo_lim_r = 0.75 * float(pair_peak)
-        hi_lim_r = 1.30 * float(pair_peak)
-    else:
-        # Without pair_peak, fall back to bounds relative to the detected peak.
-        lo_lim_r = 0.70 * float(r[peak_bin])
-        hi_lim_r = 1.35 * float(r[peak_bin])
-    lo_lim_bin = int(max(0, np.searchsorted(r, lo_lim_r) - 1))
-    hi_lim_bin = int(min(r.size - 1, np.searchsorted(r, hi_lim_r)))
-
-    # Walk inward / outward to the first *significant* smoothed local
-    # minimum.  "Significant" means below a fraction of the peak - just
-    # any noise wiggle used to stop the walk, and for noisy liquids
-    # with a nearly-flat profile the window was collapsing to almost a
-    # single bin.
     peak_val = float(smoothed[peak_bin])
-    # Dip threshold: a candidate minimum has to be at most ``min_ratio``
-    # of peak_val to count.  0.85 still lets us pick the obvious valley
-    # between first and second shell in crystalline cases.
-    min_ratio = 0.85
-    dip_thresh = peak_val * min_ratio
+    peak_r = float(r[peak_bin])
+    if peak_val <= _EPS:
+        return mask  # nothing above the floor
 
-    left_bin = lo_lim_bin
-    for idx in range(peak_bin - 1, lo_lim_bin, -1):
-        if (smoothed[idx] <= smoothed[idx - 1]
-                and smoothed[idx] < smoothed[idx + 1]
-                and smoothed[idx] <= dip_thresh):
-            left_bin = idx
-            break
+    # --- Right edge: first bin where smoothed dips below threshold ---
+    if pair_peak is not None and np.isfinite(pair_peak) and pair_peak > 0:
+        hi_cap_r = float(hi_cap_factor) * float(pair_peak)
+    else:
+        hi_cap_r = float(hi_cap_factor) * peak_r
+    hi_cap_bin = int(min(r.size - 1, np.searchsorted(r, hi_cap_r)))
+    dip_thresh = peak_val * float(dip_fraction)
 
-    right_bin = hi_lim_bin
-    for idx in range(peak_bin + 1, hi_lim_bin):
-        if (smoothed[idx] < smoothed[idx - 1]
-                and smoothed[idx] <= smoothed[idx + 1]
-                and smoothed[idx] <= dip_thresh):
+    right_bin = hi_cap_bin
+    for idx in range(peak_bin + 1, hi_cap_bin + 1):
+        if smoothed[idx] <= dip_thresh:
             right_bin = idx
             break
+
+    # --- Left edge: pin at the first non-zero bin to always capture
+    # the full rising edge, but don't go below 0.75 × pair_peak so a
+    # stray low-r count at a grain boundary can't drag the mask to
+    # r < 1 Å.
+    if pair_peak is not None and np.isfinite(pair_peak) and pair_peak > 0:
+        lo_floor_r = 0.75 * float(pair_peak)
+    else:
+        lo_floor_r = 0.75 * peak_r
+    lo_floor_bin = int(max(0, np.searchsorted(r, lo_floor_r) - 1))
+    first_nonzero = int(positive[0])
+    left_bin = max(first_nonzero, lo_floor_bin)
+    # But never start past the peak.
+    left_bin = min(left_bin, peak_bin)
 
     mask[left_bin : right_bin + 1] = True
     return mask
@@ -2580,12 +2582,12 @@ class _PlottingMixin:
         is_mp4 = str(output).lower().endswith(".mp4")
 
         if is_mp4:
-            # MP4 via ffmpeg subprocess — true 60fps
+            # MP4 via ffmpeg subprocess - true 60fps
             import subprocess
             import io
 
             # Frame dimensions from figure size (no bbox_inches="tight"
-            # for the raw pipe — keeps pixel count deterministic).
+            # for the raw pipe - keeps pixel count deterministic).
             fw, fh = width, height
 
             ffmpeg_cmd = [

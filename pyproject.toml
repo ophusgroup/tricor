@@ -13,6 +13,7 @@ dependencies = [
     "matplotlib",
     "ase",
     "anywidget",
+    "numba>=0.65.0",
 ]
 
 [project.optional-dependencies]

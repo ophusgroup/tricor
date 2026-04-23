@@ -1551,6 +1551,7 @@ class _MonteCarloMixin:
         *,
         force: bool = False,
         show_progress: bool = True,
+        backend: str = "auto",
     ) -> G3Distribution:
         """Measure the current random supercell on the target distribution grid.
 
@@ -1566,6 +1567,13 @@ class _MonteCarloMixin:
         show_progress
             If `True`, display a text progress bar while the supercell histogram
             is accumulated.
+        backend
+            Kernel selector forwarded to :meth:`G3Distribution.measure_g3`.
+            ``"auto"`` (default) picks the numba-parallel path when numba is
+            installed (typically 10-25x faster than the numpy path),
+            ``"numba"`` requires it, ``"python"`` forces the reference numpy
+            loop.  See the underlying method's docstring for the small
+            floating-point drift the numba path incurs at phi-bin boundaries.
         """
         if self.current_distribution is not None and not force:
             return self.current_distribution
@@ -1577,6 +1585,7 @@ class _MonteCarloMixin:
             phi_num_bins=self.measure_phi_num_bins,
             show_progress=show_progress,
             progress_label=f"Measuring g3 in {self.label}",
+            backend=backend,
         )
         self.current_distribution = measured
         return measured

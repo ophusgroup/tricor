@@ -1,10 +1,10 @@
-"""Supercell class — disordered atomic structure generation and optimization.
+"""Supercell class - disordered atomic structure generation and optimization.
 
 The heavy lifting is split across mixin modules:
-    _grain.py        — Voronoi grain construction
-    _shell_relax.py  — vectorized spring-network relaxation
-    _plotting.py     — visualization (plot_structure, plot_g3_compare, …)
-    _monte_carlo.py  — Monte Carlo engine, spatial indexing, teacher rollout
+    _grain.py - Voronoi grain construction
+    _shell_relax.py - vectorized spring-network relaxation
+    _plotting.py - visualization (plot_structure, plot_g3_compare, …)
+    _monte_carlo.py - Monte Carlo engine, spatial indexing, teacher rollout
 """
 
 from __future__ import annotations
@@ -474,7 +474,7 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
             Number of relaxation sweeps.
         grain_size
             Diameter of crystalline grains in Angstrom.  ``None`` means
-            no grains — start from random positions (liquid/amorphous).
+            no grains - start from random positions (liquid/amorphous).
         crystalline_fraction
             Volume fraction filled by crystalline grains (0–1).  Only
             used when *grain_size* is set.  The remaining volume is

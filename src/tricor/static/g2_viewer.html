@@ -145,11 +145,12 @@ function drawProfile() {
   let yMax, offsetStep;
   if (IS_COMPARE && drawSpec.length > 1) {
     // Each curve gets its own slot of height perCurveMax; offsets
-    // stack them bottom-to-top.  The step has to be close to
-    // perCurveMax itself (not ~0.35× it) to keep sharp first-shell
-    // peaks — graphite's in-plane C-C peak reaches ~6× the bulk
-    // average — from crashing into adjacent series.
-    offsetStep = perCurveMax * 0.85;
+    // stack them bottom-to-top.  0.42 is tight enough that adjacent
+    // curves visibly overlap at sharp first-shell peaks (desirable:
+    // makes small shifts between regimes easier to eyeball) but wide
+    // enough to keep each curve's baseline and ~2× bulk-average
+    // amplitude readable.
+    offsetStep = perCurveMax * 0.42;
     yMax = perCurveMax + offsetStep * (drawSpec.length - 1);
   } else {
     offsetStep = 0;
