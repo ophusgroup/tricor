@@ -77,12 +77,16 @@ async function render({ model, el }) {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(model.get("background_color"));
 
-  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
+  // Two cameras kept in sync so the user can toggle between them
+  // without losing framing / orbit state.
+  const perspCam = new THREE.PerspectiveCamera(45, 1, 0.1, 4000);
+  const orthoCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 4000);
+  let camera = model.get("orthographic") ? orthoCam : perspCam;
   const renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setPixelRatio(window.devicePixelRatio);
   canvasWrap.appendChild(renderer.domElement);
 
-  const controls = new OrbitControls(camera, renderer.domElement);
+  let controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
   controls.dampingFactor = 0.12;
 
@@ -101,6 +105,8 @@ async function render({ model, el }) {
   let atomMesh = null;
   let bondMesh = null;
   let cellLine = null;
+  let polyMesh = null;
+  let polyEdgeLine = null;
 
   const dummy = new THREE.Object3D();
   const color = new THREE.Color();
@@ -200,6 +206,102 @@ async function render({ model, el }) {
     scene.add(bondMesh);
   }
 
+  function buildPolyhedra() {
+    // Clear any existing polyhedra mesh/edges.
+    if (polyMesh) {
+      scene.remove(polyMesh);
+      if (polyMesh.geometry) polyMesh.geometry.dispose();
+      if (polyMesh.material) polyMesh.material.dispose();
+      polyMesh = null;
+    }
+    if (polyEdgeLine) {
+      scene.remove(polyEdgeLine);
+      if (polyEdgeLine.geometry) polyEdgeLine.geometry.dispose();
+      if (polyEdgeLine.material) polyEdgeLine.material.dispose();
+      polyEdgeLine = null;
+    }
+    if (!model.get("show_polyhedra")) return;
+    const nPolys = model.get("num_polyhedra") || 0;
+    if (nPolys === 0) return;
+
+    const verts = new Float32Array(model.get("polyhedra_vertex_positions"));
+    const POLY_N = model.get("polyhedra_n_vertices") || 4;
+    const perPoly = !!model.get("polyhedra_per_poly_topology");
+    const facesShared = model.get("polyhedra_faces") || [];
+    const edgesShared = model.get("polyhedra_edges") || [];
+    const facesPer = model.get("polyhedra_faces_per_poly") || [];
+    const edgesPer = model.get("polyhedra_edges_per_poly") || [];
+    const stride = POLY_N * 3;
+
+    // Count faces / edges so we can size arrays.
+    let totalFaces = 0;
+    let totalEdges = 0;
+    if (perPoly) {
+      for (let t = 0; t < nPolys; t++) {
+        totalFaces += (facesPer[t] || []).length;
+        totalEdges += (edgesPer[t] || []).length;
+      }
+    } else {
+      totalFaces = nPolys * facesShared.length;
+      totalEdges = nPolys * edgesShared.length;
+    }
+    if (totalFaces === 0) return;
+
+    const facePos = new Float32Array(totalFaces * 3 * 3);
+    const edgePos = new Float32Array(totalEdges * 2 * 3);
+    let fOut = 0;
+    let eOut = 0;
+    for (let t = 0; t < nPolys; t++) {
+      const base = t * stride;
+      const V = [];
+      for (let v = 0; v < POLY_N; v++) {
+        V.push([verts[base + v*3], verts[base + v*3 + 1], verts[base + v*3 + 2]]);
+      }
+      const faces = perPoly ? (facesPer[t] || []) : facesShared;
+      for (let f = 0; f < faces.length; f++) {
+        const [a, b, cc] = faces[f];
+        const o = fOut * 9;
+        facePos[o+0]=V[a][0]; facePos[o+1]=V[a][1]; facePos[o+2]=V[a][2];
+        facePos[o+3]=V[b][0]; facePos[o+4]=V[b][1]; facePos[o+5]=V[b][2];
+        facePos[o+6]=V[cc][0]; facePos[o+7]=V[cc][1]; facePos[o+8]=V[cc][2];
+        fOut++;
+      }
+      const edges = perPoly ? (edgesPer[t] || []) : edgesShared;
+      for (let e = 0; e < edges.length; e++) {
+        const [a, b] = edges[e];
+        const o = eOut * 6;
+        edgePos[o+0]=V[a][0]; edgePos[o+1]=V[a][1]; edgePos[o+2]=V[a][2];
+        edgePos[o+3]=V[b][0]; edgePos[o+4]=V[b][1]; edgePos[o+5]=V[b][2];
+        eOut++;
+      }
+    }
+
+    const col = model.get("polyhedra_color") || [0.28, 0.62, 0.95];
+    const opacity = model.get("polyhedra_opacity") ?? 0.4;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(facePos, 3));
+    geo.computeVertexNormals();
+    const mat = new THREE.MeshPhongMaterial({
+      color: new THREE.Color(col[0], col[1], col[2]),
+      shininess: 20,
+      specular: 0x888888,
+      transparent: true,
+      opacity: opacity,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    polyMesh = new THREE.Mesh(geo, mat);
+    scene.add(polyMesh);
+
+    const egeo = new THREE.BufferGeometry();
+    egeo.setAttribute("position", new THREE.BufferAttribute(edgePos, 3));
+    const emat = new THREE.LineBasicMaterial({
+      color: 0x111111, transparent: true, opacity: 0.55,
+    });
+    polyEdgeLine = new THREE.LineSegments(egeo, emat);
+    scene.add(polyEdgeLine);
+  }
+
   function buildCell() {
     if (cellLine) { scene.remove(cellLine); cellLine.dispose(); }
     if (!model.get("show_cell")) return;
@@ -219,16 +321,58 @@ async function render({ model, el }) {
   }
 
   // -- camera framing --
-  function frameCamera() {
+  let sceneRadius = 1;
+  function computeSceneRadius() {
     const verts = model.get("cell_vertices");
     let maxDist = 0;
     for (let i = 0; i < verts.length; i += 3) {
       const d = Math.sqrt(verts[i] ** 2 + verts[i + 1] ** 2 + verts[i + 2] ** 2);
       if (d > maxDist) maxDist = d;
     }
-    camera.position.set(maxDist * 1.8, maxDist * 0.6, maxDist * 1.5);
-    camera.lookAt(0, 0, 0);
+    return Math.max(maxDist, 1);
+  }
+
+  function frameCamera() {
+    sceneRadius = computeSceneRadius();
+    // Position both cameras; keep them in sync so swapping is seamless.
+    const pos = new THREE.Vector3(sceneRadius * 1.8, sceneRadius * 0.6, sceneRadius * 1.5);
+    perspCam.position.copy(pos);
+    perspCam.lookAt(0, 0, 0);
+    orthoCam.position.copy(pos);
+    orthoCam.lookAt(0, 0, 0);
     controls.target.set(0, 0, 0);
+    updateOrthoFrustum();
+    controls.update();
+  }
+
+  function updateOrthoFrustum() {
+    const w = canvasWrap.clientWidth || 600;
+    const h = canvasWrap.clientHeight || 600;
+    const aspect = w / h;
+    // Frame so the cube bounding sphere fits in the smaller dim, padded.
+    const pad = 1.15;
+    const halfH = sceneRadius * pad;
+    const halfW = halfH * aspect;
+    orthoCam.left = -halfW; orthoCam.right = halfW;
+    orthoCam.top = halfH;   orthoCam.bottom = -halfH;
+    orthoCam.updateProjectionMatrix();
+  }
+
+  function swapCamera(newOrtho) {
+    // Keep position / target consistent between the two cameras so the
+    // toggle looks like a projection swap, not a re-frame.
+    const oldPos = camera.position.clone();
+    const oldTarget = controls.target.clone();
+    camera = newOrtho ? orthoCam : perspCam;
+    camera.position.copy(oldPos);
+    camera.lookAt(oldTarget);
+    // Replace OrbitControls so it drives the active camera.
+    controls.dispose();
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.12;
+    controls.target.copy(oldTarget);
+    if (newOrtho) updateOrthoFrustum();
     controls.update();
   }
 
@@ -299,6 +443,13 @@ async function render({ model, el }) {
     });
     controlsPanel.appendChild(cellCb);
 
+    // Orthographic toggle
+    const orthoCb = makeCheckbox("Orthographic", model.get("orthographic"), (v) => {
+      model.set("orthographic", v);
+      model.save_changes();
+    });
+    controlsPanel.appendChild(orthoCb);
+
     // Show bonds checkbox
     const bondCb = makeCheckbox("Show bonds", model.get("show_bonds"), (v) => {
       model.set("show_bonds", v);
@@ -306,6 +457,72 @@ async function render({ model, el }) {
       buildBonds();
     });
     controlsPanel.appendChild(bondCb);
+
+    // --- Polyhedra controls ---
+    const polyCb = makeCheckbox("Show polyhedra", model.get("show_polyhedra"), (v) => {
+      model.set("show_polyhedra", v);
+      model.save_changes();
+    });
+    controlsPanel.appendChild(polyCb);
+
+    const polyKind = model.get("polyhedra_kind");
+    if (polyKind) {
+      // bond_length slider (radial centre of the first-shell window)
+      const blGroup = makeSliderGroup(
+        `${polyKind.slice(0,-1)} bond length (\u00C5)`,
+        0.5, 5.0, model.get("polyhedra_bond_length"), 0.01,
+        (v) => {
+          model.set("polyhedra_bond_length", v);
+          model.save_changes();
+        }
+      );
+      controlsPanel.appendChild(blGroup);
+
+      // bond_length_tol slider (fractional, 0-50%)
+      const blTolGroup = makeSliderGroup(
+        "radial tolerance (fraction)",
+        0.02, 0.40, model.get("polyhedra_bond_length_tol"), 0.01,
+        (v) => {
+          model.set("polyhedra_bond_length_tol", v);
+          model.save_changes();
+        }
+      );
+      controlsPanel.appendChild(blTolGroup);
+
+      // angle_tol_deg slider (0-45 deg)
+      const atGroup = makeSliderGroup(
+        "angle tolerance (\u00B0)",
+        1.0, 45.0, model.get("polyhedra_angle_tol_deg"), 0.5,
+        (v) => {
+          model.set("polyhedra_angle_tol_deg", v);
+          model.save_changes();
+        }
+      );
+      controlsPanel.appendChild(atGroup);
+
+      // polyhedra scale slider (0.2 - 1.0)
+      const scGroup = makeSliderGroup(
+        "polyhedra scale",
+        0.2, 1.0, model.get("polyhedra_scale"), 0.01,
+        (v) => {
+          model.set("polyhedra_scale", v);
+          model.save_changes();
+        }
+      );
+      controlsPanel.appendChild(scGroup);
+
+      // opacity slider
+      const opGroup = makeSliderGroup(
+        "polyhedra opacity",
+        0.05, 0.95, model.get("polyhedra_opacity"), 0.05,
+        (v) => {
+          model.set("polyhedra_opacity", v);
+          model.save_changes();
+          buildPolyhedra();
+        }
+      );
+      controlsPanel.appendChild(opGroup);
+    }
 
     // Slab sliders
     const slabNames = [
@@ -409,8 +626,9 @@ async function render({ model, el }) {
   function resize() {
     const w = canvasWrap.clientWidth || 600;
     const h = canvasWrap.clientHeight || 600;
-    camera.aspect = w / h;
-    camera.updateProjectionMatrix();
+    perspCam.aspect = w / h;
+    perspCam.updateProjectionMatrix();
+    updateOrthoFrustum();
     renderer.setSize(w, h);
   }
   const resizeObs = new ResizeObserver(resize);
@@ -420,7 +638,7 @@ async function render({ model, el }) {
   function animate() {
     requestAnimationFrame(animate);
     controls.update();
-    renderer.render(scene, camera);
+    renderer.render(scene, camera);   // `camera` is swappable via swapCamera()
   }
 
   // -- model listeners --
@@ -428,12 +646,18 @@ async function render({ model, el }) {
   model.on("change:bond_visible change:bond_starts change:bond_ends change:bond_colors change:num_bonds change:show_bonds", () => buildBonds());
   model.on("change:show_cell", () => buildCell());
   model.on("change:atom_scale", () => updateAtomVisibility());
+  model.on(
+    "change:show_polyhedra change:num_polyhedra change:polyhedra_vertex_positions change:polyhedra_color change:polyhedra_opacity",
+    () => buildPolyhedra()
+  );
+  model.on("change:orthographic", () => swapCamera(model.get("orthographic")));
 
   // -- init --
   buildControls();
   buildAtoms();
   buildBonds();
   buildCell();
+  buildPolyhedra();
   frameCamera();
   resize();
   animate();

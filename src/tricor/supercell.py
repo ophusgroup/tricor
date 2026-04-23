@@ -1,10 +1,10 @@
-"""Supercell class — disordered atomic structure generation and optimization.
+"""Supercell class - disordered atomic structure generation and optimization.
 
 The heavy lifting is split across mixin modules:
-    _grain.py        — Voronoi grain construction
-    _shell_relax.py  — vectorized spring-network relaxation
-    _plotting.py     — visualization (plot_structure, plot_g3_compare, …)
-    _monte_carlo.py  — Monte Carlo engine, spatial indexing, teacher rollout
+    _grain.py - Voronoi grain construction
+    _shell_relax.py - vectorized spring-network relaxation
+    _plotting.py - visualization (plot_structure, plot_g3_compare, …)
+    _monte_carlo.py - Monte Carlo engine, spatial indexing, teacher rollout
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         distribution: G3Distribution,
         cell_dim_angstroms: float | Sequence[float],
         *,
-        relative_density: float = 1.0,
+        relative_density: float = 0.96,
         measure_g3: bool = False,
         plot_g3_compare: bool = False,
         label: str | None = None,
@@ -152,6 +152,15 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         ]
         self._flat_triplet_size = self._r_num * self._r_num * self._phi_num_bins
         self._atom_species_index = np.searchsorted(self._species, self.atoms.numbers)
+        # Optional override: when a composite shell target has more
+        # virtual species than the atomic-number species (e.g. sp2_C
+        # and sp3_C sharing atomic number 6), the relaxer and the
+        # polyhedra-friendly plotting paths consult this array instead
+        # of ``_atom_species_index``.  Set from ``_build_grain_atoms``
+        # when ``grain_sources`` is supplied, or manually via
+        # ``Supercell.generate(..., atom_species_index=...)``.
+        self._atom_shell_species_index: np.ndarray | None = None
+        self._grain_source: np.ndarray | None = None
         self._g3_rr_weights_flat = self._build_g3_rr_weights()
         self._spatial_offset_cache: dict[tuple[int, int, int], np.ndarray] = {}
         self._rebuild_spatial_index()
@@ -172,7 +181,7 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         r_max: float = 10.0,
         r_step: float = 0.2,
         phi_num_bins: int = 90,
-        relative_density: float = 1.0,
+        relative_density: float = 0.96,
         rng_seed: int | None = None,
         label: str | None = None,
         **kwargs: Any,
@@ -233,31 +242,57 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
     # Cell geometry utilities
     # ------------------------------------------------------------------
 
-    def _normalize_cell_dim_angstroms(
-        self,
-        cell_dim_angstroms: float | Sequence[float],
-    ) -> tuple[float, float, float]:
-        """Validate and normalize the requested supercell lengths in Angstrom."""
+    def _normalize_cell_dim_angstroms(self, cell_dim_angstroms):
+        """Validate and normalize the requested supercell lattice.
+
+        Accepts:
+            - a scalar (cubic box),
+            - a length-3 sequence of positive edge lengths (orthogonal box),
+            - a 3 x 3 array of cell vectors (general triclinic box).
+        """
         if isinstance(cell_dim_angstroms, (int, float)):
             if float(cell_dim_angstroms) <= 0:
                 raise ValueError("cell_dim_angstroms must be positive.")
             length = float(cell_dim_angstroms)
             return (length, length, length)
 
-        dims = tuple(float(value) for value in cell_dim_angstroms)
-        if len(dims) != 3 or any(value <= 0 for value in dims):
-            raise ValueError(
-                "cell_dim_angstroms must be a scalar or a length-3 sequence of positive values."
-            )
-        return dims
+        arr = np.asarray(cell_dim_angstroms, dtype=float)
+        if arr.ndim == 2 and arr.shape == (3, 3):
+            if abs(np.linalg.det(arr)) < 1e-8:
+                raise ValueError("cell_dim_angstroms 3x3 matrix is singular.")
+            return arr.copy()
+
+        if arr.ndim == 1 and arr.shape[0] == 3:
+            if np.any(arr <= 0):
+                raise ValueError(
+                    "cell_dim_angstroms edge lengths must be positive."
+                )
+            return tuple(float(v) for v in arr)
+
+        raise ValueError(
+            "cell_dim_angstroms must be a scalar, a length-3 sequence, "
+            "or a 3x3 matrix of cell vectors.",
+        )
 
     def _build_supercell_cell(self) -> np.ndarray:
-        """Build an orthogonal supercell with the requested dimensions.
+        """Build the supercell cell matrix.
 
-        Always returns a diagonal cell matrix regardless of the
-        reference crystal's lattice vectors.
+        ``cell_dim_angstroms`` can be supplied as either
+        - a 3-tuple of edge lengths (orthogonal cell), or
+        - a full 3x3 array of cell vectors (rows = cell vectors).
+
+        The second form lets a hexagonal / triclinic reference be tiled
+        into a supercell that shares its lattice geometry so that quartz,
+        etc., tile cleanly through the periodic boundaries.
         """
-        return np.diag(np.asarray(self.cell_dim_angstroms, dtype=np.float64))
+        dim = np.asarray(self.cell_dim_angstroms, dtype=np.float64)
+        if dim.ndim == 1 and dim.shape[0] == 3:
+            return np.diag(dim)
+        if dim.ndim == 2 and dim.shape == (3, 3):
+            return dim.copy()
+        raise ValueError(
+            f"cell_dim_angstroms must be shape (3,) or (3, 3), got {dim.shape!r}"
+        )
 
     @staticmethod
     def _to_orthogonal_cell(atoms: Atoms) -> Atoms:
@@ -362,36 +397,48 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
 
     PRESETS: dict[str, dict[str, Any]] = {
         "liquid": dict(
+            num_steps=100,
             grain_size=None,
-            bond_weight=0.3, angle_weight=0.05,
-            repulsion_weight=1.0, hard_core_scale=0.85,
-            relative_density=0.96, num_steps=40,
+            bond_weight=0.4, angle_weight=0.5,
+            repulsion_weight=0.5,
+            hard_core_scale=0.75, nonbond_push_scale=0.7,
         ),
         "amorphous": dict(
-            grain_size=4.0,
-            bond_weight=1.0, angle_weight=0.3,
-            hard_core_scale=0.92,
-            relative_density=0.96,
+            num_steps=150,
+            grain_size=6.0,
+            bond_weight=1.2, angle_weight=0.6,
+            repulsion_weight=1.5,
+            hard_core_scale=0.9, nonbond_push_scale=0.5,
+            displacement_sigma=0.08,
         ),
         "SRO": dict(
-            grain_size=8.0,
-            bond_weight=2.0, angle_weight=1.0,
-            relative_density=0.96,
+            num_steps=200,
+            grain_size=10.0,
+            bond_weight=2.2, angle_weight=1.0,
+            repulsion_weight=2.0,
+            hard_core_scale=0.95, nonbond_push_scale=0.6,
+            displacement_sigma=0.04,
         ),
         "MRO": dict(
-            grain_size=12.0, crystalline_fraction=0.5,
-            bond_weight=2.0, angle_weight=0.6,
-            relative_density=0.96,
+            num_steps=150,
+            grain_size=13.0,
+            bond_weight=1.9, angle_weight=0.9,
+            repulsion_weight=2.5,
+            hard_core_scale=0.95, nonbond_push_scale=0.7,
+            displacement_sigma=0.04,
         ),
-        "mixed": dict(
-            grain_size=18.0, crystalline_fraction=0.5,
-            bond_weight=2.5, angle_weight=1.0,
-            relative_density=0.96,
+        "MRO_more": dict(
+            num_steps=150,
+            grain_size=18.0,
+            bond_weight=2.0, angle_weight=1.0,
+            hard_core_scale=0.95, nonbond_push_scale=0.9,
+            displacement_sigma=0.04,
         ),
         "nanocrystalline": dict(
-            grain_size=25.0,
+            num_steps=150,
+            grain_size=20.0,
             bond_weight=3.0, angle_weight=1.5,
-            relative_density=0.96,
+            displacement_sigma=0.02,
         ),
     }
 
@@ -408,6 +455,8 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         hard_core_scale: float = 1.0,
         nonbond_push_scale: float = 1.0,
         displacement_sigma: float = 0.0,
+        atom_species_index: np.ndarray | None = None,
+        grain_sources: "list[dict] | None" = None,
         show_progress: bool = True,
         **shell_relax_kwargs: Any,
     ) -> dict[str, Any]:
@@ -425,7 +474,7 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
             Number of relaxation sweeps.
         grain_size
             Diameter of crystalline grains in Angstrom.  ``None`` means
-            no grains — start from random positions (liquid/amorphous).
+            no grains - start from random positions (liquid/amorphous).
         crystalline_fraction
             Volume fraction filled by crystalline grains (0–1).  Only
             used when *grain_size* is set.  The remaining volume is
@@ -464,6 +513,7 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
                 grain_size=float(grain_size),
                 crystalline_fraction=crystalline_fraction,
                 displacement_sigma=displacement_sigma,
+                grain_sources=grain_sources,
             )
 
             # Refresh cached arrays after rebuilding atoms
@@ -473,6 +523,51 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
                 self._species, self.atoms.numbers,
             )
             self._rebuild_spatial_index()
+            # If the caller passed an explicit per-atom virtual species
+            # index, it takes precedence over whatever _build_grain_atoms
+            # set.  (The grain builder writes an index when grain_sources
+            # is non-None; an explicit kwarg here lets the caller
+            # override that.)
+            if atom_species_index is not None:
+                asp = np.asarray(atom_species_index, dtype=np.intp)
+                if asp.shape[0] != len(self.atoms):
+                    raise ValueError(
+                        f"atom_species_index length ({asp.shape[0]}) must "
+                        f"match atom count ({len(self.atoms)}) after "
+                        f"grain construction."
+                    )
+                self._atom_shell_species_index = asp
+        else:
+            # Liquid path: atoms came from _build_random_atoms() at init
+            # time with purely-random positions.  Pre-separate only
+            # severe overlaps (< 0.35 * hard_min ~ one-third a bond),
+            # leaving the rest for shell_relax's soft repulsion spring
+            # to handle smoothly.  A harder push would pile up a sharp
+            # non-physical spike at exactly the cutoff radius (that's
+            # exactly the artefact the user saw in the Cu liquid
+            # panel).
+            from ._grain import _push_close_pairs_apart
+            hard_min = float(np.min(
+                np.asarray(shell_target.pair_hard_min, dtype=np.float64)
+            ))
+            push_cutoff = 0.35 * hard_min
+            self.atoms.positions = _push_close_pairs_apart(
+                self.atoms.positions,
+                self.atoms.numbers,
+                self.atoms.cell.array,
+                pbc=self.atoms.pbc,
+                push_cutoff=push_cutoff,
+                max_iter=40,
+            )
+            self._rebuild_spatial_index()
+            if atom_species_index is not None:
+                asp = np.asarray(atom_species_index, dtype=np.intp)
+                if asp.shape[0] != len(self.atoms):
+                    raise ValueError(
+                        f"atom_species_index length ({asp.shape[0]}) must "
+                        f"match atom count ({len(self.atoms)})."
+                    )
+                self._atom_shell_species_index = asp
 
         # --- relax ---
         summary = self.shell_relax(

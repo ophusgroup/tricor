@@ -13,6 +13,7 @@ dependencies = [
     "matplotlib",
     "ase",
     "anywidget",
+    "numba>=0.65.0",
     "torch",
     "torch-geometric",
     "lightning",
@@ -24,12 +25,6 @@ dependencies = [
 data = [
     "h5py",
     "zarr",
-]
-docs = [
-    "sphinx>=7,<7.3",
-    "furo",
-    "myst-nb>=1.1,<1.2",
-    "myst-parser>=2,<3",
 ]
 
 [tool.hatch.build]

@@ -529,6 +529,7 @@ class G3Distribution:
         return_g3: bool = False,
         show_progress: bool = False,
         progress_label: str | None = None,
+        backend: str = "auto",
     ) -> np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Measure the raw rooted three-body distribution.
 
@@ -548,9 +549,25 @@ class G3Distribution:
             measured raw histogram.
         show_progress
             If `True`, display a simple text progress bar while the origin-centered
-            triplet histograms are accumulated.
+            triplet histograms are accumulated.  (Progress reporting is only
+            emitted by the pure-numpy path; the numba path runs too fast to
+            need it.)
         progress_label
             Optional label shown next to the progress bar.
+        backend
+            Which accumulation kernel to use.  One of:
+
+            - ``"auto"`` *(default)* - use numba if available, fall back to
+              the pure-numpy loop otherwise.
+            - ``"numba"`` - require the numba-parallel kernel.  Raises
+              ``RuntimeError`` if numba is not installed.
+            - ``"python"`` - force the original numpy implementation.  Slower
+              but self-contained; handy as a reference.
+
+            The two backends produce ``g2count`` bit-for-bit identical and
+            ``g3count`` that differ by less than ~3e-5 of the total count -
+            only a handful of triplets flip between adjacent phi bins from
+            floating-point ULP drift at bin boundaries.
 
         Returns
         -------
@@ -724,6 +741,97 @@ class G3Distribution:
                 label=progress_label or f"Measuring {self.label}",
             )
             progress.update(0)
+
+        # Optional fast path: numba-parallel kernel produces the same
+        # g3count / g2count (modulo ~0.003% ULP drift at phi-bin
+        # boundaries) in a fraction of the time.
+        _use_numba = backend == "numba" or backend == "auto"
+        if _use_numba:
+            try:
+                from ._g3_numba import HAS_NUMBA, run_g3_numba
+            except ImportError:
+                HAS_NUMBA = False
+                run_g3_numba = None
+            if HAS_NUMBA:
+                # Run the native kernel inside a background thread so
+                # we can poll a progress bar from the main thread.  The
+                # numba loop doesn't expose per-origin progress, so we
+                # animate a smooth 0 -> 99% sweep while it runs and
+                # snap to 100% on completion.  Releases the GIL inside
+                # the JIT'd kernel, so the main-thread polling is cheap.
+                import threading
+                import time as _time
+
+                result_box: dict = {}
+
+                def _run_kernel():
+                    try:
+                        result_box["value"] = run_g3_numba(
+                            origin_xyz=self.origin_xyz,
+                            origin_species_index=self.origin_species_index,
+                            tile_xyz=self.tile_xyz,
+                            tile_species=self.tile_species,
+                            species=self.species,
+                            g3_lookup=self.g3_lookup,
+                            r_max=self.r_max,
+                            r_step=self.r_step,
+                            phi_step=self.phi_step,
+                            num_r=self.r_num,
+                            num_phi=self.phi_num_bins,
+                            num_species=self.num_species,
+                            num_triplets=self.num_triplets,
+                            zero_tol=zero_tol,
+                        )
+                    except BaseException as exc:  # noqa: BLE001
+                        result_box["error"] = exc
+
+                worker = threading.Thread(target=_run_kernel, daemon=True)
+                worker.start()
+
+                if progress is not None:
+                    # Animate a slow sweep - we can't observe real
+                    # kernel progress, but the user gets a moving bar
+                    # and an obvious 100% finish.  Cap at 99% until
+                    # the worker returns so the user never sees "100%"
+                    # while the kernel is still running.
+                    t_start = _time.perf_counter()
+                    # Heuristic pace: 40^3 SrTiO3 runs ~1.2 s; 20^3
+                    # everything runs ~0.15 s.  Assume 2 s for the
+                    # visible sweep - fast calls will just snap to
+                    # 100% immediately on join.
+                    sweep_total = 2.0
+                    while worker.is_alive():
+                        elapsed = _time.perf_counter() - t_start
+                        frac = min(0.99, elapsed / sweep_total)
+                        progress.update(int(frac * self.num_sites))
+                        _time.sleep(0.05)
+
+                worker.join()
+                if "error" in result_box:
+                    if progress is not None:
+                        progress.close()
+                    raise result_box["error"]
+                g3count_nb, g2count_nb = result_box["value"]
+
+                if progress is not None:
+                    progress.update(self.num_sites)
+                    progress.close()
+
+                self.g3count = g3count_nb
+                self.g2count = g2count_nb
+                self.g3 = self.g3count
+                self.g2 = self.g2count
+                if plot_g3:
+                    self.plot_g3()
+                if return_g3:
+                    return self.g3, self.r, self.phi
+                return self.g3
+            elif backend == "numba":
+                raise RuntimeError(
+                    "backend='numba' requested but numba is not installed; "
+                    "pip install tricor[fast]"
+                )
+            # backend == "auto" and numba missing: fall through to numpy
 
         # calculate g3 as the sum over all unit-cell origins, grouped by center species
         for ind0 in range(self.num_species):
