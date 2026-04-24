@@ -19,13 +19,14 @@ from tricor.flowmatch.sampler_guided import (
     generate_guided,
     positions_to_atoms,
 )
-from tricor.differentiable_pdf import DifferentiablePDFADF, DifferentiableSpectralLoss
+from tricor.differentiable_pdf import DifferentiableSpectralLoss
+from tricor.differentiable_pdf_fast import DifferentiablePDFADF_Fast as DifferentiablePDFADF
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG — edit these
 # ══════════════════════════════════════════════════════════════════════════════
 
-CHECKPOINT = "./lightning_logs/flowmatch-uncond-si3n4/version_0/checkpoints/last.ckpt"
+CHECKPOINT = "./lightning_logs/flowmatch-uncond-si3n4/version_1/checkpoints/last.ckpt"
 REFERENCE_STRUCTURE = "/pscratch/sd/e/ehrdt/mcstructgen/smallcell/Si3N4(10)_d90_g3_jit2_s0.15_m2.xyz"
 SPECIES = [7, 14]
 ATOM_FRACTIONS = [3/7, 4/7]
@@ -39,6 +40,7 @@ R_STEP = 0.05
 PHI_NUM_BINS = 90
 SIGMA_R = 0.15
 SIGMA_PHI = 0.1
+ADF_R_MAX = 3.5                          # shorter cutoff for ADF (first shell)
 
 # Generation settings
 CUTOFF = 5.0
@@ -69,16 +71,17 @@ def normalize_adf(adf_raw, dphi):
 
 
 def compute_normalized_spectra(atoms, calc, species_list):
-    pos = torch.tensor(atoms.positions, dtype=torch.float64)
-    sp = torch.tensor(atoms.numbers, dtype=torch.long)
-    cell = torch.tensor(atoms.cell.array, dtype=torch.float64)
+    device = calc.r_grid.device
+    pos = torch.tensor(atoms.positions, dtype=torch.float64, device=device)
+    sp = torch.tensor(atoms.numbers, dtype=torch.long, device=device)
+    cell = torch.tensor(atoms.cell.array, dtype=torch.float64, device=device)
 
     with torch.no_grad():
         g2_raw, adf_raw = calc.compute(pos, sp, cell)
-    g2_raw = g2_raw.numpy()
-    adf_raw = adf_raw.numpy()
+    g2_raw = g2_raw.cpu().numpy()
+    adf_raw = adf_raw.cpu().numpy()
 
-    r = calc.r_grid.numpy()
+    r = calc.r_grid.cpu().numpy()
     dr = float(calc.r_step)
     volume = abs(np.linalg.det(atoms.cell.array))
     num_species = len(species_list)
@@ -90,7 +93,7 @@ def compute_normalized_spectra(atoms, calc, species_list):
             n_j = (atoms.numbers == species_list[j]).sum()
             g2_norm[i, j] = normalize_g2(g2_raw[i, j], r, n_i, n_j, volume, dr)
 
-    phi = calc.phi_grid.numpy()
+    phi = calc.phi_grid.cpu().numpy()
     dphi = phi[1] - phi[0] if len(phi) > 1 else 1.0
     adf_norm = np.zeros_like(adf_raw)
     for t_idx in range(adf_raw.shape[0]):
@@ -112,7 +115,8 @@ def main():
     calc = DifferentiablePDFADF(
         r_max=R_MAX, r_step=R_STEP, phi_num_bins=PHI_NUM_BINS,
         sigma_r=SIGMA_R, sigma_phi=SIGMA_PHI, species=SPECIES,
-    ).double()
+        adf_r_max=ADF_R_MAX,
+    ).double().to(device)
 
     # Reference spectra (normalized)
     print("Computing reference spectra...")
@@ -125,7 +129,7 @@ def main():
     with torch.no_grad():
         target_g2, target_adf = calc.compute(ref_pos, ref_sp, ref_cell)
 
-    loss_fn = DifferentiableSpectralLoss(calc)
+    loss_fn = DifferentiableSpectralLoss(calc, adf_weight=0.0)
 
     # Load model
     print(f"Loading: {CHECKPOINT}")
@@ -154,8 +158,8 @@ def main():
     from pathlib import Path
     Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
-    r = calc.r_grid.numpy()
-    phi_deg = np.rad2deg(calc.phi_grid.numpy())
+    r = calc.r_grid.cpu().numpy()
+    phi_deg = np.rad2deg(calc.phi_grid.cpu().numpy())
 
     # ── Generate: unconditional ──────────────────────────────────────────
 

@@ -7,8 +7,10 @@ __pycache__/
 build/
 dist/
 .claude/worktrees/
-
+uv.lock
 src/tricor/.DS_Store
 
 .DS_Store
 docs/_build/
+scripts/
+data/

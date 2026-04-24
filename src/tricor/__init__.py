@@ -11,12 +11,14 @@ from .supercell import Supercell
 from .differentiable_pdf import DifferentiablePDFADF, DifferentiableSpectralLoss
 
 __all__ = [
+    
     "CoordinationShellTarget",
+   
     "G3Distribution",
+   
     "Supercell",
     "DifferentiablePDFADF",
     "DifferentiableSpectralLoss",
-    "__version__",
     "__version__",
     "export_g2_compare_html",
     "export_overview_html",

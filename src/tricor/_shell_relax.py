@@ -34,6 +34,8 @@ class _ShellRelaxMixin:
         max_force_clip: float = 2.0,
         capture_trajectory: bool = False,
         show_progress: bool = True,
+        save_trajectory: bool = False,
+        trajectory_stride: int = 1,
     ) -> dict[str, Any]:
         """Relax random positions to match first-shell targets using spring forces.
 
@@ -402,6 +404,9 @@ class _ShellRelaxMixin:
         best_positions = self.atoms.positions.copy()
         best_loss = np.inf
 
+        positions_snapshots: list[np.ndarray] = []
+        snapshot_steps: list[int] = []
+
         if show_progress:
             progress = _TextProgressBar(num_steps, label="Shell relax", width=28)
         else:
@@ -410,6 +415,12 @@ class _ShellRelaxMixin:
         # --- main loop ---
         for step in range(num_steps + 1):
             pos = self.atoms.positions  # (num_atoms, 3) -- live reference
+
+            if save_trajectory and (
+                step % trajectory_stride == 0 or step == num_steps
+            ):
+                positions_snapshots.append(pos.astype(np.float32, copy=True))
+                snapshot_steps.append(step)
 
             # Rebuild bond topology periodically
             if step % neighbor_update_interval == 0:
@@ -610,10 +621,16 @@ class _ShellRelaxMixin:
             "angle_loss": angle_loss_history,
             "repulsion_loss": repulsion_loss_history,
         }
-        if trajectory is not None:
-            self.shell_relax_history["trajectory"] = trajectory
-        if atom_cost_history is not None:
-            self.shell_relax_history["atom_cost"] = atom_cost_history
+        if save_trajectory:
+            self.shell_relax_history["positions"] = np.stack(
+                positions_snapshots, axis=0,
+            )
+            self.shell_relax_history["snapshot_steps"] = np.asarray(
+                snapshot_steps, dtype=np.int32,
+            )
+            self.shell_relax_history["best_positions"] = best_positions.astype(
+                np.float32, copy=True,
+            )
 
         # Invalidate caches
         self.current_distribution = None
