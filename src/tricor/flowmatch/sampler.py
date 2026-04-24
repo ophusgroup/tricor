@@ -15,12 +15,15 @@ import ase
 from torch import Tensor
 from typing import Optional
 
-from graphite.nn import periodic_radius_graph
-from .flow_utils import wrap_periodic, sample_uniform_in_cell
+from .flow_utils import wrap_periodic, sample_uniform_in_cell, periodic_radius_graph_chunked
+
+_GRAPH_CHUNK = 1024
 
 
 def _build_graph(pos: Tensor, cell: Tensor, cutoff: float):
-    edge_index, edge_vec = periodic_radius_graph(pos, cutoff, cell)
+    edge_index, edge_vec = periodic_radius_graph_chunked(
+        pos, cutoff, cell, chunk=_GRAPH_CHUNK,
+    )
     edge_len = edge_vec.norm(dim=-1, keepdim=True)
     edge_attr = torch.hstack([edge_vec, edge_len])
     return edge_index, edge_attr

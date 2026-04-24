@@ -24,7 +24,6 @@ __all__ = [
     "export_g2_compare_html",
     "export_overview_html",
     "plot_g2_compare",
-,
 ]
 
 __version__ = "0.1.0"

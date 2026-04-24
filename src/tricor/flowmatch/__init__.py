@@ -19,7 +19,7 @@ from .sampler import generate, positions_to_atoms
 # Unconditional + guidance
 from .velocity_model_uncond import UncondVelocityModel, LitUncondFlowMatch
 from .data_uncond import UncondFlowMatchDataset, UncondFlowMatchDataModule
-from .sampler_guided import generate_unconditional, generate_guided
+from .sampler_guided import generate_unconditional, generate_guided, generate_hybrid
 
 __all__ = [
     # Conditional
@@ -36,4 +36,5 @@ __all__ = [
     "UncondFlowMatchDataModule",
     "generate_unconditional",
     "generate_guided",
+    "generate_hybrid",
 ]

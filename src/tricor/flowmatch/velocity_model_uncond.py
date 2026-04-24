@@ -118,6 +118,9 @@ class LitUncondFlowMatch(L.LightningModule):
         dim: int = 200,
         ema_decay: float = 0.9999,
         learn_rate: float = 1e-3,
+        lr_schedule: str = "none",      # "none" | "cosine"
+        lr_min_ratio: float = 0.01,     # eta_min = learn_rate * lr_min_ratio
+        warmup_steps: int = 0,          # linear warmup before the main schedule
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -134,6 +137,9 @@ class LitUncondFlowMatch(L.LightningModule):
         )
 
         self.learn_rate = learn_rate
+        self.lr_schedule = lr_schedule
+        self.lr_min_ratio = lr_min_ratio
+        self.warmup_steps = warmup_steps
 
     def training_step(self, batch, batch_idx):
         v_pred = self.model(
@@ -154,7 +160,35 @@ class LitUncondFlowMatch(L.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.model.parameters(), lr=self.learn_rate)
+        opt = torch.optim.Adam(self.model.parameters(), lr=self.learn_rate)
+        if self.lr_schedule == "none":
+            return opt
+
+        total_steps = int(self.trainer.estimated_stepping_batches)
+        eta_min = self.learn_rate * self.lr_min_ratio
+
+        if self.lr_schedule == "cosine":
+            cosine_steps = max(1, total_steps - self.warmup_steps)
+            cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=cosine_steps, eta_min=eta_min,
+            )
+            if self.warmup_steps > 0:
+                warmup = torch.optim.lr_scheduler.LinearLR(
+                    opt, start_factor=1e-3, end_factor=1.0,
+                    total_iters=self.warmup_steps,
+                )
+                sched = torch.optim.lr_scheduler.SequentialLR(
+                    opt, schedulers=[warmup, cosine], milestones=[self.warmup_steps],
+                )
+            else:
+                sched = cosine
+        else:
+            raise ValueError(f"Unknown lr_schedule: {self.lr_schedule}")
+
+        return {
+            "optimizer": opt,
+            "lr_scheduler": {"scheduler": sched, "interval": "step"},
+        }
 
     def optimizer_step(self, *args, **kwargs):
         super().optimizer_step(*args, **kwargs)
