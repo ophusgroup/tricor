@@ -57,7 +57,7 @@ EMA_DECAY = 0.9999
 LR = 5e-4
 
 # Training
-MAX_EPOCHS = 5000
+MAX_EPOCHS = 100
 BATCH_SIZE = 16
 NUM_WORKERS = 0                          # 0 avoids pickle errors with Python 3.14
 GPUS = 1
