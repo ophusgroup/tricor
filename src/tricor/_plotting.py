@@ -1330,18 +1330,32 @@ def _detect_shell_mask(
             right_bin = idx
             break
 
-    # --- Left edge: pin at the first non-zero bin to always capture
-    # the full rising edge, but don't go below 0.75 × pair_peak so a
-    # stray low-r count at a grain boundary can't drag the mask to
-    # r < 1 Å.
+    # --- Left edge: walk LEFT from the peak until the smoothed
+    # profile dips below ``dip_thresh``, mirroring the right-edge
+    # logic.  Floor at ``0.75 × pair_peak`` so a broad low-r tail
+    # (e.g. grain-boundary atoms smearing the rising edge in a
+    # nanocrystalline g(r), or Gaussian-smoothing bleed) can't drag
+    # the mask down past the true first-NN peak.
+    #
+    # The previous heuristic pinned the left edge at the first
+    # non-zero bin (capped at the 0.75 × pair_peak floor).  That
+    # captured the FULL rising edge for clean crystals, but for
+    # nanocrystalline cells where GB atoms fill the [0.75 × peak,
+    # peak] region with low-density counts, it left a wide "bleed"
+    # band of low-count data inside the shell window.  The dip-walk
+    # mirrors the right edge and gives a clean, symmetric cut.
     if pair_peak is not None and np.isfinite(pair_peak) and pair_peak > 0:
         lo_floor_r = 0.75 * float(pair_peak)
     else:
         lo_floor_r = 0.75 * peak_r
     lo_floor_bin = int(max(0, np.searchsorted(r, lo_floor_r) - 1))
-    first_nonzero = int(positive[0])
-    left_bin = max(first_nonzero, lo_floor_bin)
-    # But never start past the peak.
+
+    left_bin = lo_floor_bin
+    for idx in range(peak_bin - 1, lo_floor_bin - 1, -1):
+        if smoothed[idx] <= dip_thresh:
+            left_bin = idx
+            break
+    # Never start past the peak.
     left_bin = min(left_bin, peak_bin)
 
     mask[left_bin : right_bin + 1] = True

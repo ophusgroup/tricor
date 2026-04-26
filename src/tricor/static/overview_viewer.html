@@ -50,7 +50,28 @@ for (let i = 0; i < DATA.structures.length; i++) {
 }
 
 (async function() {
-  const THREE = await import("https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js");
+  // Multi-CDN fallback.
+  const VERSION = "0.170.0";
+  const MIRRORS = [
+    "https://cdn.jsdelivr.net/npm/three@" + VERSION + "/build/three.module.js",
+    "https://unpkg.com/three@" + VERSION + "/build/three.module.js",
+    "https://esm.sh/three@" + VERSION + "/build/three.module.js",
+  ];
+  let THREE = null;
+  const errs = [];
+  for (const url of MIRRORS) {
+    try {
+      THREE = await Promise.race([
+        import(url),
+        new Promise((_, r) => setTimeout(() => r(new Error("timeout")), 5000))
+      ]);
+      break;
+    } catch (e) { errs.push(url + ": " + e.message); }
+  }
+  if (!THREE) {
+    document.body.innerHTML = "<p style='padding:16px;font:13px sans-serif;'>Failed to load Three.js from any CDN. Tried:<br/>" + errs.join("<br/>") + "</p>";
+    return;
+  }
 
   const canvas = document.getElementById("canvas");
   const renderer = new THREE.WebGLRenderer({ antialias: true, canvas });
