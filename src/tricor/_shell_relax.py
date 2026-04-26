@@ -778,9 +778,11 @@ class _ShellRelaxMixin:
             disables the term and reproduces unrestrained MC.  Small
             values (~0.1 - 1.0) preserve the input regime character
             (grain layout, amorphous topology) while still permitting
-            local relaxation; large values (≫ 10) freeze the structure
-            in place.  This is the smooth, physically motivated
-            replacement for the ``freeze_interior`` hack.
+            local relaxation; large values (≫ 10) hold the structure
+            essentially rigid.  Differentiable + globally defined, so
+            unlike a hard ``freeze_interior`` the cost surface stays
+            smooth and the relaxation can find consistent low-strain
+            configurations across grain boundaries.
         neighbor_update_interval
             Rebuild the bond topology every this many sweeps.
         capture_stride
@@ -789,6 +791,25 @@ class _ShellRelaxMixin:
         capture_trajectory
             Whether to store per-sweep positions.  Disable for very
             long runs where only cost / T / accept_rate matter.
+        freeze_interior
+            Legacy hard-freeze of crystalline grain interiors.  Only
+            takes effect when explicitly set to ``True`` *and* the cell
+            has populated ``_grain_ids`` / ``_grain_seeds`` (i.e. came
+            from :meth:`generate` with ``grain_size``).  Default
+            ``None`` leaves all atoms free; prefer ``k_restraint > 0``
+            for a smooth, differentiable, regime-preserving alternative.
+        freeze_mask
+            Explicit per-atom freeze mask of shape ``(num_atoms,)``.
+            ``True`` entries are pinned for the entire run.  Overrides
+            ``freeze_interior``.  Useful when the cell isn't grain-tiled
+            but you still want to hold specific atoms (e.g. an
+            interface) fixed.
+        grain_moves
+            If ``True`` (or ``None`` and the cell has ≥2 grains),
+            propose rigid rotation + translation of each grain every
+            ``grain_move_interval`` sweeps.
+        grain_move_interval, grain_sigma_rot, grain_sigma_trans
+            Frequency and amplitude of the grain rigid-body proposals.
 
         Returns
         -------
@@ -822,16 +843,17 @@ class _ShellRelaxMixin:
         ).astype(np.intp, copy=True)
 
         # --- resolve freeze_mask ---
-        # Priority: explicit mask > freeze_interior flag > auto-detect
-        # from self._grain_ids when available.  Matches shell_relax's
-        # built-in "freeze crystalline interior, relax grain-boundary
-        # atoms only" behaviour, which is what most users want for
-        # structure-preserving thermal refinement on nanocrystalline
-        # cells.
+        # Priority: explicit mask > explicit freeze_interior=True.
+        # ``freeze_interior=None`` (default) leaves all atoms free; the
+        # modern way to preserve regime structure is the differentiable
+        # ``k_restraint`` term (see kwarg above), which gives a smooth
+        # tether instead of a hard freeze.  ``freeze_interior=True`` is
+        # retained for back-compat with workflows that explicitly opted
+        # into the legacy hard-freeze behaviour.
         if freeze_mask is not None:
             _freeze_mask_arr = np.asarray(freeze_mask, dtype=bool)
         elif (
-            (freeze_interior is True or freeze_interior is None)
+            freeze_interior is True
             and getattr(self, "_grain_ids", None) is not None
             and getattr(self, "_grain_seeds", None) is not None
         ):
@@ -848,8 +870,10 @@ class _ShellRelaxMixin:
                 print(
                     f"thermal_relax: freezing {nfroz}/{len(self.atoms)} "
                     f"interior atoms; {len(self.atoms)-nfroz} grain-boundary "
-                    f"atoms will move.  Pass freeze_interior=False to "
-                    f"relax everything."
+                    f"atoms will move.  (Consider ``k_restraint`` as a "
+                    f"smoother alternative — it tethers all atoms to "
+                    f"their starting positions with a spring instead of "
+                    f"hard-freezing the interior.)"
                 )
         else:
             _freeze_mask_arr = None
@@ -944,6 +968,16 @@ class _ShellRelaxMixin:
             hist["repulsion_loss"] / max(len(self.atoms), 1),
             lw=1.0, alpha=0.7, label="repulsion (per atom)",
         )
+        # Position-restraint loss is only surfaced when k_restraint > 0
+        # was used; older histories (or runs at k=0) don't show this
+        # curve so the plot stays clean for unrestrained relaxations.
+        # Use a small absolute tolerance so floating-point noise from
+        # the ``total - bond - angle - rep`` decomposition doesn't
+        # accidentally trigger the curve at k=0.
+        restraint = hist.get("restraint_loss")
+        if restraint is not None and float(np.max(np.asarray(restraint))) > 1e-6:
+            ax.plot(hist["step"], restraint, lw=1.0, alpha=0.7,
+                    label="restraint", color="#9467bd")
         if log_y:
             positive = hist["loss"][hist["loss"] > 0.0]
             if positive.size:
@@ -999,6 +1033,22 @@ class _ShellRelaxMixin:
         ax_cost.plot(hist["sweep"], np.asarray(hist["cost_bond"]) / n, lw=0.9, alpha=0.7, label="bond")
         ax_cost.plot(hist["sweep"], np.asarray(hist["cost_angle"]) / n, lw=0.9, alpha=0.7, label="angle")
         ax_cost.plot(hist["sweep"], np.asarray(hist["cost_rep"]) / n, lw=0.9, alpha=0.7, label="repulsion")
+        # Position-restraint cost is only surfaced when k_restraint > 0
+        # was used; older histories (or runs at k=0) don't surface this
+        # curve so the legend stays compact for unrestrained runs.
+        # Tolerance compares to the ``cost`` magnitude so the curve
+        # only shows when the restraint is a meaningful fraction of
+        # total energy (filters FP noise from the
+        # ``total - bond - angle - rep`` decomposition at k=0).
+        cost_restraint = hist.get("cost_restraint")
+        if cost_restraint is not None:
+            restraint_arr = np.asarray(cost_restraint)
+            cost_arr = np.asarray(hist["cost"])
+            cost_scale = float(np.max(np.abs(cost_arr))) + 1e-12
+            if float(np.max(np.abs(restraint_arr))) > 1e-6 * cost_scale:
+                ax_cost.plot(hist["sweep"], restraint_arr / n,
+                             lw=0.9, alpha=0.7, label="restraint",
+                             color="#9467bd")
         if log_y:
             ax_cost.set_yscale("log")
         if log_x:
@@ -1006,7 +1056,7 @@ class _ShellRelaxMixin:
             ax_cost.set_xscale("log")
         ax_cost.set_ylabel("cost / atom")
         ax_cost.set_title("Thermal MC history")
-        ax_cost.legend(ncols=5, fontsize=9, loc="upper right")
+        ax_cost.legend(ncols=6, fontsize=9, loc="upper right")
         ax_cost.grid(alpha=0.25)
 
         ax_T.plot(hist["sweep"], hist["T"], color="#c2454c", lw=1.6)
