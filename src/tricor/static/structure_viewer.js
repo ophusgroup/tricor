@@ -1,59 +1,121 @@
-// Load Three.js + OrbitControls via import map injection.
-// OrbitControls ESM does `import { ... } from "three"` which
-// requires the browser to resolve the bare specifier "three".
+// Load Three.js + OrbitControls with multi-CDN fallback.
+// Some Jupyter deployments block jsdelivr (CSP / VPN / offline);
+// we try a short list of well-known mirrors before giving up.
 let THREE = null;
 let OrbitControls = null;
+
+// Build (three_url, orbit_url) pairs to try in order.
+const THREE_VERSION = "0.170.0";
+const THREE_CDN_MIRRORS = [
+  [
+    `https://cdn.jsdelivr.net/npm/three@${THREE_VERSION}/build/three.module.js`,
+    `https://cdn.jsdelivr.net/npm/three@${THREE_VERSION}/examples/jsm/controls/OrbitControls.js`,
+  ],
+  [
+    `https://unpkg.com/three@${THREE_VERSION}/build/three.module.js`,
+    `https://unpkg.com/three@${THREE_VERSION}/examples/jsm/controls/OrbitControls.js`,
+  ],
+  [
+    `https://esm.sh/three@${THREE_VERSION}/build/three.module.js`,
+    `https://esm.sh/three@${THREE_VERSION}/examples/jsm/controls/OrbitControls.js`,
+  ],
+  [
+    `https://cdnjs.cloudflare.com/ajax/libs/three.js/r170/three.module.js`,
+    // cdnjs doesn't mirror OrbitControls reliably; leave null and
+    // we'll reuse whichever Orbit URL the caller succeeded with.
+    null,
+  ],
+];
+
+async function _fetchText(url, timeoutMs = 8000) {
+  const ctrl = new AbortController();
+  const tid = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, { signal: ctrl.signal });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    return await resp.text();
+  } finally {
+    clearTimeout(tid);
+  }
+}
+
+let _threeBlobUrl = null;  // Kept alive across session so OrbitControls can refer back.
 
 async function ensureThree() {
   if (THREE) return;
 
-  // Inject import map so "three" resolves to the CDN URL
-  if (!document.querySelector('script[type="importmap"][data-tricor]')) {
-    const map = document.createElement("script");
-    map.type = "importmap";
-    map.setAttribute("data-tricor", "1");
-    map.textContent = JSON.stringify({
-      imports: {
-        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
-        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
-      }
-    });
-    document.head.appendChild(map);
-    // Import maps must be added before any module imports, but
-    // in Jupyter the page is already loaded. Fall back to manual
-    // patching if the import map doesn't take effect.
-  }
-
-  // Try ESM import first
-  try {
-    THREE = await import("https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js");
-    // Patch globalThis so OrbitControls can find "three"
-    const threeKeys = Object.keys(THREE);
-    if (!globalThis.__three_module_cache) {
-      globalThis.__three_module_cache = THREE;
+  const errors = [];
+  let threeSrc = null;
+  let chosenMirrorIdx = -1;
+  for (let i = 0; i < THREE_CDN_MIRRORS.length; i++) {
+    const [tUrl] = THREE_CDN_MIRRORS[i];
+    try {
+      threeSrc = await _fetchText(tUrl);
+      chosenMirrorIdx = i;
+      break;
+    } catch (e) {
+      errors.push(`${tUrl}: ${e.message}`);
     }
-  } catch (e) {
-    throw new Error("Failed to load Three.js: " + e.message);
+  }
+  if (threeSrc === null) {
+    throw new Error(
+      "Failed to load Three.js source from any CDN mirror.  Tried:\n" +
+        errors.join("\n") +
+        "\n\nYour Jupyter environment likely can't reach a CDN. " +
+        "Workarounds: (a) run Jupyter on a network with internet access, " +
+        "(b) open the exported HTML files directly, or " +
+        "(c) file a tricor issue asking for a locally-bundled Three.js option.",
+    );
+  }
+  // Stable blob URL for Three.js that OrbitControls can reference.
+  const threeBlob = new Blob([threeSrc], { type: "application/javascript" });
+  _threeBlobUrl = URL.createObjectURL(threeBlob);
+  THREE = await import(_threeBlobUrl);
+  // Deliberately NOT revoking _threeBlobUrl - needs to stay live so
+  // OrbitControls (loaded next) can resolve its "three" import.
+  if (!globalThis.__three_module_cache) {
+    globalThis.__three_module_cache = THREE;
+    globalThis.__three_blob_url = _threeBlobUrl;
   }
 
-  // OrbitControls needs "three" as bare specifier. Fetch source
-  // and rewrite the import to use the full URL.
-  try {
-    const resp = await fetch("https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/controls/OrbitControls.js");
-    let src = await resp.text();
-    // Rewrite bare "three" import to absolute URL
-    src = src.replace(
-      /from\s+['"]three['"]/g,
-      'from "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js"'
-    );
-    const blob = new Blob([src], { type: "application/javascript" });
-    const url = URL.createObjectURL(blob);
-    const mod = await import(url);
-    URL.revokeObjectURL(url);
-    OrbitControls = mod.OrbitControls;
-  } catch (e) {
-    throw new Error("Failed to load OrbitControls: " + e.message);
+  // Fetch OrbitControls (any mirror works); rewrite bare-"three"
+  // import to point at the SAME blob URL we imported Three.js from.
+  // This way the browser only hits the CDN via fetch(); the second
+  // import() is a blob-URL import which CSP doesn't gate.
+  let orbitSrc = null;
+  const orbitErrors = [];
+  const orbitCandidates = [];
+  for (const [tUrl, oUrl] of THREE_CDN_MIRRORS) {
+    if (oUrl) orbitCandidates.push(oUrl);
   }
+  // Prefer the sibling of whichever three mirror worked, first.
+  const siblingOrbit = THREE_CDN_MIRRORS[chosenMirrorIdx][1];
+  if (siblingOrbit) {
+    orbitCandidates.unshift(siblingOrbit);
+  }
+  for (const candidate of orbitCandidates) {
+    try {
+      orbitSrc = await _fetchText(candidate);
+      break;
+    } catch (e) {
+      orbitErrors.push(`${candidate}: ${e.message}`);
+    }
+  }
+  if (orbitSrc === null) {
+    throw new Error(
+      "Failed to load OrbitControls from any mirror.  Tried:\n" +
+        orbitErrors.join("\n"),
+    );
+  }
+  orbitSrc = orbitSrc.replace(
+    /from\s+['"]three['"]/g,
+    `from "${_threeBlobUrl}"`,
+  );
+  const orbitBlob = new Blob([orbitSrc], { type: "application/javascript" });
+  const orbitBlobUrl = URL.createObjectURL(orbitBlob);
+  const mod = await import(orbitBlobUrl);
+  URL.revokeObjectURL(orbitBlobUrl);
+  OrbitControls = mod.OrbitControls;
 }
 
 async function render({ model, el }) {
