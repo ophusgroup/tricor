@@ -1591,7 +1591,30 @@ class _MonteCarloMixin:
         return measured
 
     def sync_g3(self: "Supercell", *, show_progress: bool = True) -> G3Distribution:
-        """Recompute the supercell g2/g3 from scratch and rebuild MC caches."""
+        """Recompute the supercell's g2 + g3 from scratch and rebuild Monte-Carlo caches.
+
+        Forces a fresh :meth:`measure_g3` (bypassing any cached
+        result) and then re-initialises the per-atom contribution
+        tables that :meth:`monte_carlo` uses to compute incremental
+        ΔG3 / Δcost on each trial move.  Call after externally
+        modifying ``self.atoms.positions`` (e.g. injecting
+        a :func:`numpy.random.normal` thermal jitter) or after
+        chaining a :meth:`shell_relax` between MC rounds — otherwise
+        the MC caches refer to stale neighbour pairings and the
+        proposed-move statistics drift.
+
+        Parameters
+        ----------
+        show_progress : bool, optional
+            Display a tqdm-style progress bar while the underlying
+            :meth:`measure_g3` iterates.  Default ``True``.
+
+        Returns
+        -------
+        G3Distribution
+            The freshly measured distribution, also stored as
+            ``self.current_distribution``.
+        """
         measured = self.measure_g3(force=True, show_progress=show_progress)
         self._initialize_mc_state()
         return measured
@@ -1613,11 +1636,69 @@ class _MonteCarloMixin:
         output_format: str = "npz",
         show_progress: bool = True,
     ) -> dict[str, Any] | Path:
-        """Generate a coarse teacher trajectory for model training.
+        """Generate a sparse teacher trajectory for ML coordinate-update training.
 
-        This method keeps the exact repulsion and Monte Carlo logic intact, but
-        records sparse snapshots of the trajectory so a later model can learn
-        coordinate updates that move structures toward the target `g3`.
+        Runs the standard repulsion → Monte-Carlo pipeline that
+        :meth:`generate` uses internally, but records snapshots
+        every ``snapshot_stride_accepted`` accepted moves so a
+        downstream model can learn to predict per-atom coordinate
+        updates that drive a starting structure toward
+        ``self.target_distribution``.
+
+        Parameters
+        ----------
+        repulsion_steps : int, optional
+            Number of repulsion-only relaxation steps applied first
+            (separates overlapping starting positions).  Default
+            ``10``.
+        repulsion_step_size : float, optional
+            Per-step displacement magnitude for the repulsion phase
+            (Å).  ``None`` (default) lets :meth:`repulsion` choose.
+        repulsion_cutoff : float, optional
+            Pair-distance cutoff for repulsion-force evaluation (Å).
+            ``None`` (default) auto-picks from ``shell_target``.
+        mc_steps : int, optional
+            Number of Monte-Carlo trial moves to attempt.
+            Default ``1_000``.
+        temperature : float, optional
+            MC sampling temperature (in energy units of the cost
+            function).  ``0.0`` (default) accepts only downhill moves.
+        jump_size : float, optional
+            Standard deviation (Å) of the Gaussian displacement
+            proposed per atom.  ``None`` (default) auto-picks based
+            on ``r_max``.
+        r_min_nn : float, optional
+            Minimum allowed nearest-neighbour distance (Å) — proposed
+            moves that violate this are rejected.  ``None`` (default)
+            uses ``shell_target.pair_hard_min``.
+        attempt_prob : float, optional
+            Probability of attempting an MC move per atom per sweep.
+            Default ``1.0`` (every atom gets a trial each sweep).
+        snapshot_stride_accepted : int, optional
+            Record one snapshot per this many accepted moves.
+            Default ``40``.  Smaller → finer-grained teacher traj
+            (larger output files).
+        target_id : str, optional
+            Identifier stored alongside each snapshot for grouping
+            multiple rollouts under one training tag.  Default uses
+            ``self.target_distribution.label``.
+        output_path : str or Path, optional
+            If given, write the snapshot list to this path and
+            return the path instead of the in-memory dict.
+        output_format : {"npz", "pickle"}, optional
+            Serialisation format when ``output_path`` is set.
+            Default ``"npz"``.
+        show_progress : bool, optional
+            Display tqdm progress bars during the repulsion and MC
+            phases.  Default ``True``.
+
+        Returns
+        -------
+        dict or Path
+            When ``output_path is None``: dict with keys
+            ``snapshots`` (list of per-snapshot dicts), ``target_id``,
+            ``repulsion_summary``, ``mc_summary``.  When
+            ``output_path`` is provided: returns the written path.
         """
         snapshot_stride_accepted = int(snapshot_stride_accepted)
         if snapshot_stride_accepted <= 0:

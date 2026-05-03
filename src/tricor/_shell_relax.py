@@ -805,10 +805,13 @@ class _ShellRelaxMixin:
             ``"smart"`` is a force-biased Langevin proposal with
             Metropolis correction (reserved for v2; currently treated
             as no-op).
-        bond_weight, angle_weight, repulsion_weight,
-        hard_core_scale, nonbond_push_scale
-            Same as :meth:`shell_relax`.
-        k_restraint
+        bond_weight : float, optional
+            Same as :meth:`shell_relax`.  Default ``1.0``.
+        angle_weight : float, optional
+            Same as :meth:`shell_relax`.  Default ``0.5``.
+        repulsion_weight : float, optional
+            Same as :meth:`shell_relax`.  Default ``3.0``.
+        k_restraint : float, optional
             Spring constant (eV / Å²) for a global position-restraint
             energy ``½ k_restraint Σ ‖r_i - r_initial_i‖²`` that tethers
             every atom to its starting position.  ``0.0`` (default)
@@ -820,6 +823,10 @@ class _ShellRelaxMixin:
             unlike a hard ``freeze_interior`` the cost surface stays
             smooth and the relaxation can find consistent low-strain
             configurations across grain boundaries.
+        hard_core_scale : float, optional
+            Same as :meth:`shell_relax`.  Default ``1.0``.
+        nonbond_push_scale : float, optional
+            Same as :meth:`shell_relax`.  Default ``1.0``.
         neighbor_update_interval
             Rebuild the bond topology every this many sweeps.
         capture_stride
@@ -841,12 +848,19 @@ class _ShellRelaxMixin:
             ``freeze_interior``.  Useful when the cell isn't grain-tiled
             but you still want to hold specific atoms (e.g. an
             interface) fixed.
-        grain_moves
+        grain_moves : bool, optional
             If ``True`` (or ``None`` and the cell has ≥2 grains),
             propose rigid rotation + translation of each grain every
             ``grain_move_interval`` sweeps.
-        grain_move_interval, grain_sigma_rot, grain_sigma_trans
-            Frequency and amplitude of the grain rigid-body proposals.
+        grain_move_interval : int, optional
+            Sweep cadence of the rigid-grain proposals.  Default ``1``
+            (one set of grain moves per sweep when enabled).
+        grain_sigma_rot : float, optional
+            Std-dev of the per-grain rotation angle (radians).
+            Default ``0.01``.
+        grain_sigma_trans : float, optional
+            Std-dev of the per-grain translation (Å).  Default
+            ``0.01``.
 
         Returns
         -------
@@ -988,7 +1002,33 @@ class _ShellRelaxMixin:
         *,
         log_y: bool = False,
     ):
-        """Plot the recorded shell-relax loss history using Matplotlib."""
+        """Plot the FIRE relaxation loss history captured by the most recent :meth:`shell_relax` call.
+
+        Renders the per-step total loss alongside its best-so-far
+        envelope and the three component contributions (bond, angle,
+        repulsion).  When the run was launched with
+        ``k_restraint > 0``, the position-restraint contribution is
+        added as a fifth curve in purple.
+
+        Parameters
+        ----------
+        log_y : bool, optional
+            Display the loss axis on a log scale.  Useful for runs
+            that span several orders of magnitude (e.g.
+            ``num_steps`` > 200 with stiff springs).  Default
+            ``False``.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            The created figure.
+
+        Raises
+        ------
+        ValueError
+            If :meth:`shell_relax` has not been run yet
+            (``self.shell_relax_history is None``).
+        """
         if self.shell_relax_history is None:
             raise ValueError("Run shell_relax() before plotting the history.")
 
@@ -1145,11 +1185,34 @@ class _ShellRelaxMixin:
         r_max: float = 8.0,
         title: str | None = None,
     ):
-        """Compare g(r) before and after thermal_relax.
+        """Compare g(r) before and after the most recent :meth:`thermal_relax` call.
 
-        Returns the IPython HTML object from
-        :func:`tricor.plot_g2_compare`.  The "before" snapshot is the
-        cell state cached at the start of :meth:`thermal_relax`.
+        Builds a g(r) overlay viewer with two curves: the cell state
+        cached at the start of :meth:`thermal_relax` ("before") and
+        the current state after the Monte-Carlo run completes
+        ("after").  Useful for visualising how an anneal schedule
+        sharpened or broadened the radial distribution.
+
+        Parameters
+        ----------
+        r_max : float, optional
+            Maximum radial distance (Å) plotted on the x-axis.
+            Default ``8.0`` Å.
+        title : str, optional
+            Title shown above the viewer.  Default uses the
+            supercell's ``label``.
+
+        Returns
+        -------
+        IPython.display.HTML
+            The rendered comparison viewer (auto-displays inline in
+            Jupyter when returned from a cell).
+
+        Raises
+        ------
+        ValueError
+            If :meth:`thermal_relax` has not been run yet (no cached
+            pre-thermal snapshot or history).
         """
         snap = getattr(self, "_thermal_start_snapshot", None)
         if snap is None:

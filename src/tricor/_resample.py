@@ -354,14 +354,21 @@ class _ResampleMixin:
             Stop after this many full round-robin passes regardless
             of time.  A pass with zero accepts triggers early
             convergence.
-        n_rot, n_trans
-            Per-grain trial budget.  Raise both to sample more
-            orientations / lattice anchors per grain.  Wall time
-            scales linearly with ``n_rot * n_trans * num_grains``.
-        rotation_min_deg, rotation_max_deg
-            Trial rotations are sampled uniformly in this angle
-            range about a uniformly-random axis.  Lower the minimum
-            to encourage fine local refinements late in the search.
+        n_rot : int, optional
+            Per-grain rotation trials.  Wall time scales linearly
+            with ``n_rot * n_trans * num_grains``.
+        n_trans : int, optional
+            Per-grain translation trials.  Combined with ``n_rot``
+            sets the basin coverage per grain.
+        rotation_min_deg : float, optional
+            Lower bound on trial rotation angle (degrees).  Lower
+            values encourage fine local refinements late in the
+            search.
+        rotation_max_deg : float, optional
+            Upper bound on trial rotation angle (degrees).  Trial
+            rotations sample uniformly in
+            ``[rotation_min_deg, rotation_max_deg]`` about a
+            uniformly-random axis.
         neighbor_shell_radius_factor
             The local FIRE region around each grain extends
             ``radius_factor * pair_peak_max`` Å beyond the grain
@@ -373,10 +380,19 @@ class _ResampleMixin:
             Number of FIRE descent steps per trial.  50 is enough to
             absorb the boundary strain from a fresh rotation; raising
             past 100 wastes budget.
-        bond_weight, angle_weight, repulsion_weight,
-        hard_core_scale, nonbond_push_scale
-            Spring weights — mirror the values used when the cell was
-            originally generated.
+        bond_weight : float, optional
+            Spring weight for bond-distance terms.  Mirror the value
+            used when the cell was originally generated.
+        angle_weight : float, optional
+            Spring weight for bond-angle terms.
+        repulsion_weight : float, optional
+            Spring weight for hard-core + nonbond-clearance terms.
+        hard_core_scale : float, optional
+            Multiplier on ``shell_target.pair_inner`` setting the
+            minimum allowed pair distance.
+        nonbond_push_scale : float, optional
+            Multiplier on ``shell_target.pair_peak`` setting the
+            non-bonded shell-clearance radius.
         final_quench_steps
             After the round-robin loop finishes, run this many
             full-cell FIRE steps (no freezing, no restraint) to lock
@@ -783,33 +799,80 @@ class _ResampleMixin:
         show_progress: bool = True,
         rng_seed: "int | None" = None,
     ) -> dict:
-        """Coarse-to-fine basin hopping per grain.
+        """Coarse-to-fine basin hopping for per-grain rotations.
 
         Walks an angle-amplitude schedule from coarse to fine.  For
         each ``(amplitude, grain)`` pair, samples
-        ``trials_per_amplitude`` candidate ``(R, T)`` pairs where the
-        rotation is bounded in angle by ``amplitude`` and *composed*
-        onto the grain's current orientation.  Local FIRE on each
-        candidate; the lowest-cost outcome wins for that grain.  The
-        same amplitude is repeated up to ``max_rounds_per_amplitude``
-        rounds while it keeps producing accepts; then the schedule
-        steps down to a smaller amplitude.
+        ``trials_per_amplitude`` candidate rotations bounded in angle
+        by ``amplitude`` and **composed** onto the grain's current
+        orientation, applies a short local FIRE on each, and accepts
+        the lowest-cost outcome.  The same amplitude is repeated up
+        to ``max_rounds_per_amplitude`` rounds while it keeps producing
+        accepts; then the schedule steps down.
 
-        Why this finds dozens of accepts where uniform-SO(3) sampling
-        finds 1-2:
-        - Each trial is *anchored* to the current orientation, so
-          fine refinements within the right basin keep yielding small
-          improvements.
-        - Translations are also bounded by the amplitude
-          (``trans_scale = amplitude / 180°``), giving matching
-          fine-tuning of the lattice anchor.
-        - Multi-round at each amplitude exhausts the local search
-          before stepping to a smaller amplitude.
+        This finds dozens of accepts where uniform-SO(3) sampling
+        finds only 1-2 because every trial is anchored to the current
+        orientation, so fine refinements within the chosen basin keep
+        yielding small improvements; translations are also bounded by
+        the amplitude (``trans_scale = amplitude / 180°``); and
+        multi-round at each amplitude exhausts the local search
+        before stepping to a smaller amplitude.
 
-        Returns a history dict identical in shape to
-        :meth:`refine_grains`'s history (so the trajectory + cost
-        plotters work unchanged), plus an ``rotation_amplitude_deg``
-        array marking which amplitude phase produced each accept.
+        Parameters
+        ----------
+        shell_target : CoordinationShellTarget
+            Target whose ``pair_peak`` defines the per-pair bond
+            length the cost function targets.
+        initial_uniform_trials : int, optional
+            Stage-1 uniform-SO(3) basin search per grain (rotations
+            sampled independently of the current orientation, used
+            only to escape the seed orientation).  Default ``32``.
+            Set ``0`` to skip the basin search.
+        angle_schedule_deg : tuple of float, optional
+            Stage-2 amplitude schedule (degrees), coarse → fine.
+            Default ``(45, 22, 11, 5, 2, 1)``.
+        trials_per_amplitude : int, optional
+            Candidate rotations per (amplitude, grain).  Default
+            ``12``.
+        max_rounds_per_amplitude : int, optional
+            Maximum round-robin passes over all grains within one
+            amplitude phase.  Default ``3``.
+        local_fire_steps : int, optional
+            FIRE steps applied to each trial's neighbour shell to
+            evaluate its cost.  Default ``50``.
+        neighbor_shell_radius_factor : float, optional
+            Local-FIRE neighbour shell extends to this multiple of
+            ``shell_target.pair_peak`` around the perturbed grain.
+            Default ``2.5``.
+        bond_weight, angle_weight, repulsion_weight : float, optional
+            Spring weights forwarded to the per-trial FIRE + cost
+            evaluation.
+        hard_core_scale, nonbond_push_scale : float, optional
+            Repulsion thresholds for the per-trial FIRE.
+        final_quench_steps : int, optional
+            Whole-cell FIRE quench steps applied after the SO(3)
+            search completes.  Default ``200``; set ``0`` to skip.
+        time_budget_sec : float, optional
+            Wall-time guard rail (seconds).  The search bails after
+            this even if amplitudes remain.  Default ``180``.
+        capture_trajectory : bool, optional
+            Record per-frame atom positions after each acceptance.
+            Default ``True`` (needed for trajectory-replay HTML).
+        show_progress : bool, optional
+            Display a tqdm progress bar.  Default ``True``.
+        rng_seed : int, optional
+            Seed for the rotation sampler.  ``None`` (default) uses
+            the cell's own RNG.
+
+        Returns
+        -------
+        dict
+            History captured under
+            ``self.refine_grains_coarse_to_fine_history`` — same
+            shape as :meth:`refine_grains`'s history (so the
+            trajectory + cost plotters work unchanged), plus a
+            ``rotation_amplitude_deg`` array marking which amplitude
+            phase produced each accept.
         """
         if getattr(self, "_grain_ids", None) is None:
             raise ValueError(
@@ -2314,22 +2377,110 @@ class _ResampleMixin:
         rng_seed: "int | None" = None,
         show_progress: bool = True,
     ) -> dict:
-        """Optimise per-grain rotations BEFORE the global FIRE quench.
+        """Optimise per-grain rotations via SO(3) coordinate descent BEFORE the global FIRE quench.
 
-        Designed to be called between the Voronoi tile (which assigns
-        random initial rotations) and the global FIRE quench.  The
-        intended workflow is::
+        Walks each Voronoi grain through a sequence of progressively
+        finer rotation perturbations, accepting any rotation that
+        lowers a fast topology-free pair-distance score against the
+        grain's local environment.  Designed to be called between
+        the Voronoi tile (which assigns random initial rotations) and
+        the global FIRE quench.  The intended workflow is::
 
             cell.generate(shell, num_steps=0, ...)        # build only
             cell.refine_initial_orientations(shell)        # this method
             cell.shell_relax(shell, num_steps=150, ...)    # FIRE quench
 
-        Or equivalently, run ``generate()`` end-to-end then call this
-        method (which retiles each grain at its current rotation,
-        discarding the FIRE relaxation it had) and re-quench afterwards.
+        Or equivalently use ``cell.generate(refine_orientations=True,
+        refine_orientations_kwargs=...)`` which chains the three
+        steps in one call.
 
-        Returns a history dict with ``iteration`` / ``cost`` /
-        ``accepted_grain`` / ``amplitude_deg`` arrays for plotting.
+        Parameters
+        ----------
+        shell_target : CoordinationShellTarget
+            Target whose ``pair_peak`` defines the per-pair bond
+            length the score targets.
+        amplitudes_deg : tuple of float, optional
+            Schedule of rotation amplitudes (degrees) the SO(3)
+            coordinate search walks through.  Default
+            ``(30, 15, 5, 2)``: the largest step lets a misaligned
+            grain escape its starting basin, the smallest step locks
+            in the chosen orientation.
+        trials_per_amplitude_per_grain : int, optional
+            Number of random rotations sampled per (amplitude,
+            grain).  Default ``50``.  The best-scoring trial is
+            accepted if it beats the current orientation by more
+            than ``score_cutoff_factor``.
+        max_rounds_per_amplitude : int, optional
+            Number of full passes over all grains within one
+            amplitude phase.  Default ``2``.
+        bond_weight, angle_weight, repulsion_weight : float, optional
+            Spring weights forwarded to the per-trial score.  Only
+            used when ``cost_function="cached_topology"``; the
+            default ``"pair_distance"`` mode ignores them.
+        hard_core_scale, nonbond_push_scale : float, optional
+            Repulsion thresholds passed through to the per-trial
+            score's clash-penalty term.
+        time_budget_sec : float, optional
+            Wall-time guard rail (seconds).  The search bails after
+            this even if amplitudes remain.  Default ``120``.
+        final_fire_steps : int, optional
+            If > 0, run a whole-cell ``shell_relax`` for this many
+            steps after the SO(3) search completes — bakes a final
+            quench into a single call.  Default ``0`` (caller is
+            expected to run their own ``shell_relax``).
+        capture_trajectory : bool, optional
+            Record the cell's atom positions at every accepted
+            rotation.  Default ``False`` (faster).  Set to ``True``
+            for trajectory-replay HTML export.
+        cost_function : {"pair_distance", "cached_topology"}, optional
+            Score to minimise.  ``"pair_distance"`` (default,
+            recommended) is a topology-free
+            ``Σ (d - pair_peak)²`` over neighbour pairs in the
+            grain's local frame — fast and consistent across grains
+            and trials.  ``"cached_topology"`` uses
+            ``_total_energy_fast`` with a rebuilt bond list (more
+            physically faithful but the rebuilt topology drifts as
+            positions change and can walk into a worse basin on big
+            cells).
+        score_cutoff_factor : float, optional
+            Acceptance threshold relative to the current baseline
+            score.  Higher values accept more aggressively.  Default
+            ``1.5``.
+        topology_rebuild : {"per_grain", "per_amp", "once"}, optional
+            Cadence for rebuilding the bond list (only used when
+            ``cost_function="cached_topology"``).  Default
+            ``"per_grain"``.
+        rng_seed : int, optional
+            Seed for the random rotation sampler.  ``None`` (default)
+            uses the cell's own RNG.
+        show_progress : bool, optional
+            Display a tqdm progress bar over the (amplitudes ×
+            rounds × grains) workload.  Default ``True``.
+
+        Returns
+        -------
+        dict
+            History captured under
+            ``self.refine_initial_orientations_history``:
+
+            - ``iteration`` (ndarray of int) — accept indices,
+              starting at 0 for the initial state.
+            - ``global_cost`` (ndarray of float) — total cost at
+              each accepted state.
+            - ``cost_bond`` / ``cost_angle`` / ``cost_rep`` — cost
+              decomposition (only populated for
+              ``cost_function="cached_topology"``).
+            - ``accepted_grain`` (ndarray of int) — grain index
+              that moved at each acceptance (-1 for the initial
+              state).
+            - ``rotation_amplitude_deg`` (ndarray of float) — the
+              current amplitude phase at each acceptance.
+            - ``amplitude_phase`` (ndarray of int) — phase index
+              into ``amplitudes_deg``.
+            - ``trajectory`` (ndarray of float32, optional) — only
+              present when ``capture_trajectory=True``: positions
+              ``(num_accepts, num_atoms, 3)`` at each accepted
+              rotation.
         """
         from ._thermal_mc import _build_thermal_topology, _total_energy_fast
 
