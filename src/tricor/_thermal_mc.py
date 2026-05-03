@@ -1577,7 +1577,15 @@ def thermal_relax_impl(
         sigma_hist[cap_idx] = sigma
         best_cost_hist[cap_idx] = best_cost
         if traj_hist is not None:
-            traj_hist[cap_idx] = positions.astype(np.float32)
+            # Wrap positions through PBC before storing the frame so
+            # the trajectory viewer never shows atoms outside the box.
+            # Hot-temperature MC accumulates unbounded displacements in
+            # the live ``positions`` array (energies are min-image so
+            # the dynamics are unaffected); the wrapped copy is for
+            # rendering only.
+            frac = positions @ cell_inv
+            frac -= np.floor(frac)
+            traj_hist[cap_idx] = (frac @ cell_mat).astype(np.float32)
         cap_idx += 1
 
     _capture(0, float(T_sched[0]), 0.0, float(step_sigma))
@@ -1734,6 +1742,14 @@ def thermal_relax_impl(
     if restore_best:
         positions[:] = best_positions
         species_idx[:] = best_species_idx
+    # Wrap final positions through PBC so ``cell.atoms`` always sits
+    # inside the simulation box even after a long high-temperature
+    # excursion (live MC accumulates unbounded drift; energies are
+    # min-image-corrected so the wrap is purely cosmetic for the
+    # final-state rendering).
+    frac = positions @ cell_inv
+    frac -= np.floor(frac)
+    positions[:] = frac @ cell_mat
     atoms.positions = positions
 
     # Trim history arrays.

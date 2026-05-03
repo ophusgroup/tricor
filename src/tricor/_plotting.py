@@ -426,7 +426,15 @@ def _resolve_polyhedra_cfg(
         detector = _detect_tetrahedra
         ideal_default = 109.47
         angle_tol_default = 25.0
-        scale_default = 1.0
+        # Single-element tetrahedra (e.g. Si-Si-Si in diamond): vertices
+        # sit directly on neighbour atoms when scale=1.0, which makes
+        # the polyhedra visually overlap.  Default to bond-midpoint
+        # vertices for cleaner rendering.  Multi-element tetrahedra
+        # (e.g. SiO₄: Si centre, O vertices) keep scale=1.0 so the
+        # vertices land on the actual O atoms.
+        same_element = cfg.get("center_symbol") == cfg.get("vertex_symbol") \
+            and cfg.get("center_symbol") is not None
+        scale_default = 0.5 if same_element else 1.0
     elif octahedra is not None:
         cfg = octahedra
         n_vertices = 6
@@ -434,7 +442,10 @@ def _resolve_polyhedra_cfg(
         detector = _detect_octahedra
         ideal_default = 90.0
         angle_tol_default = 18.0
-        scale_default = 1.0
+        # Same single-element logic as tetrahedra.
+        same_element = cfg.get("center_symbol") == cfg.get("vertex_symbol") \
+            and cfg.get("center_symbol") is not None
+        scale_default = 0.5 if same_element else 1.0
     elif cuboctahedra is not None:
         cfg = cuboctahedra
         n_vertices = 12
@@ -952,7 +963,7 @@ def export_overview_html(
     cells_and_labels,
     *,
     grid_cols: int = 3,
-    atom_scale: float = 0.18,
+    atom_scale: float = 0.17,
     bond_radius: float = 0.07,
     bond_color=(0.95, 0.1, 0.1),
     background_color: str = "#f7f8f5",
@@ -964,8 +975,8 @@ def export_overview_html(
     ideal_angle_deg: float = 109.47,
     bond_angle_tol_deg: float = 18.0,
     tetrahedra: dict | None = None,
-    tetrahedra_color=(0.25, 0.65, 0.95),
-    tetrahedra_opacity: float = 0.35,
+    tetrahedra_color=(0.35, 0.45, 0.95),
+    tetrahedra_opacity: float = 0.45,
     octahedra: dict | None = None,
     octahedra_color=(0.95, 0.55, 0.25),
     octahedra_opacity: float = 0.4,
@@ -1621,13 +1632,13 @@ class _PlottingMixin:
         output_path: str,
         *,
         bond_cutoff: float | None = None,
-        atom_scale: float = 0.32,
+        atom_scale: float = 0.17,
         bond_radius: float = 0.06,
         background_color: str = "#f7f8f5",
         title: str = "",
         tetrahedra: dict | None = None,
-        tetrahedra_color=(0.25, 0.65, 0.95),
-        tetrahedra_opacity: float = 0.35,
+        tetrahedra_color=(0.35, 0.45, 0.95),
+        tetrahedra_opacity: float = 0.45,
         octahedra: dict | None = None,
         octahedra_color=(0.95, 0.55, 0.25),
         octahedra_opacity: float = 0.4,
@@ -1636,6 +1647,7 @@ class _PlottingMixin:
         cuboctahedra_opacity: float = 0.4,
         polyhedra_groups: "list[dict] | None" = None,
         show_bonds: bool | None = None,
+        history: "dict | str | None" = None,
     ) -> str:
         """Export an interactive 3D trajectory viewer as a self-contained HTML file.
 
@@ -1665,6 +1677,13 @@ class _PlottingMixin:
             ``True`` when no ``tetrahedra`` are requested, ``False`` when
             they are (tetrahedra supersede bonds).  Pass ``True`` / ``False``
             explicitly to override.
+        history
+            Which trajectory history to render.  ``None`` (default) uses
+            ``self.shell_relax_history``.  Pass ``"thermal_relax"`` to
+            render ``self.thermal_relax_history``, or pass an explicit
+            history dict.  Both shell-relax and thermal-relax dicts have
+            a ``"trajectory"`` key when their parent call was run with
+            ``capture_trajectory=True``.
 
         Returns
         -------
@@ -1675,12 +1694,34 @@ class _PlottingMixin:
         from ase.data import covalent_radii
         from ase.data.colors import jmol_colors
 
-        history = self.shell_relax_history
-        if history is None or "trajectory" not in history:
-            raise ValueError(
-                "No trajectory data available.  Run shell_relax() or "
-                "generate() with capture_trajectory=True first."
+        if history is None:
+            resolved_history = self.shell_relax_history
+            history_label = "shell_relax_history"
+        elif isinstance(history, str):
+            attr = (
+                "thermal_relax_history" if history in ("thermal", "thermal_relax")
+                else "shell_relax_history" if history in ("shell", "shell_relax")
+                else "refine_grains_history" if history in ("refine", "refine_grains")
+                else None
             )
+            if attr is None:
+                raise ValueError(
+                    f"history string must be one of "
+                    f"'shell_relax' / 'thermal_relax' / 'refine_grains'; "
+                    f"got {history!r}"
+                )
+            resolved_history = getattr(self, attr, None)
+            history_label = attr
+        else:
+            resolved_history = history
+            history_label = "(provided)"
+        if resolved_history is None or "trajectory" not in resolved_history:
+            raise ValueError(
+                f"No trajectory data available on {history_label}.  Run "
+                "shell_relax() / generate() / thermal_relax() with "
+                "capture_trajectory=True first."
+            )
+        history = resolved_history
         trajectory = np.asarray(history["trajectory"], dtype=np.float32)
         n_frames, n_atoms, _ = trajectory.shape
 
@@ -1738,12 +1779,13 @@ class _PlottingMixin:
         per_poly_faces: list[list[list[int]]] = []
         per_poly_edges: list[list[list[int]]] = []
 
-        # Resolve show_bonds auto-default: bonds follow atoms when no
-        # polyhedra are requested; polyhedra supersede bonds otherwise.
-        # Multi-group polyhedra_groups suppress bonds just like the
-        # legacy single-group tetrahedra= kwarg.
+        # Resolve show_bonds auto-default: bonds are NEVER drawn by
+        # default — they're an opt-in render mode now.  Polyhedra are
+        # the preferred visualisation when configured; otherwise the
+        # viewer shows atoms only.  Pass ``show_bonds=True`` to bring
+        # back the old bond cylinders.
         if show_bonds is None:
-            show_bonds_eff = tetra_cfg is None and not polyhedra_groups
+            show_bonds_eff = False
         else:
             show_bonds_eff = bool(show_bonds)
 

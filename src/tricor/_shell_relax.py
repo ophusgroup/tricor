@@ -26,6 +26,8 @@ class _ShellRelaxMixin:
         angle_weight: float = 0.5,
         repulsion_weight: float = 3.0,
         k_restraint: float = 0.0,
+        r_initial_override: "np.ndarray | None" = None,
+        freeze_mask: "np.ndarray | None" = None,
         hard_core_scale: float = 1.0,
         nonbond_push_scale: float = 1.0,
         step_size: float = 0.1,
@@ -418,7 +420,22 @@ class _ShellRelaxMixin:
         # corrected); ``k_restraint == 0`` disables the term.  This
         # lets the FIRE relaxation be globally differentiable yet still
         # tethered to the input regime structure.
-        r_initial = self.atoms.positions.copy()
+        #
+        # ``r_initial_override`` lets a caller supply a different
+        # reference (e.g. when chaining shell_relax after thermal_relax
+        # to do a final FIRE quench: the override should be the
+        # *pre-thermal* positions so the restraint still pulls atoms
+        # toward the regime's reference cell, not toward the post-MC
+        # configuration).
+        if r_initial_override is not None:
+            r_initial = np.ascontiguousarray(r_initial_override, dtype=np.float64).copy()
+            if r_initial.shape != self.atoms.positions.shape:
+                raise ValueError(
+                    f"r_initial_override has shape {r_initial.shape}; "
+                    f"expected {self.atoms.positions.shape}"
+                )
+        else:
+            r_initial = self.atoms.positions.copy()
         k_restraint_f = float(k_restraint)
 
         if show_progress:
@@ -578,12 +595,18 @@ class _ShellRelaxMixin:
                 # parallel to the bond / angle reporting style.
                 restraint_loss = float(np.mean(np.sum(d_restr * d_restr, axis=1)))
                 if atom_cost is not None:
-                    # 0.5 k Σ‖Δ‖² split per atom (each atom owns its
-                    # own restraint term, no double-counting).
-                    np.add.at(
-                        atom_cost,
-                        np.arange(num_atoms),
-                        0.5 * k_restraint_f * np.sum(d_restr * d_restr, axis=1),
+                    # 0.5 k Σ‖Δ‖² per atom (each atom owns its own
+                    # restraint term, no double-counting).  Use direct
+                    # ``+=`` rather than ``np.add.at`` — every index
+                    # appears exactly once so plain addition is
+                    # functionally identical and orders of magnitude
+                    # faster (np.add.at goes through the ufunc-at
+                    # machinery even for unique indices, which made
+                    # capture-trajectory FIRE quenches with k_restraint
+                    # > 0 take minutes per call).
+                    atom_cost += (
+                        0.5 * k_restraint_f
+                        * np.sum(d_restr * d_restr, axis=1)
                     )
 
             # ---------- record loss ----------
@@ -609,8 +632,22 @@ class _ShellRelaxMixin:
 
             # ---------- integrate (skip on last step) ----------
             if step < num_steps:
+                # Caller-supplied freeze mask: zero force + velocity on
+                # any True entry.  Used by ``refine_grains`` to relax
+                # only a grain + its neighbour shell while the rest of
+                # the cell stays put.  Takes precedence over the
+                # built-in grain-boundary detection.
+                if freeze_mask is not None:
+                    fm = np.asarray(freeze_mask, dtype=bool)
+                    if fm.shape != (num_atoms,):
+                        raise ValueError(
+                            f"freeze_mask shape {fm.shape} != ({num_atoms},)"
+                        )
+                    if np.any(fm):
+                        force[fm] = 0.0
+                        velocity[fm] = 0.0
                 # Freeze interior grain atoms: zero force and velocity
-                if is_boundary is not None:
+                elif is_boundary is not None:
                     interior_mask = ~is_boundary
                     if np.any(interior_mask):
                         force[interior_mask] = 0.0
@@ -1056,7 +1093,23 @@ class _ShellRelaxMixin:
             ax_cost.set_xscale("log")
         ax_cost.set_ylabel("cost / atom")
         ax_cost.set_title("Thermal MC history")
-        ax_cost.legend(ncols=6, fontsize=9, loc="upper right")
+        # Trim very-low-magnitude tail when on log so the curves use
+        # the full vertical span rather than getting squashed against
+        # the top by a single curve that decays many orders of magnitude.
+        if log_y:
+            cost_arrs = [
+                np.asarray(hist["cost"]) / n,
+                np.asarray(hist["cost_bond"]) / n,
+                np.asarray(hist["cost_angle"]) / n,
+                np.asarray(hist["cost_rep"]) / n,
+            ]
+            stacked = np.concatenate(cost_arrs)
+            positive = stacked[stacked > 0]
+            if positive.size:
+                lo = float(np.percentile(positive, 1.0))
+                hi = float(np.max(stacked))
+                if hi > 0:
+                    ax_cost.set_ylim(max(lo * 0.5, 1e-12), hi * 1.6)
         ax_cost.grid(alpha=0.25)
 
         ax_T.plot(hist["sweep"], hist["T"], color="#c2454c", lw=1.6)
@@ -1072,7 +1125,18 @@ class _ShellRelaxMixin:
         ax_acc.tick_params(axis="y", labelcolor="#2a6e4e")
         ax_acc.set_ylim(0.0, 1.0)
 
-        fig.tight_layout()
+        # Legend below the figure so it never overlaps the cost curves.
+        # Use the cost-panel handles only (the T-panel curves are
+        # self-explanatory from their axis labels).
+        handles, labels = ax_cost.get_legend_handles_labels()
+        fig.legend(
+            handles, labels,
+            ncol=min(7, len(handles)),
+            fontsize=9, loc="lower center",
+            bbox_to_anchor=(0.5, -0.02),
+            frameon=False,
+        )
+        fig.subplots_adjust(bottom=0.18)
         return fig, (ax_cost, ax_T)
 
     def plot_thermal_before_after(
