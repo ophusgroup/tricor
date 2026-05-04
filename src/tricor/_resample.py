@@ -407,13 +407,13 @@ class _ResampleMixin:
         Wall-clock for the demo runs in this repo
         (``cell_dim_angstroms = (40, 40, 40)``):
 
-        ===========  =======  ===========  ===========
-        regime       grains   ~accepts/run wall time
-        ===========  =======  ===========  ===========
-        amorphous    ~600     ~50          5–7 min
-        MRO          ~50      ~10          2–3 min
-        nano (NC)    ~5       ~3           30–60 s
-        ===========  =======  ===========  ===========
+        ===========  =======  =============  ===========
+        regime       grains   ~accepts/run   wall time
+        ===========  =======  =============  ===========
+        amorphous    ~600     ~50            5–7 min
+        MRO          ~50      ~10            2–3 min
+        nano (NC)    ~5       ~3             30–60 s
+        ===========  =======  =============  ===========
 
         For production-quality output (e.g. ML training datasets),
         raise ``time_budget_sec`` to 1800 - 3600, raise ``n_rot`` to
