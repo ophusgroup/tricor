@@ -385,9 +385,20 @@ class _GrainMixin:
                 src["atoms"].get_scaled_positions(wrap=True), dtype=np.float64
             )
             src_numbers = np.asarray(src["atoms"].numbers, dtype=np.int64)
-            masters.append(
-                _build_master_atom_block_3d(src_cell, src_basis, src_numbers, radius)
+            master = _build_master_atom_block_3d(
+                src_cell, src_basis, src_numbers, radius,
             )
+            # Tag each master with its source's species_offset so the
+            # orientation-refinement retile can restore the correct
+            # virtual-species index for the rotated grain.  Without
+            # this, multi-source composite cells (sp²/sp³ carbon,
+            # SiO₂/Si₃N₄ blends, ...) lose all virtual-species
+            # information after refinement because every atom carries
+            # the SAME atomic number — searchsorted(self._species,
+            # numbers) returns 0 for every atom and tags them all as
+            # the first virtual species.
+            master["species_offset"] = int(src.get("species_offset", 0))
+            masters.append(master)
 
         # Per-grain source assignment: draw by weight (or uniform for
         # legacy single-source).  Store on self so the trajectory

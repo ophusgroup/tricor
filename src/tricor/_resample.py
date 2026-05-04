@@ -2743,10 +2743,26 @@ class _ResampleMixin:
                         new_pos_world, new_nums_world = retile
                         self.atoms.positions[grain_mask] = new_pos_world
                         self.atoms.numbers[grain_mask] = new_nums_world
-                        # Re-map species index for the grain atoms
-                        species_idx[grain_indices] = np.searchsorted(
-                            self._species, new_nums_world,
-                        )
+                        # Re-map species index for the grain atoms.
+                        # For composite shell targets with virtual
+                        # species (sp²-C and sp³-C both at atomic
+                        # number 6), ``searchsorted(self._species,
+                        # numbers)`` is wrong because every atom
+                        # has the same atomic number and the
+                        # searchsorted result is always 0.  The
+                        # species_offset is a grain-level property
+                        # set when the master block was built — use
+                        # it directly so each grain's atoms keep
+                        # their virtual-species tag through the
+                        # rotation search.
+                        if "species_offset" in master:
+                            species_idx[grain_indices] = int(
+                                master["species_offset"]
+                            )
+                        else:
+                            species_idx[grain_indices] = np.searchsorted(
+                                self._species, new_nums_world,
+                            )
                         if (cost_function == "cached_topology"
                                 and topology_rebuild == "per_trial"):
                             topo = _build_topo()
@@ -2769,9 +2785,20 @@ class _ResampleMixin:
                     if best_atoms_grain is not None:
                         self.atoms.positions[grain_mask] = best_atoms_grain
                         self.atoms.numbers[grain_mask] = best_nums_grain
-                        species_idx[grain_indices] = np.searchsorted(
-                            self._species, best_nums_grain,
-                        )
+                        # Same virtual-species fix as the trial loop:
+                        # use the grain's species_offset (set on the
+                        # master block when it was built) instead of
+                        # ``searchsorted(self._species, numbers)``,
+                        # which is wrong when atoms share atomic
+                        # numbers across virtual species.
+                        if "species_offset" in master:
+                            species_idx[grain_indices] = int(
+                                master["species_offset"]
+                            )
+                        else:
+                            species_idx[grain_indices] = np.searchsorted(
+                                self._species, best_nums_grain,
+                            )
                         current_rotations[gid] = best_R
                         current_translations[gid] = best_T
                         iteration += 1
