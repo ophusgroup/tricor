@@ -28,6 +28,7 @@ class _ShellRelaxMixin:
         k_restraint: float = 0.0,
         r_initial_override: "np.ndarray | None" = None,
         freeze_mask: "np.ndarray | None" = None,
+        freeze_grain_interiors: bool = False,
         hard_core_scale: float = 1.0,
         nonbond_push_scale: float = 1.0,
         step_size: float = 0.1,
@@ -90,6 +91,18 @@ class _ShellRelaxMixin:
         max_force_clip
             Per-atom force magnitude is clipped to this value before
             integration to keep the dynamics stable.
+        freeze_grain_interiors
+            If ``True``, atoms identified as deep grain interior (more
+            than ``0.5 × max(pair_peak)`` away from the nearest
+            grain-boundary plane) are held fixed during relaxation.
+            ``False`` (default since 2026-05) lets every atom relax,
+            which is required for multi-species systems where the
+            interior atoms must accommodate cross-species spring
+            strain (SiO2, SrTiO3, sp²/sp³ carbon).  Setting ``True``
+            reproduces the pre-2026 behaviour and is occasionally
+            useful for single-species nanocrystalline cells where the
+            interiors are already at their target geometry.  Has no
+            effect on cells built without a ``grain_size``.
         show_progress
             Display a text progress bar.
 
@@ -158,12 +171,20 @@ class _ShellRelaxMixin:
         nonbond_push[nonbond_push < _EPS] = float(np.max(pair_peak)) * 1.5
 
         # --- grain-aware force scaling ---
-        # When _grain_ids is set, interior atoms are frozen to preserve
-        # crystalline order; boundary atoms get full relaxation forces.
+        # When _grain_ids is set AND the caller asks for it, interior
+        # atoms are frozen to preserve crystalline order; boundary
+        # atoms get full relaxation forces.  The default since 2026-05
+        # is ``freeze_grain_interiors=False``: every atom relaxes.
+        # Pre-fix behaviour (interior frozen) caused multi-species
+        # systems (SiO2, SrTiO3, sp²/sp³ carbon) to plateau in a
+        # high-energy basin because the interior atoms could not
+        # accommodate cross-species spring strain that propagated in
+        # from the boundaries.
         grain_ids = self._grain_ids
         grain_seeds = self._grain_seeds
         if (
-            grain_ids is not None
+            freeze_grain_interiors
+            and grain_ids is not None
             and grain_seeds is not None
             and len(grain_ids) == num_atoms
         ):

@@ -153,6 +153,7 @@ class CoordinationShellTarget:
         shell_hist_step: float = 0.05,
         shell_smooth_sigma_bins: float = 1.2,
         extract_cutoff: float | None = None,
+        auto_filter_lattice_artifacts: bool = True,
         label: str | None = None,
     ) -> "CoordinationShellTarget":
         """Extract first-shell coordination, distance, and angle targets from a reference crystal.
@@ -190,6 +191,18 @@ class CoordinationShellTarget:
             building the neighbour list.  If ``None`` the routine picks
             ``min(default, max(3.8 × NN, NN + 2))`` based on the
             inferred nearest-neighbour distance.
+        auto_filter_lattice_artifacts : bool, optional
+            If ``True`` (default), zero out ``coordination_target`` for
+            species pairs that represent lattice artefacts rather than
+            real chemical bonds.  A pair ``(i, j)`` is kept only when
+            ``pair_peak[i, j]`` is the smallest enabled peak in
+            either row ``i`` or column ``j``.  This automatically
+            silences the second-shell ``Si-Si`` / ``O-O`` springs in
+            ``SiO2``, the ``Sr-Sr`` / ``Ti-Ti`` / ``O-O`` / ``Sr-Ti``
+            springs in ``SrTiO3``, etc.  Set to ``False`` to keep every
+            extracted pair (pre-2026 behaviour); callers can also
+            override the filter by chaining
+            :meth:`with_bonded_species_pairs` after extraction.
         label : str, optional
             Free-text identifier carried along on the returned target
             (used in plot legends and HTML viewer titles).  Default
@@ -343,6 +356,58 @@ class CoordinationShellTarget:
                 centered_counts = counts[centers]
                 coordination_target[center_ind, neigh_ind] = float(np.mean(centered_counts))
                 coordination_std[center_ind, neigh_ind] = float(np.std(centered_counts))
+
+        # ----------------------------------------------------------------
+        # Auto-filter lattice-artefact bond pairs.
+        #
+        # In multi-element crystals like SiO2 and SrTiO3 the
+        # neighbour-list extraction also picks up the *second* shell
+        # (Si-Si at 3.06 Å in alpha-quartz, O-O at 2.64 Å, Sr-Sr at
+        # 3.91 Å in SrTiO3, etc.) and emits a non-zero
+        # ``coordination_target`` for those pairs.  Treating them as
+        # bonds during shell relaxation puts geometrically-incompatible
+        # springs on the same atom (each Si simultaneously gets pulled
+        # to 4 O at 1.61 Å AND 4 Si at 3.06 Å, etc.) and FIRE thrashes
+        # without converging.
+        #
+        # Heuristic: pair (i, j) is a real chemical bond iff
+        # ``pair_peak[i, j]`` is the smallest enabled peak for at least
+        # one of {row i, column j}.  In words: the pair must represent
+        # a direct atom-atom contact for at least one of the two
+        # species.  Lattice artefacts (which always go through a
+        # bridging atom or a longer lattice vector) are larger than
+        # both sides' minimum and get zeroed out.
+        #
+        # Concrete examples:
+        #   SiO2:    Si-O is min for Si and O    → real
+        #            Si-Si > min(Si row)         → artefact (zeroed)
+        #            O-O   > min(O row)          → artefact (zeroed)
+        #   SrTiO3:  Ti-O is min for Ti and O    → real
+        #            Sr-O is min for Sr only     → real
+        #            Sr-Sr > min(Sr row)         → artefact (zeroed)
+        #            Ti-Ti > min(Ti row)         → artefact (zeroed)
+        #            Sr-Ti > min(Sr) > min(Ti)   → artefact (zeroed)
+        #   Cu/Si:   only one species, sole pair → real
+        #
+        # Set ``auto_filter_lattice_artifacts=False`` to disable and
+        # recover the pre-fix behaviour (every pair_mask entry kept).
+        # Callers can always override afterwards via
+        # :meth:`with_bonded_species_pairs` /
+        # :meth:`with_cross_species_bonds_only`.
+        if auto_filter_lattice_artifacts and num_species >= 2:
+            enabled_peaks = np.where(pair_mask, pair_peak, np.inf)
+            min_per_row = np.min(enabled_peaks, axis=1)
+            min_per_col = np.min(enabled_peaks, axis=0)
+            tol = 1e-6  # numerical slack for symmetric peaks
+            for i_sp in range(num_species):
+                for j_sp in range(num_species):
+                    if not pair_mask[i_sp, j_sp]:
+                        continue
+                    peak_ij = pair_peak[i_sp, j_sp]
+                    is_min_for_row = peak_ij <= min_per_row[i_sp] + tol
+                    is_min_for_col = peak_ij <= min_per_col[j_sp] + tol
+                    if not (is_min_for_row or is_min_for_col):
+                        coordination_target[i_sp, j_sp] = 0.0
 
         angle_target = np.zeros((angle_index.shape[0], phi_num_bins), dtype=np.float64)
         angle_pair_mass_target = np.zeros(angle_index.shape[0], dtype=np.float64)
