@@ -4,29 +4,84 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tricor"
-version = "0.1.0"
-description = "Construct disordered-to-ordered atomic supercells from 3 body distributions."
+version = "0.1.1"
+description = "Generate disordered-to-nanocrystalline atomic supercells guided by three-body (g3) distributions."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-    "numpy",
-    "matplotlib",
-    "ase",
-    "anywidget",
-    "numba>=0.65.0",
+license = { file = "LICENSE" }
+authors = [
+    { name = "Colin Ophus", email = "cophus@gmail.com" },
 ]
+keywords = [
+    "atomic-supercell",
+    "amorphous",
+    "nanocrystalline",
+    "machine-learning-potentials",
+    "training-data",
+    "three-body-correlation",
+    "voronoi",
+    "ase",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+    "ase>=3.22",
+    "anywidget>=0.9",
+    # Numba is required: powers the parallel ``measure_g3`` kernel
+    # (~20× faster than the numpy reference path on 40 Å cells) and
+    # the ``thermal_relax`` / orientation-refinement code paths.
+    # The pure-numpy fallback in ``_g3_numba.py`` is still maintained
+    # for development and as a runtime safety net, but a fresh
+    # ``pip install tricor`` always pulls numba so the default
+    # user experience is the fast one.
+    "numba>=0.58",
+]
+
+[project.urls]
+Homepage = "https://github.com/ophusgroup/tricor"
+Documentation = "https://tricor.readthedocs.io"
+Repository = "https://github.com/ophusgroup/tricor"
+Issues = "https://github.com/ophusgroup/tricor/issues"
 
 [project.optional-dependencies]
 data = [
     "h5py",
     "zarr",
 ]
-
-[tool.hatch.build]
-include = [
-    "src/tricor/static/*.js",
-    "src/tricor/static/*.css",
+test = [
+    "pytest>=7.0",
 ]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-v", "--tb=short"]
+
 [tool.hatch.build.targets.wheel]
+# ``packages`` picks up every file under ``src/tricor/`` — Python
+# modules AND the JS/CSS/HTML widget assets in ``src/tricor/static/``.
 packages = ["src/tricor"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/tricor",
+    "tests",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]

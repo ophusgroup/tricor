@@ -1309,6 +1309,29 @@ if HAS_NUMBA:
         )
 
 
+else:
+    # Numba is a hard dependency (declared in ``pyproject.toml``), so
+    # this branch shouldn't be reached in a correctly-installed
+    # environment.  We keep stub functions anyway so that an
+    # ``import tricor`` against a broken install (numba directory
+    # corrupted, llvmlite-incompatible Python build, etc.) still
+    # succeeds — the few code paths that actually need numba then
+    # raise a clear, actionable error at call time instead of a
+    # stack trace at import.
+    def _make_numba_stub(func_name: str):
+        def _stub(*args, **kwargs):
+            raise RuntimeError(
+                f"{func_name} requires numba but it is not importable. "
+                "Reinstall tricor with `pip install --force-reinstall "
+                "tricor` (numba is a hard dependency)."
+            )
+        _stub.__name__ = func_name
+        return _stub
+
+    _thermal_mc_sweep = _make_numba_stub("_thermal_mc_sweep")
+    _total_energy_fast = _make_numba_stub("_total_energy_fast")
+
+
 # ---------------------------------------------------------------------------
 # Python-level total-energy evaluator (for history capture)
 # ---------------------------------------------------------------------------
@@ -1474,7 +1497,9 @@ def thermal_relax_impl(
     """
     if not HAS_NUMBA:
         raise RuntimeError(
-            "thermal_relax requires numba.  Install: uv add numba."
+            "thermal_relax requires numba but it is not importable.  "
+            "Reinstall tricor with `pip install --force-reinstall "
+            "tricor` (numba is a hard dependency)."
         )
     rng = np.random.default_rng(rng_seed)
     move_probs = move_probs or {"displace": 1.0, "swap": 0.0, "smart": 0.0}

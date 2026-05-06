@@ -9,8 +9,21 @@ Generate disordered atomic supercells guided by three-body (g3) distributions, s
 ## Installation
 
 ```bash
-uv sync
+pip install tricor
+
+# Optional data-IO extras
+pip install 'tricor[data]'        # h5py, zarr
 ```
+
+Or to install the development checkout:
+
+```bash
+git clone https://github.com/ophusgroup/tricor
+cd tricor
+uv sync                # or: pip install -e '.[test]'
+```
+
+`tricor` requires Python ≥ 3.10 and works on Linux, macOS, and Windows.
 
 ## Quick start - Si
 
