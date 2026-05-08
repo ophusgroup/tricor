@@ -242,6 +242,12 @@ def generate_glass_style(
     guide_norm_mode: str = "relative",
     noise_sigma: float = 0.1,            # 0 = pure ODE, >0 = SDE per-step noise
     noise_schedule: str = "linear",      # "linear" | "bridge" | "const" | "none"
+    surrogate=None,                      # LitSurrogate; if provided, replaces
+                                         # autograd through spectral_loss_fn
+                                         # for the per-step guidance gradient.
+    skip_branch_a: bool = False,         # production mode: skip the uncond
+                                         # comparison branch entirely; returns
+                                         # (None, pos_b). ~30% wall-time saving.
     verbose: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """Two-stage FM sampler matching GLASS's generation procedure.
@@ -302,24 +308,29 @@ def generate_glass_style(
             pos = _enforce_min_distance(pos, pos_prev, cell, min_dist_threshold)
 
     pos_branch_start = pos.clone()
-
-    # ── Branch A: continue uncond t in [t_switch, 1] ──────────────────
-    if verbose:
-        print(f"Branch A (uncond continuation): t in [{t_switch}, 1], {cond_steps} steps")
-    pos_a = pos_branch_start.clone()
     dt2 = (1.0 - t_switch) / cond_steps
     sqrt_dt2 = dt2 ** 0.5
-    for i in range(cond_steps):
-        t_val = t_switch + i * dt2
-        t = torch.full((num_atoms, 1), t_val, device=device)
-        edge_index, edge_attr = _build_graph(pos_a, cell, cutoff)
-        v = velocity_model(z, edge_index, edge_attr, t)
-        pos_prev = pos_a.clone()
-        sigma = _noise_scale(t_val)
-        eps = torch.randn_like(pos_a) if sigma > 0.0 else 0.0
-        pos_a = wrap_periodic(pos_a + dt2 * v + sigma * sqrt_dt2 * eps, cell)
-        if min_dist_threshold is not None:
-            pos_a = _enforce_min_distance(pos_a, pos_prev, cell, min_dist_threshold)
+
+    # ── Branch A: continue uncond t in [t_switch, 1] ──────────────────
+    if skip_branch_a:
+        if verbose:
+            print("Branch A skipped (skip_branch_a=True)")
+        pos_a = None
+    else:
+        if verbose:
+            print(f"Branch A (uncond continuation): t in [{t_switch}, 1], {cond_steps} steps")
+        pos_a = pos_branch_start.clone()
+        for i in range(cond_steps):
+            t_val = t_switch + i * dt2
+            t = torch.full((num_atoms, 1), t_val, device=device)
+            edge_index, edge_attr = _build_graph(pos_a, cell, cutoff)
+            v = velocity_model(z, edge_index, edge_attr, t)
+            pos_prev = pos_a.clone()
+            sigma = _noise_scale(t_val)
+            eps = torch.randn_like(pos_a) if sigma > 0.0 else 0.0
+            pos_a = wrap_periodic(pos_a + dt2 * v + sigma * sqrt_dt2 * eps, cell)
+            if min_dist_threshold is not None:
+                pos_a = _enforce_min_distance(pos_a, pos_prev, cell, min_dist_threshold)
 
     # ── Branch B: guided, t in [t_switch, 1] ──────────────────────────
     if verbose:
@@ -335,13 +346,33 @@ def generate_glass_style(
         remaining = max(1.0 - t_val, 1e-4)
         x_hat_1 = wrap_periodic(pos_b + remaining * v_prior, cell)
 
-        with torch.enable_grad():
-            x_hat_grad = x_hat_1.detach().double().requires_grad_(True)
-            loss, components = spectral_loss_fn(
-                x_hat_grad, species_dev, cell_spec, target_g2, target_adf,
+        if surrogate is None:
+            # Exact gradient via autograd through differentiable PDF/ADF.
+            with torch.enable_grad():
+                x_hat_grad = x_hat_1.detach().double().requires_grad_(True)
+                loss, components = spectral_loss_fn(
+                    x_hat_grad, species_dev, cell_spec, target_g2, target_adf,
+                )
+                grad = torch.autograd.grad(loss, x_hat_grad)[0]
+            s_guide = -grad.float()
+        else:
+            # Surrogate forward pass on x_hat_1's graph.
+            ei_h, ea_h = _build_graph(x_hat_1, cell, cutoff)
+            batch_idx = torch.zeros(num_atoms, dtype=torch.long, device=device)
+            grad_pred = surrogate.predict_gradient(
+                z, ei_h, ea_h, t,
+                target_g2.unsqueeze(0).float(),
+                target_adf.unsqueeze(0).float(),
+                batch_idx,
             )
-            grad = torch.autograd.grad(loss, x_hat_grad)[0]
-        s_guide = -grad.float()
+            s_guide = -grad_pred.float()
+            # Diagnostics: still compute spectral loss components for logging.
+            if verbose:
+                with torch.no_grad():
+                    _, components = spectral_loss_fn(
+                        x_hat_1.double(), species_dev, cell_spec,
+                        target_g2, target_adf,
+                    )
 
         if guide_norm_mode == "relative":
             prior_norm = v_prior.norm()

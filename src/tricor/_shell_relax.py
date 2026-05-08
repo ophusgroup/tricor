@@ -423,6 +423,9 @@ class _ShellRelaxMixin:
         r_initial = self.atoms.positions.copy()
         k_restraint_f = float(k_restraint)
 
+        positions_snapshots: list[np.ndarray] = []                                                                                                                                                                                               
+        snapshot_steps: list[int] = []   
+        
         if show_progress:
             progress = _TextProgressBar(num_steps, label="Shell relax", width=28)
         else:

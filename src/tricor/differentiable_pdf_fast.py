@@ -211,12 +211,27 @@ class DifferentiablePDFADF_Fast(nn.Module):
             sp_idx = torch.zeros(N, dtype=torch.long, device=device)
 
         ci, ni, vecs, dsq = self._build_neighbor_list(positions, cell)
+
+        # Pair subsampling — same logic as compute(). Critical that this
+        # method honors `pair_subsample_frac` so the fast g2-only path used
+        # when adf_weight=0 still benefits from subsampling.
+        alpha = getattr(self, "pair_subsample_frac", None)
+        if alpha is not None and 0.0 < alpha < 1.0 and ci.numel() > 0:
+            keep = torch.rand(ci.shape[0], device=device) < alpha
+            ci = ci[keep]
+            ni = ni[keep]
+            vecs = vecs[keep]
+            dsq = dsq[keep]
+            scale_g2 = 1.0 / alpha
+        else:
+            scale_g2 = 1.0
+
         dist = torch.sqrt(dsq)
 
         sp_c = sp_idx[ci]
         sp_n = sp_idx[ni]
 
-        g2 = self._accumulate_g2(dist, sp_c, sp_n, device, dtype)
+        g2 = self._accumulate_g2(dist, sp_c, sp_n, device, dtype) * scale_g2
 
         adf = torch.zeros(self.num_triplets, self.phi_num_bins, device=device, dtype=dtype)
         return g2, adf
@@ -241,6 +256,26 @@ class DifferentiablePDFADF_Fast(nn.Module):
 
         # Build neighbor list
         ci, ni, vecs, dsq = self._build_neighbor_list(positions, cell)
+
+        # Optional pair subsampling for stochastic-gradient guidance.
+        # When `pair_subsample_frac` (set as a runtime attribute) is in (0, 1),
+        # we keep a uniform random fraction α of directed pairs and rescale
+        # g2 by 1/α and adf by 1/α² so both remain unbiased estimates of the
+        # full-pair quantities. Each compute() call draws a fresh sample, so
+        # over many guidance steps the noise averages out (analogous to SGD).
+        alpha = getattr(self, "pair_subsample_frac", None)
+        if alpha is not None and 0.0 < alpha < 1.0 and ci.numel() > 0:
+            keep = torch.rand(ci.shape[0], device=device) < alpha
+            ci = ci[keep]
+            ni = ni[keep]
+            vecs = vecs[keep]
+            dsq = dsq[keep]
+            scale_g2 = 1.0 / alpha
+            scale_adf = 1.0 / (alpha * alpha)
+        else:
+            scale_g2 = 1.0
+            scale_adf = 1.0
+
         dist = torch.sqrt(dsq)
 
         sp_c = sp_idx[ci]
@@ -249,7 +284,7 @@ class DifferentiablePDFADF_Fast(nn.Module):
         phi_grid = self.phi_grid
         phi_norm = self.phi_step / (math.sqrt(2 * math.pi) * self.sigma_phi)
 
-        g2 = self._accumulate_g2(dist, sp_c, sp_n, device, dtype)
+        g2 = self._accumulate_g2(dist, sp_c, sp_n, device, dtype) * scale_g2
 
         # ─── ADF: true batched vectorization over centers ─────────────────
         adf = torch.zeros(self.num_triplets, self.phi_num_bins, device=device, dtype=dtype)
@@ -263,6 +298,23 @@ class DifferentiablePDFADF_Fast(nn.Module):
             dsq_a = dsq[adf_mask]
         else:
             ci_a, ni_a, vecs_a, dsq_a = ci, ni, vecs, dsq
+
+        # Optional ADF-only pair subsampling. Drops pairs BEFORE they expand
+        # into the (n_centers, K_max, K_max) angle tensor — so K_max itself
+        # shrinks to ~γ × K_max_full and the einsum/acos cost drops as γ².
+        # This is the version that actually saves wall time. Triplet count
+        # per center scales as γ² (need both endpoints kept), so the
+        # unbiasedness rescale is 1/γ² (added later).
+        gamma = getattr(self, "adf_triplet_subsample_frac", None)
+        adf_pair_subsample_active = (
+            gamma is not None and 0.0 < gamma < 1.0 and ci_a.numel() > 0
+        )
+        if adf_pair_subsample_active:
+            keep = torch.rand(ci_a.shape[0], device=device) < gamma
+            ci_a = ci_a[keep]
+            ni_a = ni_a[keep]
+            vecs_a = vecs_a[keep]
+            dsq_a = dsq_a[keep]
 
         if ci_a.numel() == 0:
             return g2, adf
@@ -339,7 +391,13 @@ class DifferentiablePDFADF_Fast(nn.Module):
                 ) * phi_norm
                 adf[tri_idx] = adf[tri_idx] + phi_kernel.sum(dim=0)
 
-        return g2, adf
+        # Rescale ADF for unbiased estimation when subsampling is active.
+        # Triplet count per center scales as α² (pair sub at top of compute)
+        # × γ² (per-pair sub specifically for ADF, before angle expansion).
+        # So scale_adf = 1/(α² γ²).
+        if adf_pair_subsample_active:
+            scale_adf = scale_adf / (gamma * gamma)
+        return g2, adf * scale_adf
 
     @property
     def pair_labels(self):

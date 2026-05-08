@@ -12,5 +12,7 @@ src/tricor/.DS_Store
 
 .DS_Store
 docs/_build/
-scripts/
+scripts/*
+!scripts/relaxml/
+scripts/relaxml/lightning_logs
 data/
