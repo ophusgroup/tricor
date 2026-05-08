@@ -22,9 +22,16 @@ from ._grain import _GrainMixin
 from ._shell_relax import _ShellRelaxMixin
 from ._plotting import _PlottingMixin
 from ._monte_carlo import _MonteCarloMixin
+from ._resample import _ResampleMixin
 
 
-class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin):
+class Supercell(
+    _GrainMixin,
+    _ShellRelaxMixin,
+    _PlottingMixin,
+    _MonteCarloMixin,
+    _ResampleMixin,
+):
     """Random supercell scaffold driven by a target :class:`G3Distribution`."""
 
     def __init__(
@@ -457,6 +464,14 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         displacement_sigma: float = 0.0,
         atom_species_index: np.ndarray | None = None,
         grain_sources: "list[dict] | None" = None,
+        # Build-time grain-orientation refinement (recommended for
+        # directional-bond materials like Si — see
+        # :meth:`refine_initial_orientations`).  ``True`` runs a
+        # cheap topology-free coordinate-descent over per-grain
+        # rotations BEFORE the FIRE quench; ``False`` skips it (the
+        # historical default).
+        refine_orientations: bool = False,
+        refine_orientations_kwargs: "dict | None" = None,
         show_progress: bool = True,
         **shell_relax_kwargs: Any,
     ) -> dict[str, Any]:
@@ -568,6 +583,77 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
                         f"match atom count ({len(self.atoms)})."
                     )
                 self._atom_shell_species_index = asp
+
+        # --- optional build-time orientation refinement ---
+        # Runs BEFORE the global FIRE quench so the FIRE starts from a
+        # better basin.  Only meaningful when grains exist.  See
+        # :meth:`refine_initial_orientations` for the algorithm.  When
+        # enabled we first retile every grain at its initial rotation
+        # T=0 — this resets atoms to canonical lattice positions
+        # (undoing any thermal displacement from
+        # ``displacement_sigma`` and giving refinement a clean
+        # starting state that matches what trial retiles produce).
+        if (refine_orientations
+                and getattr(self, "_grain_ids", None) is not None
+                and getattr(self, "_grain_cells", None) is not None):
+            from ._resample import _retile_grain
+
+            grain_ids_arr = np.asarray(self._grain_ids, dtype=np.intp)
+            grain_seeds_arr = np.asarray(self._grain_seeds,
+                                         dtype=np.float64)
+            voronoi_cells_l = self._grain_cells
+            masters_l = self._grain_masters
+            grain_source_l = self._grain_source
+            if grain_source_l is None:
+                grain_source_l = np.zeros(len(grain_seeds_arr),
+                                          dtype=np.intp)
+            is_crystalline_arr = np.asarray(
+                self._grain_is_crystalline, dtype=bool,
+            )
+            box_dim_arr = np.asarray(self._grain_box_dim,
+                                     dtype=np.float64)
+            for g in [int(_g) for _g in
+                      np.unique(grain_ids_arr[grain_ids_arr >= 0])
+                      if is_crystalline_arr[int(_g)]]:
+                gm = (grain_ids_arr == g)
+                target_n = int(np.sum(gm))
+                if target_n == 0:
+                    continue
+                src_idx = int(grain_source_l[g])
+                m = masters_l[src_idx]
+                retile = _retile_grain(
+                    master_positions=np.asarray(
+                        m["positions"], dtype=np.float64),
+                    master_numbers=np.asarray(
+                        m["numbers"], dtype=np.int64),
+                    voronoi_cell=voronoi_cells_l[g],
+                    seed_world=grain_seeds_arr[g],
+                    box_dim=box_dim_arr,
+                    rotation=self._grain_rotations_initial[g],
+                    translation=np.zeros(3),
+                    target_n=target_n,
+                )
+                if retile is not None:
+                    self.atoms.positions[gm] = retile[0]
+                    # Update species: multi-species grains re-order
+                    # atoms during retile so we must also assign the
+                    # corresponding ``numbers`` array (otherwise an O
+                    # position lands at a Si atom slot etc.).
+                    self.atoms.numbers[gm] = retile[1]
+            # Refresh the species-index cache after re-tiling.
+            self._atom_species_index = np.searchsorted(
+                self._species, self.atoms.numbers,
+            )
+            self._rebuild_spatial_index()
+
+            r_kwargs = dict(refine_orientations_kwargs or {})
+            r_kwargs.setdefault("bond_weight", float(bond_weight))
+            r_kwargs.setdefault("angle_weight", float(angle_weight))
+            r_kwargs.setdefault("repulsion_weight", float(repulsion_weight))
+            r_kwargs.setdefault("hard_core_scale", float(hard_core_scale))
+            r_kwargs.setdefault("nonbond_push_scale", float(nonbond_push_scale))
+            r_kwargs.setdefault("show_progress", bool(show_progress))
+            self.refine_initial_orientations(shell_target, **r_kwargs)
 
         # --- relax ---
         summary = self.shell_relax(

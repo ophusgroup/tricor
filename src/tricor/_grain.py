@@ -385,9 +385,20 @@ class _GrainMixin:
                 src["atoms"].get_scaled_positions(wrap=True), dtype=np.float64
             )
             src_numbers = np.asarray(src["atoms"].numbers, dtype=np.int64)
-            masters.append(
-                _build_master_atom_block_3d(src_cell, src_basis, src_numbers, radius)
+            master = _build_master_atom_block_3d(
+                src_cell, src_basis, src_numbers, radius,
             )
+            # Tag each master with its source's species_offset so the
+            # orientation-refinement retile can restore the correct
+            # virtual-species index for the rotated grain.  Without
+            # this, multi-source composite cells (sp²/sp³ carbon,
+            # SiO₂/Si₃N₄ blends, ...) lose all virtual-species
+            # information after refinement because every atom carries
+            # the SAME atomic number — searchsorted(self._species,
+            # numbers) returns 0 for every atom and tags them all as
+            # the first virtual species.
+            master["species_offset"] = int(src.get("species_offset", 0))
+            masters.append(master)
 
         # Per-grain source assignment: draw by weight (or uniform for
         # legacy single-source).  Store on self so the trajectory
@@ -756,6 +767,22 @@ class _GrainMixin:
 
         self._grain_ids = grain_ids
         self._grain_seeds = seeds.copy()
+        # Persist Voronoi cells + master atom blocks so
+        # ``Supercell.refine_grains`` can re-tile a single grain
+        # without recomputing the global Voronoi tessellation.  Each
+        # entry of ``_grain_cells`` is the cell dict from
+        # ``_periodic_voronoi_3d`` (vertices, hull equations,
+        # simplices, volume, all in seed-local coordinates).
+        # ``_grain_masters`` is the per-source tiled-out reference
+        # atom block ({"positions", "numbers"}); ``_grain_source``
+        # tells refine_grains which source each grain came from.
+        self._grain_cells = cells
+        self._grain_box_dim = box_dim.copy()
+        self._grain_masters = masters
+        self._grain_master_lattice = ref_cell.copy()
+        self._grain_radius_value = float(radius)
+        self._grain_is_crystalline = is_crystalline.copy()
+        self._grain_rotations_initial = rotations.copy()
         # Publish the per-atom shell-species assignment so the
         # relaxer can pull graphite grains toward sp² targets and
         # diamond grains toward sp³ targets.  Only set when
@@ -766,5 +793,5 @@ class _GrainMixin:
             self._grain_source = grain_source
         else:
             self._atom_shell_species_index = None
-            self._grain_source = None
+            self._grain_source = grain_source  # always save (refine uses it)
         return atoms

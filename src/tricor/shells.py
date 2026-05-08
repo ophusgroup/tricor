@@ -153,9 +153,93 @@ class CoordinationShellTarget:
         shell_hist_step: float = 0.05,
         shell_smooth_sigma_bins: float = 1.2,
         extract_cutoff: float | None = None,
+        auto_filter_lattice_artifacts: bool = True,
         label: str | None = None,
     ) -> "CoordinationShellTarget":
-        """Extract first-shell count, radius, and angle targets from reference atoms."""
+        """Extract first-shell coordination, distance, and angle targets from a reference crystal.
+
+        For every species pair in ``atoms`` the method fits the first
+        peak of the radial pair distribution g(r) — its inner edge,
+        peak position, Gaussian width, and outer edge — and counts the
+        average number of neighbours each centre atom has within that
+        window.  For every triplet (centre, neighbour-A, neighbour-B)
+        species combination it builds a histogram of bond angles
+        ranged 0–180° using ``phi_num_bins`` bins, identifying the
+        dominant angle mode.  All quantities are stored as 2-D /
+        3-D numpy arrays indexed by species index in ``species``.
+
+        Parameters
+        ----------
+        atoms : ase.Atoms
+            Reference crystal whose g(r) and bond-angle distributions
+            define the target geometry.  Must be a periodic cell with
+            at least one neighbour pair within
+            ``extract_cutoff`` (auto if ``None``).
+        phi_num_bins : int, optional
+            Number of bins used to discretise the [0, 180°] bond-angle
+            axis.  Default ``72`` (2.5° per bin).  Higher values
+            sharpen the angle target but slow down the angle
+            measurement loop in :meth:`Supercell.measure_g3`.
+        shell_hist_step : float, optional
+            Bin width (Å) of the per-pair radial histogram used to
+            locate the first peak.  Default ``0.05`` Å.
+        shell_smooth_sigma_bins : float, optional
+            Gaussian smoothing width (in bins) applied to the radial
+            histogram before peak detection.  Default ``1.2`` bins.
+        extract_cutoff : float, optional
+            Maximum centre-neighbour distance (Å) considered when
+            building the neighbour list.  If ``None`` the routine picks
+            ``min(default, max(3.8 × NN, NN + 2))`` based on the
+            inferred nearest-neighbour distance.
+        auto_filter_lattice_artifacts : bool, optional
+            If ``True`` (default), zero out ``coordination_target`` for
+            species pairs that represent lattice artefacts rather than
+            real chemical bonds.  A pair ``(i, j)`` is kept only when
+            ``pair_peak[i, j]`` is the smallest enabled peak in
+            either row ``i`` or column ``j``.  This automatically
+            silences the second-shell ``Si-Si`` / ``O-O`` springs in
+            ``SiO2``, the ``Sr-Sr`` / ``Ti-Ti`` / ``O-O`` / ``Sr-Ti``
+            springs in ``SrTiO3``, etc.  Set to ``False`` to keep every
+            extracted pair (pre-2026 behaviour); callers can also
+            override the filter by chaining
+            :meth:`with_bonded_species_pairs` after extraction.
+        label : str, optional
+            Free-text identifier carried along on the returned target
+            (used in plot legends and HTML viewer titles).  Default
+            uses the chemical formula of ``atoms``.
+
+        Returns
+        -------
+        CoordinationShellTarget
+            Frozen dataclass populated with every per-species and
+            per-triplet field listed in the class header
+            (``coordination_target``, ``pair_peak``, ``pair_inner``,
+            ``angle_target``, ``angle_mode_deg``, etc.).  All ndarray
+            fields are pre-symmetrised over species pairs and the
+            angle-enabled mask is initialised to ``True`` everywhere.
+
+        Notes
+        -----
+        Single-element references (Si, Cu, …) produce a 1×1
+        coordination matrix and one self-self angle channel.
+        Multi-element references (SiO₂, SrTiO₃, …) populate every
+        cross-pair entry — see
+        :meth:`with_cross_species_bonds_only` and
+        :meth:`with_bonded_species_pairs` for masking helpers when
+        only a subset of pairs represents real chemical bonds.
+
+        Examples
+        --------
+        >>> from ase.build import bulk
+        >>> import tricor as tc
+        >>> atoms = bulk("Si", "diamond", a=5.431)
+        >>> shell = tc.CoordinationShellTarget.from_atoms(atoms,
+        ...                                                phi_num_bins=90)
+        >>> shell.coordination_target  # 4 NN per Si
+        array([[4.]])
+        >>> float(shell.pair_peak[0, 0])
+        2.352
+        """
         atoms = atoms.copy()
         species = np.unique(np.asarray(atoms.numbers, dtype=np.int64))
         num_species = int(species.size)
@@ -272,6 +356,58 @@ class CoordinationShellTarget:
                 centered_counts = counts[centers]
                 coordination_target[center_ind, neigh_ind] = float(np.mean(centered_counts))
                 coordination_std[center_ind, neigh_ind] = float(np.std(centered_counts))
+
+        # ----------------------------------------------------------------
+        # Auto-filter lattice-artefact bond pairs.
+        #
+        # In multi-element crystals like SiO2 and SrTiO3 the
+        # neighbour-list extraction also picks up the *second* shell
+        # (Si-Si at 3.06 Å in alpha-quartz, O-O at 2.64 Å, Sr-Sr at
+        # 3.91 Å in SrTiO3, etc.) and emits a non-zero
+        # ``coordination_target`` for those pairs.  Treating them as
+        # bonds during shell relaxation puts geometrically-incompatible
+        # springs on the same atom (each Si simultaneously gets pulled
+        # to 4 O at 1.61 Å AND 4 Si at 3.06 Å, etc.) and FIRE thrashes
+        # without converging.
+        #
+        # Heuristic: pair (i, j) is a real chemical bond iff
+        # ``pair_peak[i, j]`` is the smallest enabled peak for at least
+        # one of {row i, column j}.  In words: the pair must represent
+        # a direct atom-atom contact for at least one of the two
+        # species.  Lattice artefacts (which always go through a
+        # bridging atom or a longer lattice vector) are larger than
+        # both sides' minimum and get zeroed out.
+        #
+        # Concrete examples:
+        #   SiO2:    Si-O is min for Si and O    → real
+        #            Si-Si > min(Si row)         → artefact (zeroed)
+        #            O-O   > min(O row)          → artefact (zeroed)
+        #   SrTiO3:  Ti-O is min for Ti and O    → real
+        #            Sr-O is min for Sr only     → real
+        #            Sr-Sr > min(Sr row)         → artefact (zeroed)
+        #            Ti-Ti > min(Ti row)         → artefact (zeroed)
+        #            Sr-Ti > min(Sr) > min(Ti)   → artefact (zeroed)
+        #   Cu/Si:   only one species, sole pair → real
+        #
+        # Set ``auto_filter_lattice_artifacts=False`` to disable and
+        # recover the pre-fix behaviour (every pair_mask entry kept).
+        # Callers can always override afterwards via
+        # :meth:`with_bonded_species_pairs` /
+        # :meth:`with_cross_species_bonds_only`.
+        if auto_filter_lattice_artifacts and num_species >= 2:
+            enabled_peaks = np.where(pair_mask, pair_peak, np.inf)
+            min_per_row = np.min(enabled_peaks, axis=1)
+            min_per_col = np.min(enabled_peaks, axis=0)
+            tol = 1e-6  # numerical slack for symmetric peaks
+            for i_sp in range(num_species):
+                for j_sp in range(num_species):
+                    if not pair_mask[i_sp, j_sp]:
+                        continue
+                    peak_ij = pair_peak[i_sp, j_sp]
+                    is_min_for_row = peak_ij <= min_per_row[i_sp] + tol
+                    is_min_for_col = peak_ij <= min_per_col[j_sp] + tol
+                    if not (is_min_for_row or is_min_for_col):
+                        coordination_target[i_sp, j_sp] = 0.0
 
         angle_target = np.zeros((angle_index.shape[0], phi_num_bins), dtype=np.float64)
         angle_pair_mass_target = np.zeros(angle_index.shape[0], dtype=np.float64)
@@ -703,8 +839,7 @@ class CoordinationShellTarget:
         self,
         pairs: "list[tuple[str, str]]",
     ) -> "CoordinationShellTarget":
-        """Return a copy whose ``coordination_target`` is zero everywhere
-        *except* the given symmetric species pairs.
+        """Return a copy whose ``coordination_target`` is zero everywhere except for the listed species pairs.
 
         Useful for materials with spectator ions: perovskites like
         SrTiO\u2083 want only Ti-O bonds considered by
@@ -713,6 +848,23 @@ class CoordinationShellTarget:
         is a geometric artefact for non-bond triplets) or pin atoms via
         bond springs to distances that are really second-shell
         separations, not chemical bonds.
+
+        Parameters
+        ----------
+        pairs : list of tuple of str
+            Each ``(symbol_a, symbol_b)`` pair is treated symmetrically
+            \u2014 both directions in the ``coordination_target`` matrix
+            are preserved.  Pairs whose symbols don't appear in
+            ``self.species_labels`` are silently skipped.
+
+        Returns
+        -------
+        CoordinationShellTarget
+            A new ``CoordinationShellTarget`` (the original is left
+            unmodified) whose ``coordination_target`` keeps only the
+            listed species-pair entries; every other slot is zeroed
+            so :meth:`Supercell.shell_relax` won't try to enforce
+            bonds there.
 
         Examples
         --------
@@ -745,8 +897,7 @@ class CoordinationShellTarget:
         return _dc_replace(self, coordination_target=ct)
 
     def with_cross_species_bonds_only(self) -> "CoordinationShellTarget":
-        """Return a copy where same-species ``coordination_target`` entries
-        are zeroed.
+        """Return a copy where same-species ``coordination_target`` entries are zeroed.
 
         Useful for network-former compounds such as SiO\u2082 where only
         cross-species pairs (Si-O) are real chemical bonds; the same-species
@@ -756,6 +907,13 @@ class CoordinationShellTarget:
         spurious angle springs on triplets like Si-Si-Si or O-O-O whose
         ``angle_mode_deg`` is just a geometric artefact of the reference
         sampling, not a physical target).
+
+        Returns
+        -------
+        CoordinationShellTarget
+            New target whose ``coordination_target`` diagonal is
+            zeroed (off-diagonal cross-species entries preserved).
+            The original target is unmodified.
         """
         from dataclasses import replace as _dc_replace
 
@@ -781,6 +939,23 @@ class CoordinationShellTarget:
         distribution; enforcing it would strain the other modes.
         SrTiO\u2083's SrO\u2081\u2082 cuboctahedron (O-Sr-O angles at
         60°/90°/120°/180°) is the canonical example.
+
+        Parameters
+        ----------
+        triplets : list of tuple of str
+            Each ``(centre, n1, n2)`` triplet enables the angle-spring
+            term for that combination of species.  Ordering of ``n1``
+            and ``n2`` is symmetrised internally.
+
+        Returns
+        -------
+        CoordinationShellTarget
+            New target whose ``angle_enabled_mask`` is ``True`` only
+            for the listed triplets; every other triplet's angle
+            spring is silenced.
+
+        Examples
+        --------
 
         .. code-block:: python
 
@@ -822,8 +997,23 @@ class CoordinationShellTarget:
         self,
         triplets: "list[tuple[str, str, str]]",
     ) -> "CoordinationShellTarget":
-        """Return a copy with the angle mask disabled for the listed
-        triplets (inverse of :meth:`with_angle_triplets`).
+        """Return a copy with the angle mask disabled for the listed triplets.
+
+        Inverse of :meth:`with_angle_triplets`: starts from the
+        current ``angle_enabled_mask`` and turns OFF the listed
+        triplets, leaving every other triplet's angle spring intact.
+
+        Parameters
+        ----------
+        triplets : list of tuple of str
+            Each ``(centre, n1, n2)`` triplet disables the angle
+            spring for that species combination.
+
+        Returns
+        -------
+        CoordinationShellTarget
+            New target whose ``angle_enabled_mask`` matches the
+            original except the listed triplets are now ``False``.
         """
         from dataclasses import replace as _dc_replace
         from ase.data import atomic_numbers as _an
@@ -849,7 +1039,17 @@ class CoordinationShellTarget:
 
     @property
     def pair_labels(self) -> list[str]:
-        """Return human-readable pair labels."""
+        """Human-readable species-pair labels for every present pair.
+
+        Returns
+        -------
+        list of str
+            One ``"<centre>-<neighbour>"`` string per ``(centre,
+            neighbour)`` slot in ``self.pair_mask`` that is ``True``.
+            Order matches the row-major flatten of the species table
+            (centre, neighbour) — useful for legend labels in
+            multi-pair g(r) plots.
+        """
         labels = []
         for center_ind, center_label in enumerate(self.species_labels):
             for neigh_ind, neigh_label in enumerate(self.species_labels):
@@ -859,7 +1059,16 @@ class CoordinationShellTarget:
 
     @property
     def angle_labels(self) -> list[str]:
-        """Return human-readable rooted angle labels."""
+        """Human-readable rooted-angle labels for every triplet channel.
+
+        Returns
+        -------
+        list of str
+            One ``"<n1>-<centre>-<n2>"`` string per row of
+            ``self.angle_index``.  Useful for labelling angle-channel
+            histograms or filtering the per-triplet output of
+            :meth:`Supercell.measure_g3`.
+        """
         labels = []
         for center_ind, neigh1_ind, neigh2_ind in self.angle_index:
             labels.append(

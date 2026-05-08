@@ -426,7 +426,15 @@ def _resolve_polyhedra_cfg(
         detector = _detect_tetrahedra
         ideal_default = 109.47
         angle_tol_default = 25.0
-        scale_default = 1.0
+        # Single-element tetrahedra (e.g. Si-Si-Si in diamond): vertices
+        # sit directly on neighbour atoms when scale=1.0, which makes
+        # the polyhedra visually overlap.  Default to bond-midpoint
+        # vertices for cleaner rendering.  Multi-element tetrahedra
+        # (e.g. SiO₄: Si centre, O vertices) keep scale=1.0 so the
+        # vertices land on the actual O atoms.
+        same_element = cfg.get("center_symbol") == cfg.get("vertex_symbol") \
+            and cfg.get("center_symbol") is not None
+        scale_default = 0.5 if same_element else 1.0
     elif octahedra is not None:
         cfg = octahedra
         n_vertices = 6
@@ -434,7 +442,10 @@ def _resolve_polyhedra_cfg(
         detector = _detect_octahedra
         ideal_default = 90.0
         angle_tol_default = 18.0
-        scale_default = 1.0
+        # Same single-element logic as tetrahedra.
+        same_element = cfg.get("center_symbol") == cfg.get("vertex_symbol") \
+            and cfg.get("center_symbol") is not None
+        scale_default = 0.5 if same_element else 1.0
     elif cuboctahedra is not None:
         cfg = cuboctahedra
         n_vertices = 12
@@ -926,9 +937,35 @@ def plot_g2_compare(
     """Inline Jupyter display of the g(r) overlay-compare viewer.
 
     Convenience wrapper around :func:`export_g2_compare_html` that
-    packages the HTML as an :class:`IPython.display.HTML` object so you
-    can do ``tc.plot_g2_compare(cells)`` in a notebook cell.  See that
-    function's docstring for the accepted input shapes.
+    packages the HTML as an :class:`IPython.display.HTML` object so
+    you can do ``tc.plot_g2_compare(cells)`` in a notebook cell.
+
+    Parameters
+    ----------
+    cells_and_labels : list of (Supercell, str) or dict
+        Either a list of ``(supercell, label)`` pairs or a
+        ``{label: supercell}`` dict.  Each cell's g(r) becomes one
+        curve in the overlay.  See :func:`export_g2_compare_html`
+        for full input-shape details.
+    r_max : float, optional
+        Maximum radial distance (Å) plotted on the x-axis.  Default
+        ``10.0``.
+    r_step : float, optional
+        Bin width (Å) of the g(r) histogram.  Default ``0.05``.
+    title : str, optional
+        Title text rendered above the viewer.  Default ``""``.
+    height : int, optional
+        Iframe height (pixels) of the rendered viewer in Jupyter.
+        Default ``480``.
+    show_progress : bool, optional
+        Display a tqdm progress bar while the per-cell g(r)
+        histograms are built.  Default ``False``.
+
+    Returns
+    -------
+    IPython.display.HTML
+        The viewer wrapped in an iframe and ready for inline
+        display in a Jupyter cell.
     """
     from IPython.display import HTML
     html = export_g2_compare_html(
@@ -952,7 +989,7 @@ def export_overview_html(
     cells_and_labels,
     *,
     grid_cols: int = 3,
-    atom_scale: float = 0.18,
+    atom_scale: float = 0.17,
     bond_radius: float = 0.07,
     bond_color=(0.95, 0.1, 0.1),
     background_color: str = "#f7f8f5",
@@ -964,8 +1001,8 @@ def export_overview_html(
     ideal_angle_deg: float = 109.47,
     bond_angle_tol_deg: float = 18.0,
     tetrahedra: dict | None = None,
-    tetrahedra_color=(0.25, 0.65, 0.95),
-    tetrahedra_opacity: float = 0.35,
+    tetrahedra_color=(0.35, 0.45, 0.95),
+    tetrahedra_opacity: float = 0.45,
     octahedra: dict | None = None,
     octahedra_color=(0.95, 0.55, 0.25),
     octahedra_opacity: float = 0.4,
@@ -974,27 +1011,94 @@ def export_overview_html(
     cuboctahedra_opacity: float = 0.4,
     polyhedra_groups: "list[dict] | None" = None,
 ) -> str:
-    """Export a grid of static 3D structures as a self-contained HTML file.
+    """Export a 3D grid of supercells as a self-contained, auto-rotating HTML viewer.
 
-    Each panel renders the final atoms of one :class:`Supercell` using ASE
-    element colours, black outlines, and red bonds.  All panels share a
-    camera that auto-rotates; dragging any panel pauses the rotation and
-    orbits manually.
+    Each panel renders the final atom positions of one
+    :class:`Supercell` using ASE element colours and black outlines.
+    All panels share a single auto-rotating camera; dragging any
+    panel pauses the rotation and lets the user orbit manually.
+    Bonds are rendered by default; passing one of the polyhedra
+    kwargs (``tetrahedra``, ``octahedra``, ``cuboctahedra``,
+    ``polyhedra_groups``) replaces bonds with translucent polyhedra.
 
-    Passing a ``tetrahedra``, ``octahedra``, or ``cuboctahedra`` dict
-    switches the per-panel rendering from bonds to translucent polyhedra
-    (4-vertex tets, 6-vertex octahedra, or 12-vertex FCC close-packed
-    cuboctahedra respectively).  Keys for either dict:
+    Parameters
+    ----------
+    output_path : str
+        Filesystem path for the written HTML file.
+    cells_and_labels : list of (Supercell, str)
+        Pairs of supercells and their panel-title labels, rendered
+        left-to-right then top-to-bottom into a ``grid_cols``-wide
+        grid.
+    grid_cols : int, optional
+        Number of panels per row.  Default ``3``.
+    atom_scale : float, optional
+        Multiplier applied to ASE covalent radii when sizing atom
+        spheres.  Default ``0.17``.
+    bond_radius : float, optional
+        Cylinder radius (Å) for rendered bonds.  Default ``0.07``.
+    bond_color : tuple of float, optional
+        RGB triplet (each in [0, 1]) for bond colour.  Default red
+        ``(0.95, 0.1, 0.1)``.
+    background_color : str, optional
+        CSS colour string for the panel background.  Default
+        ``"#f7f8f5"`` (off-white).
+    title, subtitle : str, optional
+        Headline + sub-line text rendered above the grid.
+    bond_cutoff_scale : float, optional
+        Bond search radius is ``shell_target.pair_peak ×
+        bond_cutoff_scale``.  Default ``1.2``.
+    max_bonds_per_atom : int, optional
+        Per-atom cap on bonds drawn (after the angle filter).
+        Default ``4``.
+    bond_length_tol : float, optional
+        Acceptance window around ``pair_peak`` for the bond filter
+        (fraction).  Default ``0.10`` (±10 %).
+    ideal_angle_deg, bond_angle_tol_deg : float, optional
+        Reject bonds whose 4-NN angles deviate more than
+        ``bond_angle_tol_deg`` from ``ideal_angle_deg``.  Default
+        ``109.47°`` ± ``18°`` (tetrahedral).  Set
+        ``bond_angle_tol_deg=180`` to disable the angle filter (e.g.
+        FCC metals where 60°/90°/120° angles all matter).
+    tetrahedra : dict, optional
+        Switch panels to tetrahedron rendering.  Dict keys:
+        ``center_symbol`` (default ``"Si"``), ``vertex_symbol``
+        (default ``"O"``), ``bond_length`` (default auto-detected
+        from atoms), ``bond_length_tol`` (default ``0.15``),
+        ``ideal_angle_deg`` (default ``109.47``), ``angle_tol_deg``
+        (default ``25.0``), ``scale`` (vertex shrink factor;
+        default ``0.5`` for same-element, ``1.0`` for
+        cross-species).
+    tetrahedra_color : tuple of float, optional
+        RGB triplet for tetrahedron faces.  Default navy
+        ``(0.35, 0.45, 0.95)``.
+    tetrahedra_opacity : float, optional
+        Face opacity in [0, 1].  Default ``0.45``.
+    octahedra, octahedra_color, octahedra_opacity : dict / tuple / float, optional
+        Octahedron variant — same dict keys as ``tetrahedra``.
+    cuboctahedra, cuboctahedra_color, cuboctahedra_opacity : dict / tuple / float, optional
+        Cuboctahedron variant (12-vertex FCC close-packed shell).
+    polyhedra_groups : list of dict, optional
+        Multi-group polyhedra (e.g. sp²/sp³ carbon) — list of
+        per-group dicts each with ``kind`` (one of
+        ``"triangles"``, ``"tetrahedra"``, ``"octahedra"``,
+        ``"cuboctahedra"``), ``center_symbol``, ``vertex_symbol``,
+        ``color``, ``opacity``, plus optional ``virtual_species``
+        for filtering by ``Supercell._atom_shell_species_index``.
 
-    - ``center_symbol`` (default ``"Si"``) - element at the centre
-    - ``vertex_symbol`` (default ``"O"``)  - element at each vertex
-    - ``bond_length`` (default auto)        - centre-vertex ideal distance
-    - ``bond_length_tol`` (default ``0.15``)
-    - ``ideal_angle_deg`` (default ``109.47``)
-    - ``angle_tol_deg`` (default ``25.0``)
+    Returns
+    -------
+    str
+        The HTML written to ``output_path``.
 
-    Only centres whose four nearest vertex atoms satisfy all of the above
-    contribute a tetrahedron; bonds are not drawn in this mode.
+    Examples
+    --------
+    >>> import tricor as tc
+    >>> cells = [(cell_amorphous, "amorphous"),
+    ...          (cell_mro, "MRO"),
+    ...          (cell_nc, "NC")]
+    >>> tc.export_overview_html("overview.html", cells, grid_cols=3,
+    ...                          tetrahedra=dict(center_symbol="Si",
+    ...                                          vertex_symbol="Si"))
     """
     import json
     from ase.data import covalent_radii
@@ -1546,7 +1650,34 @@ class _PlottingMixin:
         *,
         normalize: bool = True,
     ):
-        """Return an interactive comparison between the current supercell and target."""
+        """Interactive side-by-side comparison of the current supercell's g3 against its target g3.
+
+        Renders an anywidget-based two-panel viewer in Jupyter: left
+        panel is the supercell's measured g3 for the chosen
+        species-pair triplet channel, right panel is the corresponding
+        target g3 (set via ``Supercell.target_distribution``).  Drag
+        the radial-shell slider below either panel to inspect a g3
+        slice at fixed root-bond radius.
+
+        Parameters
+        ----------
+        pair : int or str, optional
+            Which triplet channel to display.  Either an integer index
+            into ``target_distribution.angle_index`` or a string label
+            like ``"Si-Si-Si"`` resolved by
+            :meth:`G3Distribution._resolve_pair_index`.  Default ``0``
+            (first channel).
+        normalize : bool, optional
+            If ``True`` (default), normalise both g3 values by the
+            uniform-random reference so bins read as enhancements
+            (>1) or depletions (<1).  If ``False``, raw counts.
+
+        Returns
+        -------
+        G3CompareWidget
+            Interactive anywidget instance.  Display it inline in
+            Jupyter (returning the widget from a cell auto-renders).
+        """
         current = self.measure_g3()
         pair_index = self.target_distribution._resolve_pair_index(pair)
 
@@ -1582,7 +1713,36 @@ class _PlottingMixin:
         log_y: bool = False,
         show_run_boundaries: bool = True,
     ):
-        """Plot the recorded Monte Carlo cost history using Matplotlib."""
+        """Plot the Monte-Carlo cost history captured by the most recent :meth:`monte_carlo` call.
+
+        Two curves are drawn on a single matplotlib axis: instantaneous
+        cost (current MC state) and best-so-far cost (envelope).
+        Vertical dashed markers separate consecutive ``monte_carlo``
+        runs when ``show_run_boundaries=True``.
+
+        Parameters
+        ----------
+        log_y : bool, optional
+            Display the cost on a logarithmic y-axis.  Useful for
+            anneal schedules that span several orders of magnitude.
+            Default ``False``.
+        show_run_boundaries : bool, optional
+            If ``True``, draw vertical dashed lines at the start of
+            each new MC run when ``mc_history["run_index"]`` increments
+            (e.g. when chained calls extend the history).  Default
+            ``True``.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            The created figure.
+
+        Raises
+        ------
+        ValueError
+            If :meth:`monte_carlo` has not been run yet
+            (``self.mc_history is None``).
+        """
         if self.mc_history is None:
             raise ValueError("Run monte_carlo() before plotting the history.")
 
@@ -1621,13 +1781,13 @@ class _PlottingMixin:
         output_path: str,
         *,
         bond_cutoff: float | None = None,
-        atom_scale: float = 0.32,
+        atom_scale: float = 0.17,
         bond_radius: float = 0.06,
         background_color: str = "#f7f8f5",
         title: str = "",
         tetrahedra: dict | None = None,
-        tetrahedra_color=(0.25, 0.65, 0.95),
-        tetrahedra_opacity: float = 0.35,
+        tetrahedra_color=(0.35, 0.45, 0.95),
+        tetrahedra_opacity: float = 0.45,
         octahedra: dict | None = None,
         octahedra_color=(0.95, 0.55, 0.25),
         octahedra_opacity: float = 0.4,
@@ -1636,6 +1796,7 @@ class _PlottingMixin:
         cuboctahedra_opacity: float = 0.4,
         polyhedra_groups: "list[dict] | None" = None,
         show_bonds: bool | None = None,
+        history: "dict | str | None" = None,
     ) -> str:
         """Export an interactive 3D trajectory viewer as a self-contained HTML file.
 
@@ -1665,6 +1826,13 @@ class _PlottingMixin:
             ``True`` when no ``tetrahedra`` are requested, ``False`` when
             they are (tetrahedra supersede bonds).  Pass ``True`` / ``False``
             explicitly to override.
+        history
+            Which trajectory history to render.  ``None`` (default) uses
+            ``self.shell_relax_history``.  Pass ``"thermal_relax"`` to
+            render ``self.thermal_relax_history``, or pass an explicit
+            history dict.  Both shell-relax and thermal-relax dicts have
+            a ``"trajectory"`` key when their parent call was run with
+            ``capture_trajectory=True``.
 
         Returns
         -------
@@ -1675,12 +1843,34 @@ class _PlottingMixin:
         from ase.data import covalent_radii
         from ase.data.colors import jmol_colors
 
-        history = self.shell_relax_history
-        if history is None or "trajectory" not in history:
-            raise ValueError(
-                "No trajectory data available.  Run shell_relax() or "
-                "generate() with capture_trajectory=True first."
+        if history is None:
+            resolved_history = self.shell_relax_history
+            history_label = "shell_relax_history"
+        elif isinstance(history, str):
+            attr = (
+                "thermal_relax_history" if history in ("thermal", "thermal_relax")
+                else "shell_relax_history" if history in ("shell", "shell_relax")
+                else "refine_grains_history" if history in ("refine", "refine_grains")
+                else None
             )
+            if attr is None:
+                raise ValueError(
+                    f"history string must be one of "
+                    f"'shell_relax' / 'thermal_relax' / 'refine_grains'; "
+                    f"got {history!r}"
+                )
+            resolved_history = getattr(self, attr, None)
+            history_label = attr
+        else:
+            resolved_history = history
+            history_label = "(provided)"
+        if resolved_history is None or "trajectory" not in resolved_history:
+            raise ValueError(
+                f"No trajectory data available on {history_label}.  Run "
+                "shell_relax() / generate() / thermal_relax() with "
+                "capture_trajectory=True first."
+            )
+        history = resolved_history
         trajectory = np.asarray(history["trajectory"], dtype=np.float32)
         n_frames, n_atoms, _ = trajectory.shape
 
@@ -1738,12 +1928,13 @@ class _PlottingMixin:
         per_poly_faces: list[list[list[int]]] = []
         per_poly_edges: list[list[list[int]]] = []
 
-        # Resolve show_bonds auto-default: bonds follow atoms when no
-        # polyhedra are requested; polyhedra supersede bonds otherwise.
-        # Multi-group polyhedra_groups suppress bonds just like the
-        # legacy single-group tetrahedra= kwarg.
+        # Resolve show_bonds auto-default: bonds are NEVER drawn by
+        # default — they're an opt-in render mode now.  Polyhedra are
+        # the preferred visualisation when configured; otherwise the
+        # viewer shows atoms only.  Pass ``show_bonds=True`` to bring
+        # back the old bond cylinders.
         if show_bonds is None:
-            show_bonds_eff = tetra_cfg is None and not polyhedra_groups
+            show_bonds_eff = False
         else:
             show_bonds_eff = bool(show_bonds)
 

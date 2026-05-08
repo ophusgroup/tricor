@@ -26,6 +26,9 @@ class _ShellRelaxMixin:
         angle_weight: float = 0.5,
         repulsion_weight: float = 3.0,
         k_restraint: float = 0.0,
+        r_initial_override: "np.ndarray | None" = None,
+        freeze_mask: "np.ndarray | None" = None,
+        freeze_grain_interiors: bool = False,
         hard_core_scale: float = 1.0,
         nonbond_push_scale: float = 1.0,
         step_size: float = 0.1,
@@ -90,6 +93,18 @@ class _ShellRelaxMixin:
         max_force_clip
             Per-atom force magnitude is clipped to this value before
             integration to keep the dynamics stable.
+        freeze_grain_interiors
+            If ``True``, atoms identified as deep grain interior (more
+            than ``0.5 × max(pair_peak)`` away from the nearest
+            grain-boundary plane) are held fixed during relaxation.
+            ``False`` (default since 2026-05) lets every atom relax,
+            which is required for multi-species systems where the
+            interior atoms must accommodate cross-species spring
+            strain (SiO2, SrTiO3, sp²/sp³ carbon).  Setting ``True``
+            reproduces the pre-2026 behaviour and is occasionally
+            useful for single-species nanocrystalline cells where the
+            interiors are already at their target geometry.  Has no
+            effect on cells built without a ``grain_size``.
         show_progress
             Display a text progress bar.
 
@@ -158,12 +173,20 @@ class _ShellRelaxMixin:
         nonbond_push[nonbond_push < _EPS] = float(np.max(pair_peak)) * 1.5
 
         # --- grain-aware force scaling ---
-        # When _grain_ids is set, interior atoms are frozen to preserve
-        # crystalline order; boundary atoms get full relaxation forces.
+        # When _grain_ids is set AND the caller asks for it, interior
+        # atoms are frozen to preserve crystalline order; boundary
+        # atoms get full relaxation forces.  The default since 2026-05
+        # is ``freeze_grain_interiors=False``: every atom relaxes.
+        # Pre-fix behaviour (interior frozen) caused multi-species
+        # systems (SiO2, SrTiO3, sp²/sp³ carbon) to plateau in a
+        # high-energy basin because the interior atoms could not
+        # accommodate cross-species spring strain that propagated in
+        # from the boundaries.
         grain_ids = self._grain_ids
         grain_seeds = self._grain_seeds
         if (
-            grain_ids is not None
+            freeze_grain_interiors
+            and grain_ids is not None
             and grain_seeds is not None
             and len(grain_ids) == num_atoms
         ):
@@ -420,7 +443,22 @@ class _ShellRelaxMixin:
         # corrected); ``k_restraint == 0`` disables the term.  This
         # lets the FIRE relaxation be globally differentiable yet still
         # tethered to the input regime structure.
-        r_initial = self.atoms.positions.copy()
+        #
+        # ``r_initial_override`` lets a caller supply a different
+        # reference (e.g. when chaining shell_relax after thermal_relax
+        # to do a final FIRE quench: the override should be the
+        # *pre-thermal* positions so the restraint still pulls atoms
+        # toward the regime's reference cell, not toward the post-MC
+        # configuration).
+        if r_initial_override is not None:
+            r_initial = np.ascontiguousarray(r_initial_override, dtype=np.float64).copy()
+            if r_initial.shape != self.atoms.positions.shape:
+                raise ValueError(
+                    f"r_initial_override has shape {r_initial.shape}; "
+                    f"expected {self.atoms.positions.shape}"
+                )
+        else:
+            r_initial = self.atoms.positions.copy()
         k_restraint_f = float(k_restraint)
 
         positions_snapshots: list[np.ndarray] = []                                                                                                                                                                                               
@@ -589,12 +627,18 @@ class _ShellRelaxMixin:
                 # parallel to the bond / angle reporting style.
                 restraint_loss = float(np.mean(np.sum(d_restr * d_restr, axis=1)))
                 if atom_cost is not None:
-                    # 0.5 k Σ‖Δ‖² split per atom (each atom owns its
-                    # own restraint term, no double-counting).
-                    np.add.at(
-                        atom_cost,
-                        np.arange(num_atoms),
-                        0.5 * k_restraint_f * np.sum(d_restr * d_restr, axis=1),
+                    # 0.5 k Σ‖Δ‖² per atom (each atom owns its own
+                    # restraint term, no double-counting).  Use direct
+                    # ``+=`` rather than ``np.add.at`` — every index
+                    # appears exactly once so plain addition is
+                    # functionally identical and orders of magnitude
+                    # faster (np.add.at goes through the ufunc-at
+                    # machinery even for unique indices, which made
+                    # capture-trajectory FIRE quenches with k_restraint
+                    # > 0 take minutes per call).
+                    atom_cost += (
+                        0.5 * k_restraint_f
+                        * np.sum(d_restr * d_restr, axis=1)
                     )
 
             # ---------- record loss ----------
@@ -620,8 +664,22 @@ class _ShellRelaxMixin:
 
             # ---------- integrate (skip on last step) ----------
             if step < num_steps:
+                # Caller-supplied freeze mask: zero force + velocity on
+                # any True entry.  Used by ``refine_grains`` to relax
+                # only a grain + its neighbour shell while the rest of
+                # the cell stays put.  Takes precedence over the
+                # built-in grain-boundary detection.
+                if freeze_mask is not None:
+                    fm = np.asarray(freeze_mask, dtype=bool)
+                    if fm.shape != (num_atoms,):
+                        raise ValueError(
+                            f"freeze_mask shape {fm.shape} != ({num_atoms},)"
+                        )
+                    if np.any(fm):
+                        force[fm] = 0.0
+                        velocity[fm] = 0.0
                 # Freeze interior grain atoms: zero force and velocity
-                if is_boundary is not None:
+                elif is_boundary is not None:
                     interior_mask = ~is_boundary
                     if np.any(interior_mask):
                         force[interior_mask] = 0.0
@@ -785,10 +843,13 @@ class _ShellRelaxMixin:
             ``"smart"`` is a force-biased Langevin proposal with
             Metropolis correction (reserved for v2; currently treated
             as no-op).
-        bond_weight, angle_weight, repulsion_weight,
-        hard_core_scale, nonbond_push_scale
-            Same as :meth:`shell_relax`.
-        k_restraint
+        bond_weight : float, optional
+            Same as :meth:`shell_relax`.  Default ``1.0``.
+        angle_weight : float, optional
+            Same as :meth:`shell_relax`.  Default ``0.5``.
+        repulsion_weight : float, optional
+            Same as :meth:`shell_relax`.  Default ``3.0``.
+        k_restraint : float, optional
             Spring constant (eV / Å²) for a global position-restraint
             energy ``½ k_restraint Σ ‖r_i - r_initial_i‖²`` that tethers
             every atom to its starting position.  ``0.0`` (default)
@@ -800,6 +861,10 @@ class _ShellRelaxMixin:
             unlike a hard ``freeze_interior`` the cost surface stays
             smooth and the relaxation can find consistent low-strain
             configurations across grain boundaries.
+        hard_core_scale : float, optional
+            Same as :meth:`shell_relax`.  Default ``1.0``.
+        nonbond_push_scale : float, optional
+            Same as :meth:`shell_relax`.  Default ``1.0``.
         neighbor_update_interval
             Rebuild the bond topology every this many sweeps.
         capture_stride
@@ -821,12 +886,19 @@ class _ShellRelaxMixin:
             ``freeze_interior``.  Useful when the cell isn't grain-tiled
             but you still want to hold specific atoms (e.g. an
             interface) fixed.
-        grain_moves
+        grain_moves : bool, optional
             If ``True`` (or ``None`` and the cell has ≥2 grains),
             propose rigid rotation + translation of each grain every
             ``grain_move_interval`` sweeps.
-        grain_move_interval, grain_sigma_rot, grain_sigma_trans
-            Frequency and amplitude of the grain rigid-body proposals.
+        grain_move_interval : int, optional
+            Sweep cadence of the rigid-grain proposals.  Default ``1``
+            (one set of grain moves per sweep when enabled).
+        grain_sigma_rot : float, optional
+            Std-dev of the per-grain rotation angle (radians).
+            Default ``0.01``.
+        grain_sigma_trans : float, optional
+            Std-dev of the per-grain translation (Å).  Default
+            ``0.01``.
 
         Returns
         -------
@@ -968,7 +1040,33 @@ class _ShellRelaxMixin:
         *,
         log_y: bool = False,
     ):
-        """Plot the recorded shell-relax loss history using Matplotlib."""
+        """Plot the FIRE relaxation loss history captured by the most recent :meth:`shell_relax` call.
+
+        Renders the per-step total loss alongside its best-so-far
+        envelope and the three component contributions (bond, angle,
+        repulsion).  When the run was launched with
+        ``k_restraint > 0``, the position-restraint contribution is
+        added as a fifth curve in purple.
+
+        Parameters
+        ----------
+        log_y : bool, optional
+            Display the loss axis on a log scale.  Useful for runs
+            that span several orders of magnitude (e.g.
+            ``num_steps`` > 200 with stiff springs).  Default
+            ``False``.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            The created figure.
+
+        Raises
+        ------
+        ValueError
+            If :meth:`shell_relax` has not been run yet
+            (``self.shell_relax_history is None``).
+        """
         if self.shell_relax_history is None:
             raise ValueError("Run shell_relax() before plotting the history.")
 
@@ -1073,7 +1171,23 @@ class _ShellRelaxMixin:
             ax_cost.set_xscale("log")
         ax_cost.set_ylabel("cost / atom")
         ax_cost.set_title("Thermal MC history")
-        ax_cost.legend(ncols=6, fontsize=9, loc="upper right")
+        # Trim very-low-magnitude tail when on log so the curves use
+        # the full vertical span rather than getting squashed against
+        # the top by a single curve that decays many orders of magnitude.
+        if log_y:
+            cost_arrs = [
+                np.asarray(hist["cost"]) / n,
+                np.asarray(hist["cost_bond"]) / n,
+                np.asarray(hist["cost_angle"]) / n,
+                np.asarray(hist["cost_rep"]) / n,
+            ]
+            stacked = np.concatenate(cost_arrs)
+            positive = stacked[stacked > 0]
+            if positive.size:
+                lo = float(np.percentile(positive, 1.0))
+                hi = float(np.max(stacked))
+                if hi > 0:
+                    ax_cost.set_ylim(max(lo * 0.5, 1e-12), hi * 1.6)
         ax_cost.grid(alpha=0.25)
 
         ax_T.plot(hist["sweep"], hist["T"], color="#c2454c", lw=1.6)
@@ -1089,7 +1203,18 @@ class _ShellRelaxMixin:
         ax_acc.tick_params(axis="y", labelcolor="#2a6e4e")
         ax_acc.set_ylim(0.0, 1.0)
 
-        fig.tight_layout()
+        # Legend below the figure so it never overlaps the cost curves.
+        # Use the cost-panel handles only (the T-panel curves are
+        # self-explanatory from their axis labels).
+        handles, labels = ax_cost.get_legend_handles_labels()
+        fig.legend(
+            handles, labels,
+            ncol=min(7, len(handles)),
+            fontsize=9, loc="lower center",
+            bbox_to_anchor=(0.5, -0.02),
+            frameon=False,
+        )
+        fig.subplots_adjust(bottom=0.18)
         return fig, (ax_cost, ax_T)
 
     def plot_thermal_before_after(
@@ -1098,11 +1223,34 @@ class _ShellRelaxMixin:
         r_max: float = 8.0,
         title: str | None = None,
     ):
-        """Compare g(r) before and after thermal_relax.
+        """Compare g(r) before and after the most recent :meth:`thermal_relax` call.
 
-        Returns the IPython HTML object from
-        :func:`tricor.plot_g2_compare`.  The "before" snapshot is the
-        cell state cached at the start of :meth:`thermal_relax`.
+        Builds a g(r) overlay viewer with two curves: the cell state
+        cached at the start of :meth:`thermal_relax` ("before") and
+        the current state after the Monte-Carlo run completes
+        ("after").  Useful for visualising how an anneal schedule
+        sharpened or broadened the radial distribution.
+
+        Parameters
+        ----------
+        r_max : float, optional
+            Maximum radial distance (Å) plotted on the x-axis.
+            Default ``8.0`` Å.
+        title : str, optional
+            Title shown above the viewer.  Default uses the
+            supercell's ``label``.
+
+        Returns
+        -------
+        IPython.display.HTML
+            The rendered comparison viewer (auto-displays inline in
+            Jupyter when returned from a cell).
+
+        Raises
+        ------
+        ValueError
+            If :meth:`thermal_relax` has not been run yet (no cached
+            pre-thermal snapshot or history).
         """
         snap = getattr(self, "_thermal_start_snapshot", None)
         if snap is None:
