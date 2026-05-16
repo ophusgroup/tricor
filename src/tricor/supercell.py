@@ -1,10 +1,10 @@
-"""Supercell class — disordered atomic structure generation and optimization.
+"""Supercell class - disordered atomic structure generation and optimization.
 
 The heavy lifting is split across mixin modules:
-    _grain.py        — Voronoi grain construction
-    _shell_relax.py  — vectorized spring-network relaxation
-    _plotting.py     — visualization (plot_structure, plot_g3_compare, …)
-    _monte_carlo.py  — Monte Carlo engine, spatial indexing, teacher rollout
+    _grain.py - Voronoi grain construction
+    _shell_relax.py - vectorized spring-network relaxation
+    _plotting.py - visualization (plot_structure, plot_g3_compare, …)
+    _monte_carlo.py - Monte Carlo engine, spatial indexing, teacher rollout
 """
 
 from __future__ import annotations
@@ -22,9 +22,16 @@ from ._grain import _GrainMixin
 from ._shell_relax import _ShellRelaxMixin
 from ._plotting import _PlottingMixin
 from ._monte_carlo import _MonteCarloMixin
+from ._resample import _ResampleMixin
 
 
-class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin):
+class Supercell(
+    _GrainMixin,
+    _ShellRelaxMixin,
+    _PlottingMixin,
+    _MonteCarloMixin,
+    _ResampleMixin,
+):
     """Random supercell scaffold driven by a target :class:`G3Distribution`."""
 
     def __init__(
@@ -32,7 +39,7 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         distribution: G3Distribution,
         cell_dim_angstroms: float | Sequence[float],
         *,
-        relative_density: float = 1.0,
+        relative_density: float = 0.96,
         measure_g3: bool = False,
         plot_g3_compare: bool = False,
         label: str | None = None,
@@ -122,8 +129,10 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         if self.spatial_bin_size <= 0:
             raise ValueError("spatial_bin_size must be positive.")
 
-        self.reference_atoms = self.target_distribution.atoms.copy()
-        self._raw_distribution: G3Distribution = self.target_distribution
+        self.reference_atoms = self._to_orthogonal_cell(
+            self.target_distribution.atoms,
+        )
+        self._shell_target: Any | None = None
         self.atoms = self._build_random_atoms()
         self.current_distribution: G3Distribution | None = None
         self.mc_history: dict[str, np.ndarray] | None = None
@@ -150,6 +159,15 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         ]
         self._flat_triplet_size = self._r_num * self._r_num * self._phi_num_bins
         self._atom_species_index = np.searchsorted(self._species, self.atoms.numbers)
+        # Optional override: when a composite shell target has more
+        # virtual species than the atomic-number species (e.g. sp2_C
+        # and sp3_C sharing atomic number 6), the relaxer and the
+        # polyhedra-friendly plotting paths consult this array instead
+        # of ``_atom_species_index``.  Set from ``_build_grain_atoms``
+        # when ``grain_sources`` is supplied, or manually via
+        # ``Supercell.generate(..., atom_species_index=...)``.
+        self._atom_shell_species_index: np.ndarray | None = None
+        self._grain_source: np.ndarray | None = None
         self._g3_rr_weights_flat = self._build_g3_rr_weights()
         self._spatial_offset_cache: dict[tuple[int, int, int], np.ndarray] = {}
         self._rebuild_spatial_index()
@@ -170,7 +188,7 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         r_max: float = 10.0,
         r_step: float = 0.2,
         phi_num_bins: int = 90,
-        relative_density: float = 1.0,
+        relative_density: float = 0.96,
         rng_seed: int | None = None,
         label: str | None = None,
         **kwargs: Any,
@@ -231,32 +249,116 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
     # Cell geometry utilities
     # ------------------------------------------------------------------
 
-    def _normalize_cell_dim_angstroms(
-        self,
-        cell_dim_angstroms: float | Sequence[float],
-    ) -> tuple[float, float, float]:
-        """Validate and normalize the requested supercell lengths in Angstrom."""
+    def _normalize_cell_dim_angstroms(self, cell_dim_angstroms):
+        """Validate and normalize the requested supercell lattice.
+
+        Accepts:
+            - a scalar (cubic box),
+            - a length-3 sequence of positive edge lengths (orthogonal box),
+            - a 3 x 3 array of cell vectors (general triclinic box).
+        """
         if isinstance(cell_dim_angstroms, (int, float)):
             if float(cell_dim_angstroms) <= 0:
                 raise ValueError("cell_dim_angstroms must be positive.")
             length = float(cell_dim_angstroms)
             return (length, length, length)
 
-        dims = tuple(float(value) for value in cell_dim_angstroms)
-        if len(dims) != 3 or any(value <= 0 for value in dims):
-            raise ValueError(
-                "cell_dim_angstroms must be a scalar or a length-3 sequence of positive values."
-            )
-        return dims
+        arr = np.asarray(cell_dim_angstroms, dtype=float)
+        if arr.ndim == 2 and arr.shape == (3, 3):
+            if abs(np.linalg.det(arr)) < 1e-8:
+                raise ValueError("cell_dim_angstroms 3x3 matrix is singular.")
+            return arr.copy()
+
+        if arr.ndim == 1 and arr.shape[0] == 3:
+            if np.any(arr <= 0):
+                raise ValueError(
+                    "cell_dim_angstroms edge lengths must be positive."
+                )
+            return tuple(float(v) for v in arr)
+
+        raise ValueError(
+            "cell_dim_angstroms must be a scalar, a length-3 sequence, "
+            "or a 3x3 matrix of cell vectors.",
+        )
 
     def _build_supercell_cell(self) -> np.ndarray:
-        """Scale the source lattice vectors to the requested physical box lengths."""
-        reference_cell = np.asarray(self.reference_atoms.cell.array, dtype=np.float64)
-        reference_lengths = np.linalg.norm(reference_cell, axis=1)
-        if np.any(reference_lengths <= _EPS):
-            raise ValueError("Reference cell must have non-zero lattice-vector lengths.")
-        scale = np.asarray(self.cell_dim_angstroms, dtype=np.float64) / reference_lengths
-        return reference_cell * scale[:, None]
+        """Build the supercell cell matrix.
+
+        ``cell_dim_angstroms`` can be supplied as either
+        - a 3-tuple of edge lengths (orthogonal cell), or
+        - a full 3x3 array of cell vectors (rows = cell vectors).
+
+        The second form lets a hexagonal / triclinic reference be tiled
+        into a supercell that shares its lattice geometry so that quartz,
+        etc., tile cleanly through the periodic boundaries.
+        """
+        dim = np.asarray(self.cell_dim_angstroms, dtype=np.float64)
+        if dim.ndim == 1 and dim.shape[0] == 3:
+            return np.diag(dim)
+        if dim.ndim == 2 and dim.shape == (3, 3):
+            return dim.copy()
+        raise ValueError(
+            f"cell_dim_angstroms must be shape (3,) or (3, 3), got {dim.shape!r}"
+        )
+
+    @staticmethod
+    def _to_orthogonal_cell(atoms: Atoms) -> Atoms:
+        """Convert to an orthogonal (diagonal) cell if needed.
+
+        Tiles the primitive cell and wraps into the smallest
+        axis-aligned box, removing duplicates.  If the cell is
+        already orthogonal, returns a copy unchanged.
+        """
+        cell = np.asarray(atoms.cell.array, dtype=np.float64)
+        off_diag = cell - np.diag(np.diag(cell))
+        if np.allclose(off_diag, 0, atol=1e-6):
+            return atoms.copy()
+
+        # Find the smallest orthogonal box: use the max absolute
+        # Cartesian extent of each lattice vector column.
+        # For FCC [[0,a/2,a/2],[a/2,0,a/2],[a/2,a/2,0]]:
+        # max per column = [a/2, a/2, a/2], so box = [a, a, a].
+        a_orth = 2.0 * np.max(np.abs(cell), axis=0)
+        orth_cell = np.diag(a_orth)
+        orth_inv = np.linalg.inv(orth_cell)
+
+        # Tile generously
+        ref_lengths = np.linalg.norm(cell, axis=1)
+        n_reps = np.ceil(a_orth / np.maximum(ref_lengths, 1e-10)).astype(int) + 1
+        shifts = []
+        for ix in range(-n_reps[0], n_reps[0] + 1):
+            for iy in range(-n_reps[1], n_reps[1] + 1):
+                for iz in range(-n_reps[2], n_reps[2] + 1):
+                    shifts.append([ix, iy, iz])
+        shifts = np.array(shifts, dtype=np.float64)
+        shift_cart = shifts @ cell
+
+        pos = atoms.positions
+        nums = atoms.numbers
+        tiled_pos = (pos[None, :, :] + shift_cart[:, None, :]).reshape(-1, 3)
+        tiled_nums = np.tile(nums, len(shifts))
+
+        # Keep atoms inside the orthogonal box
+        frac = tiled_pos @ orth_inv
+        eps = 1e-6
+        inside = np.all((frac >= -eps) & (frac < 1.0 - eps), axis=1)
+        tiled_pos = tiled_pos[inside]
+        tiled_nums = tiled_nums[inside]
+
+        # Remove duplicates
+        frac_inside = tiled_pos @ orth_inv
+        frac_rounded = np.round(frac_inside, decimals=5)
+        _, unique_idx = np.unique(frac_rounded, axis=0, return_index=True)
+        tiled_pos = tiled_pos[unique_idx]
+        tiled_nums = tiled_nums[unique_idx]
+
+        result = Atoms(
+            numbers=tiled_nums,
+            positions=tiled_pos,
+            cell=orth_cell,
+            pbc=atoms.pbc,
+        )
+        return result
 
     def _target_species_counts(self, target_volume: float) -> tuple[np.ndarray, np.ndarray]:
         """Return the closest exact-stoichiometry atom counts for the requested box."""
@@ -296,6 +398,57 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
     # generate: unified structure generation
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Recommended presets for Si (diamond cubic)
+    # ------------------------------------------------------------------
+
+    PRESETS: dict[str, dict[str, Any]] = {
+        "liquid": dict(
+            num_steps=100,
+            grain_size=None,
+            bond_weight=0.4, angle_weight=0.5,
+            repulsion_weight=0.5,
+            hard_core_scale=0.75, nonbond_push_scale=0.7,
+        ),
+        "amorphous": dict(
+            num_steps=150,
+            grain_size=6.0,
+            bond_weight=1.2, angle_weight=0.6,
+            repulsion_weight=1.5,
+            hard_core_scale=0.9, nonbond_push_scale=0.5,
+            displacement_sigma=0.08,
+        ),
+        "SRO": dict(
+            num_steps=200,
+            grain_size=10.0,
+            bond_weight=2.2, angle_weight=1.0,
+            repulsion_weight=2.0,
+            hard_core_scale=0.95, nonbond_push_scale=0.6,
+            displacement_sigma=0.04,
+        ),
+        "MRO": dict(
+            num_steps=150,
+            grain_size=13.0,
+            bond_weight=1.9, angle_weight=0.9,
+            repulsion_weight=2.5,
+            hard_core_scale=0.95, nonbond_push_scale=0.7,
+            displacement_sigma=0.04,
+        ),
+        "LRO": dict(
+            num_steps=150,
+            grain_size=18.0,
+            bond_weight=2.0, angle_weight=1.0,
+            hard_core_scale=0.95, nonbond_push_scale=0.9,
+            displacement_sigma=0.04,
+        ),
+        "nanocrystalline": dict(
+            num_steps=150,
+            grain_size=20.0,
+            bond_weight=3.0, angle_weight=1.5,
+            displacement_sigma=0.02,
+        ),
+    }
+
     def generate(
         self,
         shell_target: "CoordinationShellTarget",
@@ -303,29 +456,30 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
         *,
         grain_size: float | None = None,
         crystalline_fraction: float = 1.0,
-        r_broadening: float | None = None,
-        phi_broadening: float | None = None,
+        bond_weight: float = 1.0,
+        angle_weight: float = 0.5,
+        repulsion_weight: float = 3.0,
+        hard_core_scale: float = 1.0,
+        nonbond_push_scale: float = 1.0,
+        displacement_sigma: float = 0.0,
+        atom_species_index: np.ndarray | None = None,
+        grain_sources: "list[dict] | None" = None,
+        # Build-time grain-orientation refinement (recommended for
+        # directional-bond materials like Si — see
+        # :meth:`refine_initial_orientations`).  ``True`` runs a
+        # cheap topology-free coordinate-descent over per-grain
+        # rotations BEFORE the FIRE quench; ``False`` skips it (the
+        # historical default).
+        refine_orientations: bool = False,
+        refine_orientations_kwargs: "dict | None" = None,
         show_progress: bool = True,
         **shell_relax_kwargs: Any,
     ) -> dict[str, Any]:
         """Generate a disordered supercell from liquid to nanocrystalline.
 
-        Covers the full spectrum of disorder:
-
-        * **Liquid** — ``grain_size=None, phi_broadening=25``:
-          only nearest-neighbor distances enforced, angles loosely constrained.
-        * **Amorphous** — ``grain_size=4, r_broadening=0.2, phi_broadening=12``:
-          short-range order with tunable distance and angle sharpness.
-        * **Short-range order** — ``grain_size=12, crystalline_fraction=0.5``:
-          small crystalline clusters in an amorphous matrix.
-        * **Mixed** — ``grain_size=18, crystalline_fraction=0.5``:
-          50 % crystalline grains, 50 % amorphous fill.
-        * **Nanocrystalline** — ``grain_size=25, crystalline_fraction=1.0``:
-          grains fill the entire box with thin disordered boundaries.
-
-        Also builds a matching *target_g3* distribution (auto-derived
-        from the construction parameters) and stores it on
-        :attr:`target_distribution` for use with :meth:`plot_g3_compare`.
+        Covers the full spectrum of disorder by combining Voronoi grain
+        construction with spring-network relaxation.  See
+        :attr:`PRESETS` for recommended parameter sets for Si.
 
         Parameters
         ----------
@@ -335,66 +489,46 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
             Number of relaxation sweeps.
         grain_size
             Diameter of crystalline grains in Angstrom.  ``None`` means
-            no grains — start from random positions (amorphous/liquid).
+            no grains - start from random positions (liquid/amorphous).
         crystalline_fraction
             Volume fraction filled by crystalline grains (0–1).  Only
             used when *grain_size* is set.  The remaining volume is
             filled with random (amorphous) positions.
-        r_broadening
-            Radial disorder σ in Angstrom at the nearest-neighbor
-            distance.  Controls how tightly bond lengths are enforced.
-            ``None`` uses a default.  Larger values → more distance
-            freedom.  Also sets the radial blur for the target g3.
-        phi_broadening
-            Angular disorder σ in degrees.  Controls how tightly bond
-            angles are enforced.  ``None`` uses a default.  180 means
-            angles are essentially free (liquid-like).  Small values
-            (e.g. 3) enforce sharp tetrahedral angles (diamond-like).
-            Also sets the angular blur for the target g3.
+        bond_weight
+            Harmonic spring strength pulling bonded neighbours toward
+            the target bond distance.  Larger = tighter distances.
+        angle_weight
+            Spring strength pushing bond angles toward the target angle.
+            Larger = tighter angles.  Near-zero = liquid-like freedom.
+        displacement_sigma
+            Gaussian displacement (Angstrom) applied to atoms within
+            crystalline grains as thermal broadening.  0 = no jitter.
         show_progress
             Display a text progress bar.
         **shell_relax_kwargs
-            Additional keyword arguments forwarded to :meth:`shell_relax`.
-            Explicit ``bond_weight`` / ``angle_weight`` override the
-            auto-derived values from broadening parameters.
+            Additional keyword arguments forwarded to :meth:`shell_relax`
+            (e.g. ``repulsion_weight``, ``hard_core_scale``, ``step_size``).
 
         Returns
         -------
         dict[str, Any]
-            Summary dict with regime, loss values, and construction
-            parameters.
+            Summary dict with regime, construction parameters, and
+            relaxation loss values.
         """
+        self._shell_target = shell_target
         pair_peak = np.asarray(shell_target.pair_peak, dtype=np.float64)
         pair_peak_max = float(np.max(pair_peak[pair_peak > _EPS])) if np.any(pair_peak > _EPS) else 2.5
-        max_pair_outer = float(shell_target.max_pair_outer)
-        g3_r_max = float(self.measure_r_max)
-        r_step = float(self.measure_r_step)
 
-        # --- compute force weights from broadening ---
-        auto_weights = self._broadening_to_weights(
-            pair_peak_max, r_broadening, phi_broadening,
-        )
-        for key, val in auto_weights.items():
-            shell_relax_kwargs.setdefault(key, val)
-
-        # --- enforce minimum grain size ---
+        # --- construct atoms ---
         use_grains = grain_size is not None and float(grain_size) > 0.0
-        user_grain_size = float(grain_size) if use_grains else 0.0
 
         if use_grains:
-            min_grain_size = pair_peak_max * 3.0
-            grain_size_clamped = max(float(grain_size), min_grain_size)
-
-            boundary_loss = pair_peak_max * 0.75
-            construction_grain_size = grain_size_clamped + 2.0 * boundary_loss
-
-            disp_sigma = float(r_broadening) if (r_broadening is not None and r_broadening > _EPS) else 0.0
-
             self.atoms = self._build_grain_atoms(
                 shell_target,
-                grain_size=construction_grain_size,
+                grain_size=float(grain_size),
                 crystalline_fraction=crystalline_fraction,
-                displacement_sigma=disp_sigma,
+                displacement_sigma=displacement_sigma,
+                grain_sources=grain_sources,
             )
 
             # Refresh cached arrays after rebuilding atoms
@@ -404,60 +538,153 @@ class Supercell(_GrainMixin, _ShellRelaxMixin, _PlottingMixin, _MonteCarloMixin)
                 self._species, self.atoms.numbers,
             )
             self._rebuild_spatial_index()
-
-        # --- auto-derive target_g3 from construction params ---
-        if use_grains:
-            target_r_min = max(user_grain_size * 0.4, max_pair_outer + 1.0)
-            target_r_max = max(user_grain_size * 0.7, target_r_min + 2.0)
+            # If the caller passed an explicit per-atom virtual species
+            # index, it takes precedence over whatever _build_grain_atoms
+            # set.  (The grain builder writes an index when grain_sources
+            # is non-None; an explicit kwarg here lets the caller
+            # override that.)
+            if atom_species_index is not None:
+                asp = np.asarray(atom_species_index, dtype=np.intp)
+                if asp.shape[0] != len(self.atoms):
+                    raise ValueError(
+                        f"atom_species_index length ({asp.shape[0]}) must "
+                        f"match atom count ({len(self.atoms)}) after "
+                        f"grain construction."
+                    )
+                self._atom_shell_species_index = asp
         else:
-            target_r_min = max_pair_outer
-            target_r_max = target_r_min + 1.5
+            # Liquid path: atoms came from _build_random_atoms() at init
+            # time with purely-random positions.  Pre-separate only
+            # severe overlaps (< 0.35 * hard_min ~ one-third a bond),
+            # leaving the rest for shell_relax's soft repulsion spring
+            # to handle smoothly.  A harder push would pile up a sharp
+            # non-physical spike at exactly the cutoff radius (that's
+            # exactly the artefact the user saw in the Cu liquid
+            # panel).
+            from ._grain import _push_close_pairs_apart
+            hard_min = float(np.min(
+                np.asarray(shell_target.pair_hard_min, dtype=np.float64)
+            ))
+            push_cutoff = 0.35 * hard_min
+            self.atoms.positions = _push_close_pairs_apart(
+                self.atoms.positions,
+                self.atoms.numbers,
+                self.atoms.cell.array,
+                pbc=self.atoms.pbc,
+                push_cutoff=push_cutoff,
+                max_iter=40,
+            )
+            self._rebuild_spatial_index()
+            if atom_species_index is not None:
+                asp = np.asarray(atom_species_index, dtype=np.intp)
+                if asp.shape[0] != len(self.atoms):
+                    raise ValueError(
+                        f"atom_species_index length ({asp.shape[0]}) must "
+                        f"match atom count ({len(self.atoms)})."
+                    )
+                self._atom_shell_species_index = asp
 
-        # Clamp to g3 grid range
-        target_r_max = min(target_r_max, g3_r_max - r_step)
-        target_r_min = min(target_r_min, target_r_max - r_step)
+        # --- optional build-time orientation refinement ---
+        # Runs BEFORE the global FIRE quench so the FIRE starts from a
+        # better basin.  Only meaningful when grains exist.  See
+        # :meth:`refine_initial_orientations` for the algorithm.  When
+        # enabled we first retile every grain at its initial rotation
+        # T=0 — this resets atoms to canonical lattice positions
+        # (undoing any thermal displacement from
+        # ``displacement_sigma`` and giving refinement a clean
+        # starting state that matches what trial retiles produce).
+        if (refine_orientations
+                and getattr(self, "_grain_ids", None) is not None
+                and getattr(self, "_grain_cells", None) is not None):
+            from ._resample import _retile_grain
 
-        # Build target distribution with boundary-aware blur
-        if use_grains:
-            boundary_blur_r = 0.15 * pair_peak_max / max(user_grain_size, pair_peak_max)
-            boundary_blur_phi = 10.0 * pair_peak_max / max(user_grain_size, pair_peak_max)
-            user_r = float(r_broadening) * 0.3 if (r_broadening is not None and r_broadening > _EPS) else 0.0
-            user_phi = float(phi_broadening) * 0.3 if (phi_broadening is not None and phi_broadening > _EPS) else 0.0
-            target_r_sigma = max(user_r, boundary_blur_r)
-            target_phi_sigma = max(user_phi, boundary_blur_phi)
-        else:
-            target_r_sigma = float(r_broadening) * 0.3 if (r_broadening is not None and r_broadening > _EPS) else None
-            target_phi_sigma = float(phi_broadening) * 0.3 if (phi_broadening is not None and phi_broadening > _EPS) else None
-        self.target_distribution = self._raw_distribution.target_g3(
-            target_r_min=target_r_min,
-            target_r_max=target_r_max,
-            r_sigma=target_r_sigma,
-            r_sigma_at=pair_peak_max,
-            phi_sigma_deg=target_phi_sigma,
-            label="target",
-        )
+            grain_ids_arr = np.asarray(self._grain_ids, dtype=np.intp)
+            grain_seeds_arr = np.asarray(self._grain_seeds,
+                                         dtype=np.float64)
+            voronoi_cells_l = self._grain_cells
+            masters_l = self._grain_masters
+            grain_source_l = self._grain_source
+            if grain_source_l is None:
+                grain_source_l = np.zeros(len(grain_seeds_arr),
+                                          dtype=np.intp)
+            is_crystalline_arr = np.asarray(
+                self._grain_is_crystalline, dtype=bool,
+            )
+            box_dim_arr = np.asarray(self._grain_box_dim,
+                                     dtype=np.float64)
+            for g in [int(_g) for _g in
+                      np.unique(grain_ids_arr[grain_ids_arr >= 0])
+                      if is_crystalline_arr[int(_g)]]:
+                gm = (grain_ids_arr == g)
+                target_n = int(np.sum(gm))
+                if target_n == 0:
+                    continue
+                src_idx = int(grain_source_l[g])
+                m = masters_l[src_idx]
+                retile = _retile_grain(
+                    master_positions=np.asarray(
+                        m["positions"], dtype=np.float64),
+                    master_numbers=np.asarray(
+                        m["numbers"], dtype=np.int64),
+                    voronoi_cell=voronoi_cells_l[g],
+                    seed_world=grain_seeds_arr[g],
+                    box_dim=box_dim_arr,
+                    rotation=self._grain_rotations_initial[g],
+                    translation=np.zeros(3),
+                    target_n=target_n,
+                )
+                if retile is not None:
+                    self.atoms.positions[gm] = retile[0]
+                    # Update species: multi-species grains re-order
+                    # atoms during retile so we must also assign the
+                    # corresponding ``numbers`` array (otherwise an O
+                    # position lands at a Si atom slot etc.).
+                    self.atoms.numbers[gm] = retile[1]
+            # Refresh the species-index cache after re-tiling.
+            self._atom_species_index = np.searchsorted(
+                self._species, self.atoms.numbers,
+            )
+            self._rebuild_spatial_index()
+
+            r_kwargs = dict(refine_orientations_kwargs or {})
+            r_kwargs.setdefault("bond_weight", float(bond_weight))
+            r_kwargs.setdefault("angle_weight", float(angle_weight))
+            r_kwargs.setdefault("repulsion_weight", float(repulsion_weight))
+            r_kwargs.setdefault("hard_core_scale", float(hard_core_scale))
+            r_kwargs.setdefault("nonbond_push_scale", float(nonbond_push_scale))
+            r_kwargs.setdefault("show_progress", bool(show_progress))
+            self.refine_initial_orientations(shell_target, **r_kwargs)
 
         # --- relax ---
         summary = self.shell_relax(
             shell_target,
             num_steps=num_steps,
+            bond_weight=bond_weight,
+            angle_weight=angle_weight,
+            repulsion_weight=repulsion_weight,
+            hard_core_scale=hard_core_scale,
+            nonbond_push_scale=nonbond_push_scale,
             show_progress=show_progress,
             **shell_relax_kwargs,
         )
 
         # --- summary ---
+        ref_density = len(self.target_distribution.atoms) / max(
+            float(self.target_distribution.atoms.cell.volume), _EPS,
+        )
+        actual_density = len(self.atoms) / max(float(self.atoms.cell.volume), _EPS)
+        actual_relative = actual_density / max(ref_density, _EPS)
+
         if use_grains:
             summary["regime"] = "nanocrystalline" if crystalline_fraction >= 0.9 else "mixed"
             summary["n_grains"] = int(self.atoms.info.get("n_grains", 0))
-            summary["grain_size"] = user_grain_size
-            summary["construction_grain_size"] = construction_grain_size
+            summary["grain_size"] = float(grain_size)
             summary["crystalline_fraction"] = crystalline_fraction
         else:
             summary["regime"] = "amorphous"
-        summary["r_broadening"] = r_broadening
-        summary["phi_broadening"] = phi_broadening
-        summary["target_r_min"] = target_r_min
-        summary["target_r_max"] = target_r_max
+        summary["num_atoms"] = len(self.atoms)
+        summary["target_density"] = self.relative_density
+        summary["actual_density"] = float(f"{actual_relative:.4f}")
 
         return summary
 

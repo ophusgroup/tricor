@@ -25,11 +25,18 @@ class _ShellRelaxMixin:
         bond_weight: float = 1.0,
         angle_weight: float = 0.5,
         repulsion_weight: float = 3.0,
+        k_restraint: float = 0.0,
+        r_initial_override: "np.ndarray | None" = None,
+        freeze_mask: "np.ndarray | None" = None,
+        freeze_grain_interiors: bool = False,
+        hard_core_scale: float = 1.0,
+        nonbond_push_scale: float = 1.0,
         step_size: float = 0.1,
         step_decay: float = 0.995,
         neighbor_update_interval: int = 10,
         neighbor_cutoff_scale: float = 1.5,
         max_force_clip: float = 2.0,
+        capture_trajectory: bool = False,
         show_progress: bool = True,
     ) -> dict[str, Any]:
         """Relax random positions to match first-shell targets using spring forces.
@@ -55,6 +62,24 @@ class _ShellRelaxMixin:
             ``angle_mode_deg``.
         repulsion_weight
             Strength of the short-range repulsive force below ``pair_hard_min``.
+        k_restraint
+            Spring constant (eV / Å²) for a global position-restraint
+            energy ``½ k_restraint Σ ‖r_i - r_initial_i‖²`` that tethers
+            every atom to its starting position.  ``0.0`` (default)
+            disables the term and reproduces unrestrained relaxation.
+            Small values (~0.1 - 1.0) preserve regime character (grain
+            layout, amorphous topology) while still permitting local
+            relaxation; large values (≫ 10) hold the structure rigid.
+        hard_core_scale
+            Multiplier for the hard-core repulsion radius.  1.0 uses
+            ``max(pair_hard_min, pair_inner)`` as the wall.  Values
+            below 1.0 allow shorter bonds (softer wall for liquid).
+            Values above 1.0 enforce a larger exclusion zone.
+        nonbond_push_scale
+            Multiplier for the non-bonded shell clearance distance.
+            1.0 pushes non-bonded atoms to ``1.5 * pair_peak``.
+            Values below 1.0 allow non-bonded atoms closer (broader
+            2nd shell for liquid).  0.0 disables non-bonded push.
         step_size
             Initial maximum displacement per step (Angstrom).
         step_decay
@@ -66,6 +91,18 @@ class _ShellRelaxMixin:
         max_force_clip
             Per-atom force magnitude is clipped to this value before
             integration to keep the dynamics stable.
+        freeze_grain_interiors
+            If ``True``, atoms identified as deep grain interior (more
+            than ``0.5 × max(pair_peak)`` away from the nearest
+            grain-boundary plane) are held fixed during relaxation.
+            ``False`` (default since 2026-05) lets every atom relax,
+            which is required for multi-species systems where the
+            interior atoms must accommodate cross-species spring
+            strain (SiO2, SrTiO3, sp²/sp³ carbon).  Setting ``True``
+            reproduces the pre-2026 behaviour and is occasionally
+            useful for single-species nanocrystalline cells where the
+            interiors are already at their target geometry.  Has no
+            effect on cells built without a ``grain_size``.
         show_progress
             Display a text progress bar.
 
@@ -75,7 +112,15 @@ class _ShellRelaxMixin:
             Summary with parameters and final/initial loss values.
         """
         num_atoms = len(self.atoms)
-        species_idx = self._atom_species_index  # (num_atoms,) int
+        # Prefer the composite-target virtual species mapping if the
+        # caller set one (e.g. sp²/sp³ carbon blends where atomic
+        # number alone can't distinguish the two chemistries);
+        # otherwise fall back to the atomic-number mapping.
+        species_idx = (
+            self._atom_shell_species_index
+            if getattr(self, "_atom_shell_species_index", None) is not None
+            else self._atom_species_index
+        )  # (num_atoms,) int
         cell_inv = self._cell_inverse
         cell_mat = self._cell_matrix
 
@@ -87,12 +132,24 @@ class _ShellRelaxMixin:
             np.asarray(shell_target.angle_mode_deg, dtype=np.float64)
         )
         angle_lookup = np.asarray(shell_target.angle_lookup, dtype=np.intp)
+        # Per-triplet angle-spring mask.  Defaults to all-True for
+        # shell targets produced by older builds that predate the
+        # field, so back-compat is preserved.
+        _default_mask = np.ones(angle_mode_rad.size, dtype=bool)
+        angle_enabled_mask = np.asarray(
+            getattr(shell_target, "angle_enabled_mask", _default_mask),
+            dtype=bool,
+        )
         cutoff = float(shell_target.max_pair_outer * neighbor_cutoff_scale)
 
-        # K nearest neighbors per atom (total across all neighbor species)
+        # K nearest neighbors per atom, both total and per-species-pair
         k_per_species = np.zeros(shell_target.species.size, dtype=np.intp)
         for s in range(shell_target.species.size):
             k_per_species[s] = int(np.round(coord_target[s].sum()))
+
+        # Per-species-pair coordination targets (rounded to int)
+        num_sp = shell_target.species.size
+        coord_target_int = np.round(coord_target).astype(np.intp)
 
         # Repulsion radii: hard core (overlap prevention) and non-bonded
         # shell clearance (eliminates close-packed background).
@@ -100,7 +157,7 @@ class _ShellRelaxMixin:
         # Hard core: use max of pair_hard_min and pair_inner to
         # prevent any bonds shorter than the shell inner boundary.
         pair_inner = np.asarray(shell_target.pair_inner, dtype=np.float64)
-        hard_core = np.maximum(pair_hard_min, pair_inner)
+        hard_core = np.maximum(pair_hard_min, pair_inner) * float(hard_core_scale)
         mask_zero = hard_core < _EPS
         hard_core[mask_zero] = 0.4 * pair_peak[mask_zero]
         global_floor = float(np.min(pair_peak[pair_peak > _EPS])) * 0.4 if np.any(pair_peak > _EPS) else 1.0
@@ -110,16 +167,24 @@ class _ShellRelaxMixin:
         # For Si, 2nd shell is at ~3.84Å (sqrt(8/3) * pair_peak).
         # Push non-bonded atoms to at least 1.5x pair_peak to
         # eliminate close-packed triplets from nearby non-bonded pairs.
-        nonbond_push = pair_peak * 1.5
+        nonbond_push = pair_peak * 1.5 * float(nonbond_push_scale)
         nonbond_push[nonbond_push < _EPS] = float(np.max(pair_peak)) * 1.5
 
         # --- grain-aware force scaling ---
-        # When _grain_ids is set, interior atoms are frozen to preserve
-        # crystalline order; boundary atoms get full relaxation forces.
+        # When _grain_ids is set AND the caller asks for it, interior
+        # atoms are frozen to preserve crystalline order; boundary
+        # atoms get full relaxation forces.  The default since 2026-05
+        # is ``freeze_grain_interiors=False``: every atom relaxes.
+        # Pre-fix behaviour (interior frozen) caused multi-species
+        # systems (SiO2, SrTiO3, sp²/sp³ carbon) to plateau in a
+        # high-energy basin because the interior atoms could not
+        # accommodate cross-species spring strain that propagated in
+        # from the boundaries.
         grain_ids = self._grain_ids
         grain_seeds = self._grain_seeds
         if (
-            grain_ids is not None
+            freeze_grain_interiors
+            and grain_ids is not None
             and grain_seeds is not None
             and len(grain_ids) == num_atoms
         ):
@@ -201,12 +266,13 @@ class _ShellRelaxMixin:
 
             nl_i, nl_j, nl_d = neighbor_list("ijd", self.atoms, cutoff)
 
-            # Symmetric bond matching with angular awareness: greedily
-            # build a K-regular bond graph.  Candidates are sorted by
-            # distance; each candidate is accepted only if the new bond
-            # makes angles >= min_accept_angle with all existing bonds at
-            # BOTH endpoints.  This eliminates close-packed clusters.
+            # Symmetric bond matching with angular + species awareness:
+            # greedily build a bond graph respecting per-species-pair
+            # coordination targets.  Candidates sorted by distance;
+            # each accepted only if angle and species constraints pass.
             bond_count = np.zeros(num_atoms, dtype=np.intp)
+            # Per-atom, per-neighbor-species bond counts
+            bond_count_pair = np.zeros((num_atoms, num_sp), dtype=np.intp)
             k_atom = np.array(
                 [int(k_per_species[species_idx[a]]) for a in range(num_atoms)],
                 dtype=np.intp,
@@ -231,12 +297,38 @@ class _ShellRelaxMixin:
 
             min_accept_angle = np.deg2rad(60.0)  # reject bonds with < 60deg to existing
 
+            def _species_pair_ok(ai: int, aj: int) -> bool:
+                """Check per-species-pair coordination limits."""
+                si, sj = species_idx[ai], species_idx[aj]
+                if bond_count_pair[ai, sj] >= coord_target_int[si, sj]:
+                    return False
+                if bond_count_pair[aj, si] >= coord_target_int[sj, si]:
+                    return False
+                return True
+
+            def _accept_bond(ai: int, aj: int) -> None:
+                """Record a new bond between atoms ai and aj."""
+                si, sj = species_idx[ai], species_idx[aj]
+                _bond_i_list.append(ai)
+                _bond_j_list.append(aj)
+                _bond_rt_list.append(float(pair_peak[si, sj]))
+                bonded_set.add((ai, aj))
+                bonded_set.add((aj, ai))
+                bonded_neighbors[ai].append(aj)
+                bonded_neighbors[aj].append(ai)
+                bond_count[ai] += 1
+                bond_count[aj] += 1
+                bond_count_pair[ai, sj] += 1
+                bond_count_pair[aj, si] += 1
+
             for idx in dist_order:
                 ai = int(nl_i[idx])
                 aj = int(nl_j[idx])
                 if bond_count[ai] >= k_atom[ai] or bond_count[aj] >= k_atom[aj]:
                     continue
                 if (ai, aj) in bonded_set:
+                    continue
+                if not _species_pair_ok(ai, aj):
                     continue
 
                 hat_ij = nl_hats[idx]
@@ -246,7 +338,7 @@ class _ShellRelaxMixin:
                 accept = True
                 for existing_hat in bond_hats_per_atom[ai]:
                     cos_a = np.dot(hat_ij, existing_hat)
-                    if cos_a > np.cos(min_accept_angle):  # angle < min_accept
+                    if cos_a > np.cos(min_accept_angle):
                         accept = False
                         break
                 if not accept:
@@ -261,22 +353,13 @@ class _ShellRelaxMixin:
                 if not accept:
                     continue
 
-                s_ai = species_idx[ai]
-                s_aj = species_idx[aj]
-                _bond_i_list.append(ai)
-                _bond_j_list.append(aj)
-                _bond_rt_list.append(float(pair_peak[s_ai, s_aj]))
-                bonded_set.add((ai, aj))
-                bonded_set.add((aj, ai))
-                bonded_neighbors[ai].append(aj)
-                bonded_neighbors[aj].append(ai)
                 bond_hats_per_atom[ai].append(hat_ij.copy())
                 bond_hats_per_atom[aj].append(hat_ji.copy())
-                bond_count[ai] += 1
-                bond_count[aj] += 1
+                _accept_bond(ai, aj)
 
             # Second pass: fill remaining unsatisfied atoms with
-            # distance-only matching (relaxing angle constraint)
+            # distance-only matching (relaxing angle constraint but
+            # still respecting species-pair limits)
             for idx in dist_order:
                 ai = int(nl_i[idx])
                 aj = int(nl_j[idx])
@@ -284,17 +367,9 @@ class _ShellRelaxMixin:
                     continue
                 if (ai, aj) in bonded_set:
                     continue
-                s_ai = species_idx[ai]
-                s_aj = species_idx[aj]
-                _bond_i_list.append(ai)
-                _bond_j_list.append(aj)
-                _bond_rt_list.append(float(pair_peak[s_ai, s_aj]))
-                bonded_set.add((ai, aj))
-                bonded_set.add((aj, ai))
-                bonded_neighbors[ai].append(aj)
-                bonded_neighbors[aj].append(ai)
-                bond_count[ai] += 1
-                bond_count[aj] += 1
+                if not _species_pair_ok(ai, aj):
+                    continue
+                _accept_bond(ai, aj)
 
             bond_i = np.array(_bond_i_list, dtype=np.intp)
             bond_j = np.array(_bond_j_list, dtype=np.intp)
@@ -319,6 +394,11 @@ class _ShellRelaxMixin:
                             triplet_idx = int(angle_lookup[s_center, s_a, s_b])
                         else:
                             triplet_idx = int(angle_lookup[s_center, s_b, s_a])
+                        # Skip triplets whose angle spring is masked
+                        # off (multi-modal shells; see
+                        # ``CoordinationShellTarget.with_angle_triplets``).
+                        if not angle_enabled_mask[triplet_idx]:
+                            continue
                         phi_t = float(angle_mode_rad[triplet_idx])
                         _tc.append(atom)
                         _ta.append(int(bn[ia]))
@@ -336,12 +416,48 @@ class _ShellRelaxMixin:
         bond_loss_history = np.zeros(num_steps + 1, dtype=np.float64)
         angle_loss_history = np.zeros(num_steps + 1, dtype=np.float64)
         repulsion_loss_history = np.zeros(num_steps + 1, dtype=np.float64)
+        restraint_loss_history = np.zeros(num_steps + 1, dtype=np.float64)
+
+        if capture_trajectory:
+            trajectory = np.zeros(
+                (num_steps + 1, num_atoms, 3), dtype=np.float32,
+            )
+            atom_cost_history = np.zeros(
+                (num_steps + 1, num_atoms), dtype=np.float32,
+            )
+        else:
+            trajectory = None
+            atom_cost_history = None
 
         current_step = float(step_size)
         velocity = np.zeros((num_atoms, 3), dtype=np.float64)
         momentum = 0.8  # momentum damping factor
         best_positions = self.atoms.positions.copy()
         best_loss = np.inf
+
+        # Position-restraint reference: a frozen snapshot of the
+        # starting positions.  Force contribution is
+        # ``F_i = -k_restraint · (r_i - r_initial_i)`` (min-image-
+        # corrected); ``k_restraint == 0`` disables the term.  This
+        # lets the FIRE relaxation be globally differentiable yet still
+        # tethered to the input regime structure.
+        #
+        # ``r_initial_override`` lets a caller supply a different
+        # reference (e.g. when chaining shell_relax after thermal_relax
+        # to do a final FIRE quench: the override should be the
+        # *pre-thermal* positions so the restraint still pulls atoms
+        # toward the regime's reference cell, not toward the post-MC
+        # configuration).
+        if r_initial_override is not None:
+            r_initial = np.ascontiguousarray(r_initial_override, dtype=np.float64).copy()
+            if r_initial.shape != self.atoms.positions.shape:
+                raise ValueError(
+                    f"r_initial_override has shape {r_initial.shape}; "
+                    f"expected {self.atoms.positions.shape}"
+                )
+        else:
+            r_initial = self.atoms.positions.copy()
+        k_restraint_f = float(k_restraint)
 
         if show_progress:
             progress = _TextProgressBar(num_steps, label="Shell relax", width=28)
@@ -360,6 +476,10 @@ class _ShellRelaxMixin:
 
             # ---------- compute forces ----------
             force = np.zeros((num_atoms, 3), dtype=np.float64)
+            if atom_cost_history is not None:
+                atom_cost = np.zeros(num_atoms, dtype=np.float64)
+            else:
+                atom_cost = None
 
             # 1) Bond springs
             bond_loss = 0.0
@@ -373,6 +493,18 @@ class _ShellRelaxMixin:
                 f_bond = (bond_weight * delta_r)[:, None] * bond_hat
                 np.add.at(force, bond_i, f_bond)
                 np.add.at(force, bond_j, -f_bond)
+                if atom_cost is not None:
+                    # Spring-energy contribution: 0.5 * k * delta_r^2
+                    # with k = bond_weight.  Before this the cost
+                    # stored just delta_r^2/2 (unscaled), so weak-
+                    # relax liquids with large residual delta_r
+                    # reported spuriously enormous per-atom costs in
+                    # the trajectory viewer (e.g. Cu liquid with
+                    # bond_weight=0.05 showed cost_max=100 vs Si's
+                    # bond_weight=0.4 showing cost_max=4).
+                    half_bond_cost = 0.5 * float(bond_weight) * delta_r ** 2
+                    np.add.at(atom_cost, bond_i, half_bond_cost)
+                    np.add.at(atom_cost, bond_j, half_bond_cost)
 
             # 2) Angle springs
             angle_loss = 0.0
@@ -394,6 +526,16 @@ class _ShellRelaxMixin:
 
                 delta_phi = phi - tri_phi_target
                 angle_loss = float(np.mean(delta_phi ** 2))
+                if atom_cost is not None:
+                    # 0.5 * angle_weight * delta_phi^2 split 1/3 to
+                    # each of the three triplet atoms.  Same scaling
+                    # rationale as the bond cost above.
+                    third_angle_cost = (
+                        0.5 * float(angle_weight) * delta_phi ** 2 / 3.0
+                    )
+                    np.add.at(atom_cost, tri_center, third_angle_cost)
+                    np.add.at(atom_cost, tri_a, third_angle_cost)
+                    np.add.at(atom_cost, tri_b, third_angle_cost)
 
                 perp_a = (hat_b - cos_phi[:, None] * hat_a) / sin_phi_safe[:, None]
                 perp_b = (hat_a - cos_phi[:, None] * hat_b) / sin_phi_safe[:, None]
@@ -451,12 +593,59 @@ class _ShellRelaxMixin:
                     np.add.at(force, rep_i_all, -f_rep)
                     np.add.at(force, rep_j_all, f_rep)
 
+                if atom_cost is not None and np.any(active):
+                    # Cost = hard-mask indicator + 0.1 * nonbond indicator, split 0.5 / 0.5
+                    per_pair_cost = 0.5 * (
+                        hard_mask.astype(np.float64)
+                        + 0.1 * nonbond_mask.astype(np.float64)
+                    )
+                    np.add.at(atom_cost, rep_i_all, per_pair_cost)
+                    np.add.at(atom_cost, rep_j_all, per_pair_cost)
+
+            # 4) Position restraint (global tether to starting config)
+            restraint_loss = 0.0
+            if k_restraint_f > 0.0:
+                d_restr = pos - r_initial
+                # Min-image so PBC wrapping doesn't cause a spurious
+                # tug across the cell boundary.
+                d_restr = min_image(d_restr)
+                # Force = -dE/dr = -k_restraint · (r - r_initial)
+                f_restr = -k_restraint_f * d_restr
+                force += f_restr
+                # Diagnostic loss: mean squared displacement (Å²),
+                # parallel to the bond / angle reporting style.
+                restraint_loss = float(np.mean(np.sum(d_restr * d_restr, axis=1)))
+                if atom_cost is not None:
+                    # 0.5 k Σ‖Δ‖² per atom (each atom owns its own
+                    # restraint term, no double-counting).  Use direct
+                    # ``+=`` rather than ``np.add.at`` — every index
+                    # appears exactly once so plain addition is
+                    # functionally identical and orders of magnitude
+                    # faster (np.add.at goes through the ufunc-at
+                    # machinery even for unique indices, which made
+                    # capture-trajectory FIRE quenches with k_restraint
+                    # > 0 take minutes per call).
+                    atom_cost += (
+                        0.5 * k_restraint_f
+                        * np.sum(d_restr * d_restr, axis=1)
+                    )
+
             # ---------- record loss ----------
-            total_loss = bond_loss + angle_loss + repulsion_loss / max(num_atoms, 1)
+            total_loss = (
+                bond_loss
+                + angle_loss
+                + repulsion_loss / max(num_atoms, 1)
+                + restraint_loss * k_restraint_f
+            )
             loss_history[step] = total_loss
             bond_loss_history[step] = bond_loss
             angle_loss_history[step] = angle_loss
             repulsion_loss_history[step] = repulsion_loss
+            restraint_loss_history[step] = restraint_loss
+            if trajectory is not None:
+                trajectory[step] = pos.astype(np.float32)
+            if atom_cost_history is not None and atom_cost is not None:
+                atom_cost_history[step] = atom_cost.astype(np.float32)
             if total_loss < best_loss:
                 best_loss = total_loss
                 best_positions = pos.copy()
@@ -464,8 +653,22 @@ class _ShellRelaxMixin:
 
             # ---------- integrate (skip on last step) ----------
             if step < num_steps:
+                # Caller-supplied freeze mask: zero force + velocity on
+                # any True entry.  Used by ``refine_grains`` to relax
+                # only a grain + its neighbour shell while the rest of
+                # the cell stays put.  Takes precedence over the
+                # built-in grain-boundary detection.
+                if freeze_mask is not None:
+                    fm = np.asarray(freeze_mask, dtype=bool)
+                    if fm.shape != (num_atoms,):
+                        raise ValueError(
+                            f"freeze_mask shape {fm.shape} != ({num_atoms},)"
+                        )
+                    if np.any(fm):
+                        force[fm] = 0.0
+                        velocity[fm] = 0.0
                 # Freeze interior grain atoms: zero force and velocity
-                if is_boundary is not None:
+                elif is_boundary is not None:
                     interior_mask = ~is_boundary
                     if np.any(interior_mask):
                         force[interior_mask] = 0.0
@@ -511,7 +714,12 @@ class _ShellRelaxMixin:
             "bond_loss": bond_loss_history,
             "angle_loss": angle_loss_history,
             "repulsion_loss": repulsion_loss_history,
+            "restraint_loss": restraint_loss_history,
         }
+        if trajectory is not None:
+            self.shell_relax_history["trajectory"] = trajectory
+        if atom_cost_history is not None:
+            self.shell_relax_history["atom_cost"] = atom_cost_history
 
         # Invalidate caches
         self.current_distribution = None
@@ -525,6 +733,7 @@ class _ShellRelaxMixin:
             "bond_weight": float(bond_weight),
             "angle_weight": float(angle_weight),
             "repulsion_weight": float(repulsion_weight),
+            "k_restraint": float(k_restraint),
             "step_size": float(step_size),
             "step_decay": float(step_decay),
             "neighbor_update_interval": int(neighbor_update_interval),
@@ -536,12 +745,311 @@ class _ShellRelaxMixin:
         }
         return summary
 
+    # ------------------------------------------------------------------
+    # thermal_relax: Metropolis Monte-Carlo with temperature schedule
+    # ------------------------------------------------------------------
+
+    def thermal_relax(
+        self: "Supercell",
+        shell_target: "CoordinationShellTarget",
+        *,
+        num_sweeps: int = 1000,
+        T_schedule="anneal",
+        T_start: float = 0.05,
+        T_end: float = 0.001,
+        hold_sweeps: int = 200,
+        step_sigma: float = 0.05,
+        smart_dt: float = 0.02,
+        adapt_step: bool = True,
+        target_accept: float = 0.4,
+        move_probs: "dict | None" = None,
+        bond_weight: float = 1.0,
+        angle_weight: float = 0.5,
+        repulsion_weight: float = 3.0,
+        k_restraint: float = 0.0,
+        hard_core_scale: float = 1.0,
+        nonbond_push_scale: float = 1.0,
+        neighbor_update_interval: int = 100,
+        rep_neighbor_update_interval: int = 20,
+        capture_stride: int = 10,
+        capture_trajectory: bool = True,
+        restore_best: bool = True,
+        freeze_interior: bool | None = None,
+        freeze_mask: np.ndarray | None = None,
+        grain_moves: bool | None = None,
+        grain_move_interval: int = 1,
+        grain_sigma_rot: float = 0.01,
+        grain_sigma_trans: float = 0.01,
+        show_progress: bool = True,
+    ) -> dict:
+        """Temperature-dependent Metropolis Monte-Carlo relaxation.
+
+        Sits alongside :meth:`shell_relax` - same spring-network
+        energy (bond + angle + repulsion from ``shell_target``), but
+        moves atoms by Metropolis accept/reject with a temperature
+        schedule.  Good for escaping the local minima that gradient
+        descent settles into and for producing annealed amorphous
+        configurations.
+
+        A typical workflow is: run :meth:`shell_relax` or
+        :meth:`generate` once to bring the initial random / tile
+        configuration into a low-energy basin, then call
+        :meth:`thermal_relax` with a moderate-to-cold anneal schedule
+        to explore the basin and settle into the global minimum of
+        that basin.
+
+        Parameters
+        ----------
+        shell_target
+            First-shell coordination targets, same object used by
+            :meth:`shell_relax`.
+        num_sweeps
+            Number of sweeps.  Each sweep performs ``len(atoms)``
+            trial moves.
+        T_schedule
+            ``"hold"`` (constant ``T_start``), ``"anneal"`` (hold at
+            ``T_start`` for ``hold_sweeps`` then linearly drop to
+            ``T_end``), or a ``callable(sweep_index) -> T``.
+        T_start, T_end, hold_sweeps
+            Parameters for the ``"anneal"`` schedule.
+        step_sigma
+            Initial Gaussian trial-move amplitude in Å.
+        adapt_step
+            If ``True``, adapt ``step_sigma`` every 20 sweeps to
+            target ``target_accept`` acceptance rate.
+        move_probs
+            Dictionary with optional keys ``"displace"``, ``"swap"``,
+            ``"smart"``.  Weights are normalised; default
+            ``{"displace": 1.0}``.  ``"swap"`` exchanges virtual
+            species between two atoms of different species; useful
+            for multi-element + composite-shell-target systems.
+            ``"smart"`` is a force-biased Langevin proposal with
+            Metropolis correction (reserved for v2; currently treated
+            as no-op).
+        bond_weight : float, optional
+            Same as :meth:`shell_relax`.  Default ``1.0``.
+        angle_weight : float, optional
+            Same as :meth:`shell_relax`.  Default ``0.5``.
+        repulsion_weight : float, optional
+            Same as :meth:`shell_relax`.  Default ``3.0``.
+        k_restraint : float, optional
+            Spring constant (eV / Å²) for a global position-restraint
+            energy ``½ k_restraint Σ ‖r_i - r_initial_i‖²`` that tethers
+            every atom to its starting position.  ``0.0`` (default)
+            disables the term and reproduces unrestrained MC.  Small
+            values (~0.1 - 1.0) preserve the input regime character
+            (grain layout, amorphous topology) while still permitting
+            local relaxation; large values (≫ 10) hold the structure
+            essentially rigid.  Differentiable + globally defined, so
+            unlike a hard ``freeze_interior`` the cost surface stays
+            smooth and the relaxation can find consistent low-strain
+            configurations across grain boundaries.
+        hard_core_scale : float, optional
+            Same as :meth:`shell_relax`.  Default ``1.0``.
+        nonbond_push_scale : float, optional
+            Same as :meth:`shell_relax`.  Default ``1.0``.
+        neighbor_update_interval
+            Rebuild the bond topology every this many sweeps.
+        capture_stride
+            Store a history frame every this many sweeps.  Smaller =
+            finer trajectory movie, larger = less memory.
+        capture_trajectory
+            Whether to store per-sweep positions.  Disable for very
+            long runs where only cost / T / accept_rate matter.
+        freeze_interior
+            Legacy hard-freeze of crystalline grain interiors.  Only
+            takes effect when explicitly set to ``True`` *and* the cell
+            has populated ``_grain_ids`` / ``_grain_seeds`` (i.e. came
+            from :meth:`generate` with ``grain_size``).  Default
+            ``None`` leaves all atoms free; prefer ``k_restraint > 0``
+            for a smooth, differentiable, regime-preserving alternative.
+        freeze_mask
+            Explicit per-atom freeze mask of shape ``(num_atoms,)``.
+            ``True`` entries are pinned for the entire run.  Overrides
+            ``freeze_interior``.  Useful when the cell isn't grain-tiled
+            but you still want to hold specific atoms (e.g. an
+            interface) fixed.
+        grain_moves : bool, optional
+            If ``True`` (or ``None`` and the cell has ≥2 grains),
+            propose rigid rotation + translation of each grain every
+            ``grain_move_interval`` sweeps.
+        grain_move_interval : int, optional
+            Sweep cadence of the rigid-grain proposals.  Default ``1``
+            (one set of grain moves per sweep when enabled).
+        grain_sigma_rot : float, optional
+            Std-dev of the per-grain rotation angle (radians).
+            Default ``0.01``.
+        grain_sigma_trans : float, optional
+            Std-dev of the per-grain translation (Å).  Default
+            ``0.01``.
+
+        Returns
+        -------
+        dict
+            History dictionary assigned to
+            ``self.thermal_relax_history``.  Layout matches
+            :meth:`shell_relax_history` where possible, so
+            :meth:`export_trajectory_html` can visualise the
+            trajectory unchanged.
+        """
+        from ._thermal_mc import thermal_relax_impl
+
+        # Cache a deep-copy of the starting state so
+        # ``plot_thermal_before_after`` can show initial vs final.
+        from ase.atoms import Atoms
+        self._thermal_start_snapshot = Atoms(
+            numbers=self.atoms.numbers.copy(),
+            positions=self.atoms.positions.copy(),
+            cell=self.atoms.cell.array.copy(),
+            pbc=self.atoms.pbc,
+        )
+        if getattr(self, "_atom_shell_species_index", None) is not None:
+            self._thermal_start_shell_species = self._atom_shell_species_index.copy()
+        else:
+            self._thermal_start_shell_species = None
+
+        species_idx = (
+            self._atom_shell_species_index
+            if getattr(self, "_atom_shell_species_index", None) is not None
+            else self._atom_species_index
+        ).astype(np.intp, copy=True)
+
+        # --- resolve freeze_mask ---
+        # Priority: explicit mask > explicit freeze_interior=True.
+        # ``freeze_interior=None`` (default) leaves all atoms free; the
+        # modern way to preserve regime structure is the differentiable
+        # ``k_restraint`` term (see kwarg above), which gives a smooth
+        # tether instead of a hard freeze.  ``freeze_interior=True`` is
+        # retained for back-compat with workflows that explicitly opted
+        # into the legacy hard-freeze behaviour.
+        if freeze_mask is not None:
+            _freeze_mask_arr = np.asarray(freeze_mask, dtype=bool)
+        elif (
+            freeze_interior is True
+            and getattr(self, "_grain_ids", None) is not None
+            and getattr(self, "_grain_seeds", None) is not None
+        ):
+            from ._thermal_mc import detect_grain_boundary_atoms
+            pair_peak_max = float(np.max(np.asarray(shell_target.pair_peak)))
+            is_boundary = detect_grain_boundary_atoms(
+                self.atoms, self._grain_ids, self._grain_seeds,
+                pair_peak_max=pair_peak_max,
+            )
+            # Freeze interior = everyone who is NOT on a grain boundary.
+            _freeze_mask_arr = ~is_boundary
+            if show_progress:
+                nfroz = int(np.sum(_freeze_mask_arr))
+                print(
+                    f"thermal_relax: freezing {nfroz}/{len(self.atoms)} "
+                    f"interior atoms; {len(self.atoms)-nfroz} grain-boundary "
+                    f"atoms will move.  (Consider ``k_restraint`` as a "
+                    f"smoother alternative — it tethers all atoms to "
+                    f"their starting positions with a spring instead of "
+                    f"hard-freezing the interior.)"
+                )
+        else:
+            _freeze_mask_arr = None
+
+        # Grain rigid-moves: default-on when cell has >=2 grains.
+        _grain_ids_for_impl = None
+        _use_grain_moves = (
+            (grain_moves is True or grain_moves is None)
+            and getattr(self, "_grain_ids", None) is not None
+        )
+        if _use_grain_moves:
+            gids = np.asarray(self._grain_ids, dtype=np.intp)
+            if int(np.unique(gids[gids >= 0]).size) >= 2:
+                _grain_ids_for_impl = gids
+                if show_progress:
+                    nonneg_gids = gids[gids >= 0]
+                    n_gr = int(np.unique(nonneg_gids).size)
+                    print(
+                        f"thermal_relax: will propose rigid rotations + "
+                        f"translations of {n_gr} grains every "
+                        f"{grain_move_interval} sweep(s) "
+                        f"(σ_rot={grain_sigma_rot} rad, "
+                        f"σ_trans={grain_sigma_trans} Å)."
+                    )
+
+        _kwargs_for_impl = dict(
+            restore_best=bool(restore_best),
+            freeze_mask=_freeze_mask_arr,
+            grain_ids=_grain_ids_for_impl,
+            grain_move_interval=int(grain_move_interval),
+            grain_sigma_rot=float(grain_sigma_rot),
+            grain_sigma_trans=float(grain_sigma_trans),
+        )
+        history = thermal_relax_impl(
+            self.atoms,
+            species_idx,
+            shell_target,
+            num_sweeps=int(num_sweeps),
+            T_schedule=T_schedule,
+            T_start=float(T_start),
+            T_end=float(T_end),
+            hold_sweeps=int(hold_sweeps),
+            step_sigma=float(step_sigma),
+            smart_dt=float(smart_dt),
+            adapt_step=bool(adapt_step),
+            target_accept=float(target_accept),
+            move_probs=move_probs,
+            bond_weight=float(bond_weight),
+            angle_weight=float(angle_weight),
+            repulsion_weight=float(repulsion_weight),
+            k_restraint=float(k_restraint),
+            hard_core_scale=float(hard_core_scale),
+            nonbond_push_scale=float(nonbond_push_scale),
+            neighbor_update_interval=int(neighbor_update_interval),
+            rep_neighbor_update_interval=int(rep_neighbor_update_interval),
+            capture_stride=int(capture_stride),
+            capture_trajectory=bool(capture_trajectory),
+            rng_seed=int(self.rng.integers(0, 2**31 - 1)) if hasattr(self, "rng") else None,
+            show_progress=bool(show_progress),
+            **_kwargs_for_impl,
+        )
+
+        # Write the final species assignments back to the Supercell.
+        if getattr(self, "_atom_shell_species_index", None) is not None:
+            self._atom_shell_species_index = history["final_species_idx"]
+        # MC invalidates the cached g3 measurement.
+        self.current_distribution = None
+        self._rebuild_spatial_index()
+
+        self.thermal_relax_history = history
+        return history
+
     def plot_shell_relax(
         self: "Supercell",
         *,
         log_y: bool = False,
     ):
-        """Plot the recorded shell-relax loss history using Matplotlib."""
+        """Plot the FIRE relaxation loss history captured by the most recent :meth:`shell_relax` call.
+
+        Renders the per-step total loss alongside its best-so-far
+        envelope and the three component contributions (bond, angle,
+        repulsion).  When the run was launched with
+        ``k_restraint > 0``, the position-restraint contribution is
+        added as a fifth curve in purple.
+
+        Parameters
+        ----------
+        log_y : bool, optional
+            Display the loss axis on a log scale.  Useful for runs
+            that span several orders of magnitude (e.g.
+            ``num_steps`` > 200 with stiff springs).  Default
+            ``False``.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            The created figure.
+
+        Raises
+        ------
+        ValueError
+            If :meth:`shell_relax` has not been run yet
+            (``self.shell_relax_history is None``).
+        """
         if self.shell_relax_history is None:
             raise ValueError("Run shell_relax() before plotting the history.")
 
@@ -558,6 +1066,16 @@ class _ShellRelaxMixin:
             hist["repulsion_loss"] / max(len(self.atoms), 1),
             lw=1.0, alpha=0.7, label="repulsion (per atom)",
         )
+        # Position-restraint loss is only surfaced when k_restraint > 0
+        # was used; older histories (or runs at k=0) don't show this
+        # curve so the plot stays clean for unrestrained relaxations.
+        # Use a small absolute tolerance so floating-point noise from
+        # the ``total - bond - angle - rep`` decomposition doesn't
+        # accidentally trigger the curve at k=0.
+        restraint = hist.get("restraint_loss")
+        if restraint is not None and float(np.max(np.asarray(restraint))) > 1e-6:
+            ax.plot(hist["step"], restraint, lw=1.0, alpha=0.7,
+                    label="restraint", color="#9467bd")
         if log_y:
             positive = hist["loss"][hist["loss"] > 0.0]
             if positive.size:
@@ -569,3 +1087,181 @@ class _ShellRelaxMixin:
         ax.grid(alpha=0.25)
         fig.tight_layout()
         return fig, ax
+
+    def plot_thermal_relax(
+        self: "Supercell",
+        *,
+        log_y: bool = False,
+        log_x: bool = False,
+    ):
+        """Plot thermal-MC history: cost + T on shared x-axis.
+
+        Two stacked panels with ``sharex=True`` so the hold-plateau /
+        anneal-ramp shape in temperature lines up visually with the
+        cost trajectory.
+
+        Parameters
+        ----------
+        log_y
+            Log-scale the cost axis.  Recommended for convergence
+            checking - a converged run shows a clear plateau when
+            the cost curve flattens on a log scale.
+        log_x
+            Log-scale the sweep axis.  Off by default because a
+            typical hold+anneal schedule is linear in sweep index, so
+            log-x distorts the temperature ramp visually.  Useful if
+            your schedule spans many orders of magnitude in sweep
+            number or you want to emphasize early-sweep dynamics.
+        """
+        hist = getattr(self, "thermal_relax_history", None)
+        if hist is None:
+            raise ValueError("Run thermal_relax() before plotting.")
+
+        import matplotlib.pyplot as plt
+
+        fig, (ax_cost, ax_T) = plt.subplots(
+            2, 1, figsize=(7.0, 5.0), sharex=True,
+            gridspec_kw={"height_ratios": [2.5, 1.0], "hspace": 0.08},
+        )
+        # Normalise to per-atom so the axis is comparable across
+        # regime sizes and across systems of different N.
+        n = float(max(1, len(self.atoms)))
+        ax_cost.plot(hist["sweep"], np.asarray(hist["cost"]) / n, lw=1.8, label="total")
+        ax_cost.plot(hist["sweep"], np.asarray(hist["best_cost"]) / n, lw=1.2, ls="--", label="best")
+        ax_cost.plot(hist["sweep"], np.asarray(hist["cost_bond"]) / n, lw=0.9, alpha=0.7, label="bond")
+        ax_cost.plot(hist["sweep"], np.asarray(hist["cost_angle"]) / n, lw=0.9, alpha=0.7, label="angle")
+        ax_cost.plot(hist["sweep"], np.asarray(hist["cost_rep"]) / n, lw=0.9, alpha=0.7, label="repulsion")
+        # Position-restraint cost is only surfaced when k_restraint > 0
+        # was used; older histories (or runs at k=0) don't surface this
+        # curve so the legend stays compact for unrestrained runs.
+        # Tolerance compares to the ``cost`` magnitude so the curve
+        # only shows when the restraint is a meaningful fraction of
+        # total energy (filters FP noise from the
+        # ``total - bond - angle - rep`` decomposition at k=0).
+        cost_restraint = hist.get("cost_restraint")
+        if cost_restraint is not None:
+            restraint_arr = np.asarray(cost_restraint)
+            cost_arr = np.asarray(hist["cost"])
+            cost_scale = float(np.max(np.abs(cost_arr))) + 1e-12
+            if float(np.max(np.abs(restraint_arr))) > 1e-6 * cost_scale:
+                ax_cost.plot(hist["sweep"], restraint_arr / n,
+                             lw=0.9, alpha=0.7, label="restraint",
+                             color="#9467bd")
+        if log_y:
+            ax_cost.set_yscale("log")
+        if log_x:
+            # Shared x-axis: setting it on one panel sets both.
+            ax_cost.set_xscale("log")
+        ax_cost.set_ylabel("cost / atom")
+        ax_cost.set_title("Thermal MC history")
+        # Trim very-low-magnitude tail when on log so the curves use
+        # the full vertical span rather than getting squashed against
+        # the top by a single curve that decays many orders of magnitude.
+        if log_y:
+            cost_arrs = [
+                np.asarray(hist["cost"]) / n,
+                np.asarray(hist["cost_bond"]) / n,
+                np.asarray(hist["cost_angle"]) / n,
+                np.asarray(hist["cost_rep"]) / n,
+            ]
+            stacked = np.concatenate(cost_arrs)
+            positive = stacked[stacked > 0]
+            if positive.size:
+                lo = float(np.percentile(positive, 1.0))
+                hi = float(np.max(stacked))
+                if hi > 0:
+                    ax_cost.set_ylim(max(lo * 0.5, 1e-12), hi * 1.6)
+        ax_cost.grid(alpha=0.25)
+
+        ax_T.plot(hist["sweep"], hist["T"], color="#c2454c", lw=1.6)
+        ax_T.set_ylabel("temperature")
+        ax_T.set_xlabel("sweep")
+        ax_T.grid(alpha=0.25)
+
+        # Secondary: acceptance rate vs sweep on a twin axis in the T panel.
+        ax_acc = ax_T.twinx()
+        ax_acc.plot(hist["sweep"], hist["accept_rate"], color="#2a6e4e",
+                    lw=1.0, alpha=0.7, label="accept rate")
+        ax_acc.set_ylabel("accept rate", color="#2a6e4e")
+        ax_acc.tick_params(axis="y", labelcolor="#2a6e4e")
+        ax_acc.set_ylim(0.0, 1.0)
+
+        # Legend below the figure so it never overlaps the cost curves.
+        # Use the cost-panel handles only (the T-panel curves are
+        # self-explanatory from their axis labels).
+        handles, labels = ax_cost.get_legend_handles_labels()
+        fig.legend(
+            handles, labels,
+            ncol=min(7, len(handles)),
+            fontsize=9, loc="lower center",
+            bbox_to_anchor=(0.5, -0.02),
+            frameon=False,
+        )
+        fig.subplots_adjust(bottom=0.18)
+        return fig, (ax_cost, ax_T)
+
+    def plot_thermal_before_after(
+        self: "Supercell",
+        *,
+        r_max: float = 8.0,
+        title: str | None = None,
+    ):
+        """Compare g(r) before and after the most recent :meth:`thermal_relax` call.
+
+        Builds a g(r) overlay viewer with two curves: the cell state
+        cached at the start of :meth:`thermal_relax` ("before") and
+        the current state after the Monte-Carlo run completes
+        ("after").  Useful for visualising how an anneal schedule
+        sharpened or broadened the radial distribution.
+
+        Parameters
+        ----------
+        r_max : float, optional
+            Maximum radial distance (Å) plotted on the x-axis.
+            Default ``8.0`` Å.
+        title : str, optional
+            Title shown above the viewer.  Default uses the
+            supercell's ``label``.
+
+        Returns
+        -------
+        IPython.display.HTML
+            The rendered comparison viewer (auto-displays inline in
+            Jupyter when returned from a cell).
+
+        Raises
+        ------
+        ValueError
+            If :meth:`thermal_relax` has not been run yet (no cached
+            pre-thermal snapshot or history).
+        """
+        snap = getattr(self, "_thermal_start_snapshot", None)
+        if snap is None:
+            raise ValueError(
+                "No pre-thermal snapshot; call thermal_relax() first."
+            )
+        hist = getattr(self, "thermal_relax_history", None)
+        if hist is None:
+            raise ValueError("Run thermal_relax() before plotting.")
+
+        # Build a shadow Supercell-like object for the 'before' entry
+        # so plot_g2_compare can measure g(r) from it.  Re-use the
+        # current cell's shell-target + grid by copy.
+        from copy import copy
+        before_cell = copy(self)
+        before_cell.atoms = snap
+        before_cell.current_distribution = None
+        if self._thermal_start_shell_species is not None:
+            before_cell._atom_shell_species_index = (
+                self._thermal_start_shell_species.copy()
+            )
+        # Rebuild spatial index (if the helper exists).
+        if hasattr(before_cell, "_rebuild_spatial_index"):
+            before_cell._rebuild_spatial_index()
+
+        from ._plotting import plot_g2_compare as _plot_g2_compare
+        cells = {
+            "initial (static relax)": before_cell,
+            "final (thermal MC)": self,
+        }
+        return _plot_g2_compare(cells, r_max=r_max, title=title or "Thermal MC: before vs after")
