@@ -473,6 +473,12 @@ class Supercell(
         refine_orientations: bool = False,
         refine_orientations_kwargs: "dict | None" = None,
         show_progress: bool = True,
+        # ─── ML backend ──────────────────────────────────────────────
+        backend: str = "fire",
+        ml_model: "Any" = None,
+        ml_fire_cleanup_steps: int = 0,
+        ml_chunk_size: int | None = None,
+        # ────────────────────────────────────────────────────────────
         **shell_relax_kwargs: Any,
     ) -> dict[str, Any]:
         """Generate a disordered supercell from liquid to nanocrystalline.
@@ -505,6 +511,29 @@ class Supercell(
             crystalline grains as thermal broadening.  0 = no jitter.
         show_progress
             Display a text progress bar.
+        backend
+            Which relaxation kernel to use after the (optional) Voronoi
+            tile + orientation refinement.  One of:
+
+            - ``"fire"`` *(default)* — the classical spring-network FIRE
+              quench (``shell_relax``).  Bit-identical to historical
+              behaviour.
+            - ``"ml"`` — single forward pass of the per-material EGNN
+              given by ``ml_model``.  Skips ``refine_orientations`` and
+              ``shell_relax`` entirely.  Use when you want the speed.
+            - ``"ml+fire"`` — ML forward pass, then
+              ``ml_fire_cleanup_steps`` of classical FIRE as a safety net
+              (verifies bond / angle / repulsion losses, catches edge
+              cases where the ML model produced a sub-NN overlap).
+        ml_model
+            Either a path to an EGNN checkpoint (loaded via
+            :func:`tricor.ml.load_model`) or a pre-loaded model object.
+            Required when ``backend != "fire"``.
+        ml_fire_cleanup_steps
+            How many FIRE iterations to run after the ML forward pass
+            when ``backend == "ml+fire"``.  Ignored otherwise.
+            Recommended values: 5–30 depending on how strict the
+            downstream acceptance gate is.
         **shell_relax_kwargs
             Additional keyword arguments forwarded to :meth:`shell_relax`
             (e.g. ``repulsion_weight``, ``hard_core_scale``, ``step_size``).
@@ -593,7 +622,12 @@ class Supercell(
         # (undoing any thermal displacement from
         # ``displacement_sigma`` and giving refinement a clean
         # starting state that matches what trial retiles produce).
+        # Skip orientation refinement when the ML backend is doing the
+        # relaxation — the EGNN forward pass is expected to fix grain
+        # boundaries in one shot, and we benchmarked it without the
+        # SO(3) search.
         if (refine_orientations
+                and backend == "fire"
                 and getattr(self, "_grain_ids", None) is not None
                 and getattr(self, "_grain_cells", None) is not None):
             from ._resample import _retile_grain
@@ -656,17 +690,60 @@ class Supercell(
             self.refine_initial_orientations(shell_target, **r_kwargs)
 
         # --- relax ---
-        summary = self.shell_relax(
-            shell_target,
-            num_steps=num_steps,
-            bond_weight=bond_weight,
-            angle_weight=angle_weight,
-            repulsion_weight=repulsion_weight,
-            hard_core_scale=hard_core_scale,
-            nonbond_push_scale=nonbond_push_scale,
-            show_progress=show_progress,
-            **shell_relax_kwargs,
-        )
+        if backend not in ("fire", "ml", "ml+fire"):
+            raise ValueError(
+                f"backend must be one of 'fire', 'ml', 'ml+fire'; "
+                f"got {backend!r}",
+            )
+        if backend in ("ml", "ml+fire"):
+            if ml_model is None:
+                raise ValueError(
+                    f"backend={backend!r} requires ml_model "
+                    "(an EGNN instance or checkpoint path)",
+                )
+            from .ml.inference import (
+                load_model as _ml_load_model,
+                predict_and_optionally_relax,
+            )
+            if isinstance(ml_model, (str, bytes)) or hasattr(ml_model, "__fspath__"):
+                ml_model = _ml_load_model(ml_model)
+            n_fire_cleanup = (
+                int(ml_fire_cleanup_steps) if backend == "ml+fire" else 0
+            )
+            # Forward shell_relax_kwargs to the FIRE cleanup pass too
+            # so per-material hard_core / nonbond / repulsion stay
+            # consistent.
+            shell_relax_kw = dict(shell_relax_kwargs)
+            shell_relax_kw.setdefault("bond_weight", float(bond_weight))
+            shell_relax_kw.setdefault("angle_weight", float(angle_weight))
+            shell_relax_kw.setdefault("repulsion_weight", float(repulsion_weight))
+            shell_relax_kw.setdefault("hard_core_scale", float(hard_core_scale))
+            shell_relax_kw.setdefault("nonbond_push_scale", float(nonbond_push_scale))
+            predict_and_optionally_relax(
+                self, shell_target, ml_model,
+                grain_size=(float(grain_size) if grain_size is not None else 0.0),
+                fire_cleanup_steps=n_fire_cleanup,
+                chunk_size=ml_chunk_size,
+                **shell_relax_kw,
+            )
+            # Build a minimal summary dict so the rest of generate()
+            # doesn't need branching to render the regime / density.
+            summary = {
+                "backend": backend,
+                "ml_fire_cleanup_steps": n_fire_cleanup,
+            }
+        else:
+            summary = self.shell_relax(
+                shell_target,
+                num_steps=num_steps,
+                bond_weight=bond_weight,
+                angle_weight=angle_weight,
+                repulsion_weight=repulsion_weight,
+                hard_core_scale=hard_core_scale,
+                nonbond_push_scale=nonbond_push_scale,
+                show_progress=show_progress,
+                **shell_relax_kwargs,
+            )
 
         # --- summary ---
         ref_density = len(self.target_distribution.atoms) / max(
