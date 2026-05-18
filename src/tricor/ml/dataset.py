@@ -279,6 +279,103 @@ class TricorMLDataset(Dataset):
         }
 
 
+class TricorMLStepDataset(Dataset):
+    """(x_t, x_{t+stride}) pairs sampled from FIRE trajectories.
+
+    Used to train an *iterative* force-style predictor — the network
+    learns to map any trajectory frame to the one ``stride`` captured
+    frames later (i.e. it learns *one step of FIRE*, not the entire
+    relaxation in one shot).  At inference the model is iterated
+    ``K`` times to relax a Voronoi tile.
+
+    Concretely: for each cell with ``n_frames`` captured FIRE frames,
+    we emit ``n_frames - stride`` (input, target) pairs.  With the
+    default 32 captured frames and ``stride=1`` that's 31 pairs/cell,
+    covering the *entire* relaxation trajectory at every depth.
+
+    Why this beats one-shot training (``fire_pos`` as target):
+
+    - Each pair is a *small* displacement, much easier to fit than
+      the cumulative Voronoi-to-FIRE-final jump.
+    - The model is trained to be the identity near convergence (so
+      it stays stable as inference iterations proceed).
+    - Forces are equivariant; the model's output minus its input is
+      the equivariant 3-vector ``∝ −∇E``.
+
+    Parameters
+    ----------
+    h5_path
+        Same HDF5 layout as :class:`TricorMLDataset` (each cell must
+        have a ``fire_trajectory`` dataset).
+    r_cut
+        Radial cutoff for PBC graph construction (used in
+        :func:`collate_cells`).
+    stride
+        Number of *captured* frames between input and target.  ``1``
+        (default) predicts the next captured frame (~8 raw FIRE
+        steps).  ``2``/``3`` predict bigger jumps but are harder to
+        learn.
+    max_box_side, regime_filter
+        Same semantics as :class:`TricorMLDataset`.
+    """
+
+    def __init__(
+        self,
+        h5_path: str | Path,
+        r_cut: float = 5.0,
+        stride: int = 1,
+        max_box_side: float | None = None,
+        regime_filter: list[str] | None = None,
+    ) -> None:
+        self.h5_path = Path(h5_path)
+        self.r_cut = float(r_cut)
+        self.stride = int(stride)
+        self.max_box_side = max_box_side
+        self.regime_filter = regime_filter
+        # Each entry: (cell_key, t)
+        self._index: list[tuple[str, int]] = []
+        with h5py.File(self.h5_path, "r") as f:
+            for key in sorted(f.keys()):
+                if not key.startswith("cell_"):
+                    continue
+                g = f[key]
+                if "fire_trajectory" not in g:
+                    continue
+                if max_box_side is not None:
+                    box = np.asarray(g.attrs.get("box_dim", [0., 0., 0.]))
+                    if float(box.max()) > float(max_box_side) + 1e-3:
+                        continue
+                if regime_filter is not None:
+                    if str(g.attrs.get("regime", "")) not in regime_filter:
+                        continue
+                n_frames = g["fire_trajectory"].shape[0]
+                for t in range(n_frames - stride):
+                    self._index.append((key, t))
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def __getitem__(self, idx: int) -> dict:
+        key, t = self._index[idx]
+        with h5py.File(self.h5_path, "r") as f:
+            g = f[key]
+            traj = g["fire_trajectory"]
+            voronoi_pos = np.asarray(traj[t], dtype=np.float32)
+            target_pos = np.asarray(traj[t + self.stride], dtype=np.float32)
+            species_idx = np.asarray(g["species_idx"], dtype=np.int64)
+            grain_size = float(g.attrs["grain_size"])
+            box_dim = np.asarray(g.attrs["box_dim"], dtype=np.float32)
+            regime = str(g.attrs.get("regime", ""))
+        return {
+            "voronoi_pos": torch.from_numpy(voronoi_pos),
+            "target_pos": torch.from_numpy(target_pos),
+            "species_idx": torch.from_numpy(species_idx),
+            "grain_size": float(grain_size),
+            "box_dim": torch.from_numpy(box_dim),
+            "regime": regime,
+        }
+
+
 def collate_cells(batch: list[dict], r_cut: float = 5.0) -> dict:
     """Collate a list of per-cell samples into a graph-batched tensor dict.
 

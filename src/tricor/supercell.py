@@ -478,6 +478,22 @@ class Supercell(
         ml_model: "Any" = None,
         ml_fire_cleanup_steps: int = 0,
         ml_chunk_size: int | None = None,
+        # When >0, run the EGNN as an *iterative* next-step predictor
+        # (model trained on TricorMLStepDataset).  Each forward pass
+        # applies ~one FIRE step's worth of relaxation; the loop runs
+        # ``ml_iterative_steps`` times.  Replaces the one-shot
+        # ``predict_positions`` path inside the ML backend.
+        ml_iterative_steps: int = 0,
+        ml_iterative_momentum: float = 0.0,
+        ml_iterative_step_clip: float | None = None,
+        # Repulsion-projection sweeps applied AFTER each EGNN iteration
+        # to push any sub-hard-core pairs apart, keeping the
+        # configuration physical between steps so the model stays in
+        # its training distribution.  ``0`` (default) disables.
+        ml_repulsion_iters_per_step: int = 0,
+        # One-shot repulsion cleanup after the full iter loop — drives
+        # any residual sub-NN bond count to zero.  10–20 is typical.
+        ml_final_repulsion_iters: int = 0,
         # ────────────────────────────────────────────────────────────
         **shell_relax_kwargs: Any,
     ) -> dict[str, Any]:
@@ -724,6 +740,11 @@ class Supercell(
                 grain_size=(float(grain_size) if grain_size is not None else 0.0),
                 fire_cleanup_steps=n_fire_cleanup,
                 chunk_size=ml_chunk_size,
+                iterative_steps=int(ml_iterative_steps),
+                iterative_momentum=float(ml_iterative_momentum),
+                iterative_step_clip=ml_iterative_step_clip,
+                iterative_repulsion_per_step=int(ml_repulsion_iters_per_step),
+                final_repulsion_iters=int(ml_final_repulsion_iters),
                 **shell_relax_kw,
             )
             # Build a minimal summary dict so the rest of generate()
@@ -731,6 +752,7 @@ class Supercell(
             summary = {
                 "backend": backend,
                 "ml_fire_cleanup_steps": n_fire_cleanup,
+                "ml_iterative_steps": int(ml_iterative_steps),
             }
         else:
             summary = self.shell_relax(

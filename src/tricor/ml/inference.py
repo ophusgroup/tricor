@@ -38,6 +38,86 @@ from .egnn import EGNN
 from .dataset import build_pbc_graph_chunked
 
 
+def _enforce_hard_core(
+    positions: np.ndarray,
+    box: np.ndarray,
+    species_idx: np.ndarray,
+    pair_hard_min: np.ndarray,
+    n_iter: int = 2,
+    push_fraction: float = 0.5,
+) -> np.ndarray:
+    """Push apart any pair below its species-pair hard-core distance.
+
+    Iteratively: find offenders via :class:`scipy.spatial.cKDTree`,
+    move each pair apart along their bond vector by
+    ``push_fraction × deficit``.  Converges in 2–5 iterations for
+    realistic cells.
+
+    Vectorised at the pair level (no per-atom Python loop) and
+    O(N log N) per iteration thanks to the KDTree.  At 200³ Å × 600 k
+    atoms: ~3 s per iteration on CPU.
+
+    Used as a **projection step** between EGNN iterations: keeps the
+    configuration feasible (no atom overlaps) so the model never sees
+    out-of-distribution clustered states.  See
+    :func:`predict_iteratively`.
+
+    Parameters
+    ----------
+    positions
+        (N, 3) atom positions in Å.  Modified in place.
+    box
+        (3,) orthorhombic box side lengths.
+    species_idx
+        (N,) per-atom species index into ``pair_hard_min``.
+    pair_hard_min
+        (S, S) per-species-pair hard-core distance (Å).  Typically
+        ``shell_target.pair_hard_min``.
+    n_iter
+        Maximum number of cleanup iterations.  Early-terminates if
+        no offenders remain.
+    push_fraction
+        Per-iteration push amount as a fraction of the deficit.
+        ``0.5`` is the natural choice (atoms meet in the middle);
+        larger values can overshoot.
+
+    Returns
+    -------
+    np.ndarray
+        ``positions``, modified in place.
+    """
+    from scipy.spatial import cKDTree
+
+    pair_hc = np.asarray(pair_hard_min, dtype=np.float64)
+    box_np = np.asarray(box, dtype=np.float64)
+    species_np = np.asarray(species_idx)
+    pos = positions  # (mutated in place)
+    max_cutoff = float(pair_hc.max()) * 1.05
+    if max_cutoff <= 0.0:
+        return pos
+    for _ in range(int(n_iter)):
+        wrapped = pos - np.floor(pos / box_np) * box_np
+        tree = cKDTree(wrapped, boxsize=box_np)
+        pairs = tree.query_pairs(max_cutoff, output_type="ndarray")
+        if len(pairs) == 0:
+            break
+        si = species_np[pairs[:, 0]]
+        sj = species_np[pairs[:, 1]]
+        target = pair_hc[si, sj]
+        delta = wrapped[pairs[:, 1]] - wrapped[pairs[:, 0]]
+        delta -= np.round(delta / box_np) * box_np
+        dist = np.linalg.norm(delta, axis=1).clip(min=1e-9)
+        mask = dist < target
+        if not mask.any():
+            break
+        unit = delta[mask] / dist[mask, None]
+        push_amt = (target[mask] - dist[mask]) * float(push_fraction)
+        push = unit * push_amt[:, None]
+        np.add.at(pos, pairs[mask, 0], -push)
+        np.add.at(pos, pairs[mask, 1], push)
+    return pos
+
+
 def load_model(checkpoint_path: str | Path,
                device: str | torch.device = "auto") -> EGNN:
     """Load an EGNN checkpoint and return it ready for inference.
@@ -147,6 +227,119 @@ def predict_positions(
     return pred.detach().cpu().numpy()
 
 
+@torch.no_grad()
+def predict_iteratively(
+    model: EGNN,
+    voronoi_positions: np.ndarray,
+    species_idx: np.ndarray,
+    box_dim: "tuple[float, float, float] | np.ndarray",
+    grain_size: float,
+    n_steps: int = 15,
+    r_cut: float | None = None,
+    momentum: float = 0.0,
+    step_clip: float | None = None,
+    repulsion_iters_per_step: int = 0,
+    final_repulsion_iters: int = 0,
+    pair_hard_min: np.ndarray | None = None,
+) -> np.ndarray:
+    """Iteratively relax positions by chaining ``n_steps`` EGNN forward
+    passes — the network is trained as a *next-step* predictor
+    (:class:`tricor.ml.dataset.TricorMLStepDataset`), so each call
+    applies ~one FIRE-step's worth of relaxation.
+
+    Parameters
+    ----------
+    model
+        :class:`EGNN` trained on (x_t, x_{t+stride}) trajectory pairs.
+    voronoi_positions
+        Initial atom positions (post-Voronoi tile).
+    species_idx, box_dim, grain_size, r_cut
+        Same as :func:`predict_positions`.
+    n_steps
+        Number of EGNN iterations.  15–25 is typical for full
+        relaxation; the same number works across all regimes because
+        each call moves atoms by a bounded amount.
+    momentum
+        Heavy-ball momentum coefficient applied to per-step
+        displacement (``Δ_t = output − input``).  ``0.0`` (default)
+        is pure gradient descent: ``x_{t+1} = output``.  Larger
+        values (e.g. ``0.9``) damp short-period oscillations near
+        convergence.
+    step_clip
+        Optional per-atom displacement cap (Å) applied each
+        iteration — a safety net for the first few steps when atoms
+        can be far from any training distribution.
+
+    Returns
+    -------
+    np.ndarray of shape (N, 3)
+        Final relaxed positions, wrapped into ``[0, box)``.
+    """
+    device = getattr(model, "device", torch.device("cpu"))
+    r_cut = float(r_cut if r_cut is not None else getattr(model, "r_cut", 5.0))
+
+    pos = torch.as_tensor(voronoi_positions, dtype=torch.float32, device=device)
+    species = torch.as_tensor(species_idx, dtype=torch.long, device=device)
+    cond = torch.tensor([[float(grain_size)]], dtype=torch.float32, device=device)
+    box_t = torch.tensor(box_dim, dtype=pos.dtype, device=device)
+
+    # Pre-compute pair_hard_min numpy view if we're going to repulsion-clean.
+    box_np = np.asarray(box_dim, dtype=np.float64)
+    species_np = np.asarray(species_idx)
+    do_rep_per_step = int(repulsion_iters_per_step) > 0 and pair_hard_min is not None
+    do_rep_final   = int(final_repulsion_iters)   > 0 and pair_hard_min is not None
+
+    velocity = torch.zeros_like(pos)
+    for step in range(int(n_steps)):
+        edge_index, edge_vec = build_pbc_graph_chunked(pos, list(box_dim), r_cut)
+        edge_index = edge_index.to(device)
+        edge_vec = edge_vec.to(device)
+        pred_pos = model(
+            positions=pos,
+            species_idx=species,
+            edge_index=edge_index,
+            edge_vec=edge_vec,
+            cond=cond,
+            batch=None,
+        )
+        # Min-image displacement so PBC wrap doesn't blow up the step.
+        delta = pred_pos - pos
+        delta = delta - torch.round(delta / box_t) * box_t
+        if step_clip is not None:
+            dmag = torch.linalg.norm(delta, dim=-1, keepdim=True).clamp(min=1e-9)
+            scale = torch.clamp(step_clip / dmag, max=1.0)
+            delta = delta * scale
+        if momentum > 0.0:
+            velocity = momentum * velocity + delta
+            pos = pos + velocity
+        else:
+            pos = pos + delta
+        # Wrap into box
+        pos = pos - torch.floor(pos / box_t) * box_t
+
+        # Projection step: push any sub-hard-core pairs apart so the
+        # next iteration's input stays in the model's training
+        # distribution.  This is what stops iter-K collapse at scale.
+        if do_rep_per_step:
+            pos_np = pos.detach().cpu().numpy().astype(np.float64)
+            pos_np = _enforce_hard_core(
+                pos_np, box_np, species_np, pair_hard_min,
+                n_iter=int(repulsion_iters_per_step),
+            )
+            pos = torch.from_numpy(pos_np.astype(np.float32)).to(device)
+
+    # Final cleanup pass with more iterations — drives sub-NN bond
+    # count to zero if the per-step pass left residuals.
+    if do_rep_final:
+        pos_np = pos.detach().cpu().numpy().astype(np.float64)
+        pos_np = _enforce_hard_core(
+            pos_np, box_np, species_np, pair_hard_min,
+            n_iter=int(final_repulsion_iters),
+        )
+        pos = torch.from_numpy(pos_np.astype(np.float32)).to(device)
+    return pos.detach().cpu().numpy()
+
+
 def predict_and_optionally_relax(
     cell,
     shell_target,
@@ -154,6 +347,11 @@ def predict_and_optionally_relax(
     grain_size: float,
     fire_cleanup_steps: int = 0,
     chunk_size: int | None = None,
+    iterative_steps: int = 0,
+    iterative_momentum: float = 0.0,
+    iterative_step_clip: float | None = None,
+    iterative_repulsion_per_step: int = 0,
+    final_repulsion_iters: int = 0,
     **shell_relax_kwargs,
 ) -> None:
     """Mutate ``cell.atoms.positions`` in place with the ML prediction,
@@ -191,14 +389,32 @@ def predict_and_optionally_relax(
         target = int(250_000_000 / max(n_atoms * 3, 1))
         chunk_size = int(max(64, min(4096, target)))
 
-    new_pos = predict_positions(
-        model,
-        voronoi_positions=np.asarray(cell.atoms.positions, dtype=np.float32),
-        species_idx=np.asarray(species_idx, dtype=np.int64),
-        box_dim=box_dim,
-        grain_size=float(grain_size),
-        chunk_size=chunk_size,
-    )
+    if iterative_steps > 0:
+        # Pull pair_hard_min from the shell target so the repulsion
+        # projection step can enforce per-species hard-core distances.
+        pair_hard_min = np.asarray(shell_target.pair_hard_min, dtype=np.float64)
+        new_pos = predict_iteratively(
+            model,
+            voronoi_positions=np.asarray(cell.atoms.positions, dtype=np.float32),
+            species_idx=np.asarray(species_idx, dtype=np.int64),
+            box_dim=box_dim,
+            grain_size=float(grain_size),
+            n_steps=int(iterative_steps),
+            momentum=float(iterative_momentum),
+            step_clip=iterative_step_clip,
+            repulsion_iters_per_step=int(iterative_repulsion_per_step),
+            final_repulsion_iters=int(final_repulsion_iters),
+            pair_hard_min=pair_hard_min,
+        )
+    else:
+        new_pos = predict_positions(
+            model,
+            voronoi_positions=np.asarray(cell.atoms.positions, dtype=np.float32),
+            species_idx=np.asarray(species_idx, dtype=np.int64),
+            box_dim=box_dim,
+            grain_size=float(grain_size),
+            chunk_size=chunk_size,
+        )
     cell.atoms.positions = new_pos.astype(np.float64)
 
     if fire_cleanup_steps > 0:
@@ -212,6 +428,7 @@ def predict_and_optionally_relax(
 
 __all__ = [
     "load_model",
+    "predict_iteratively",
     "predict_positions",
     "predict_and_optionally_relax",
 ]
