@@ -619,19 +619,25 @@ class Supercell(
             # non-physical spike at exactly the cutoff radius (that's
             # exactly the artefact the user saw in the Cu liquid
             # panel).
-            from ._grain import _push_close_pairs_apart
-            hard_min = float(np.min(
-                np.asarray(shell_target.pair_hard_min, dtype=np.float64)
-            ))
-            push_cutoff = 0.35 * hard_min
-            self.atoms.positions = _push_close_pairs_apart(
-                self.atoms.positions,
-                self.atoms.numbers,
-                self.atoms.cell.array,
-                pbc=self.atoms.pbc,
-                push_cutoff=push_cutoff,
-                max_iter=40,
-            )
+            #
+            # Skip when num_steps=0 (caller opted out of FIRE) — in
+            # that case the caller is handling relaxation themselves
+            # (typically via :meth:`bond_relax`) which does its own
+            # overlap separation.  At 200³ Å this saves ~2 min.
+            if int(num_steps) > 0:
+                from ._grain import _push_close_pairs_apart
+                hard_min = float(np.min(
+                    np.asarray(shell_target.pair_hard_min, dtype=np.float64)
+                ))
+                push_cutoff = 0.35 * hard_min
+                self.atoms.positions = _push_close_pairs_apart(
+                    self.atoms.positions,
+                    self.atoms.numbers,
+                    self.atoms.cell.array,
+                    pbc=self.atoms.pbc,
+                    push_cutoff=push_cutoff,
+                    max_iter=40,
+                )
             self._rebuild_spatial_index()
             if atom_species_index is not None:
                 asp = np.asarray(atom_species_index, dtype=np.intp)
@@ -769,7 +775,7 @@ class Supercell(
                 "ml_fire_cleanup_steps": n_fire_cleanup,
                 "ml_iterative_steps": int(ml_iterative_steps),
             }
-        else:
+        elif int(num_steps) > 0:
             summary = self.shell_relax(
                 shell_target,
                 num_steps=num_steps,
@@ -781,6 +787,17 @@ class Supercell(
                 show_progress=show_progress,
                 **shell_relax_kwargs,
             )
+        else:
+            # num_steps == 0: caller has opted out of FIRE.  Skip
+            # shell_relax entirely — it would otherwise spend ~90 s
+            # at 200³ Å rebuilding the bond topology (ASE
+            # neighbor_list + argsort) before running zero relaxation
+            # steps.  Caller is presumably running their own
+            # relaxation afterwards (e.g. cell.bond_relax()).
+            summary = {
+                "backend": backend,
+                "num_steps": 0,
+            }
 
         # --- summary ---
         ref_density = len(self.target_distribution.atoms) / max(
