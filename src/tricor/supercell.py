@@ -494,6 +494,19 @@ class Supercell(
         # One-shot repulsion cleanup after the full iter loop — drives
         # any residual sub-NN bond count to zero.  10–20 is typical.
         ml_final_repulsion_iters: int = 0,
+        # Repulsion sweeps AFTER the FIRE cleanup step.  Needed because
+        # FIRE's bond + angle forces can re-introduce sub-hard-core
+        # pairs in tight regions (grain boundaries) that FIRE's own
+        # short-range repulsion doesn't resolve in a few steps.
+        ml_post_fire_repulsion_iters: int = 0,
+        # Combined attract-to-bond-peak + repel-from-hard-core sweep
+        # applied AFTER iter/FIRE.  Pulls bonded pairs (e.g. Si–O at
+        # 1.61 Å in SiO₂) to the actual NN peak while keeping
+        # non-bonded pairs at safe distances.  20 iterations typical.
+        # Replaces FIRE cleanup as the bond-shaping step in the ML
+        # pipeline — much faster (cKDTree-based, ~1.5 s/iter at 200³)
+        # and overlap-aware by construction.
+        ml_bond_relax_iters: int = 0,
         # ────────────────────────────────────────────────────────────
         **shell_relax_kwargs: Any,
     ) -> dict[str, Any]:
@@ -745,6 +758,8 @@ class Supercell(
                 iterative_step_clip=ml_iterative_step_clip,
                 iterative_repulsion_per_step=int(ml_repulsion_iters_per_step),
                 final_repulsion_iters=int(ml_final_repulsion_iters),
+                post_fire_repulsion_iters=int(ml_post_fire_repulsion_iters),
+                bond_relax_iters=int(ml_bond_relax_iters),
                 **shell_relax_kw,
             )
             # Build a minimal summary dict so the rest of generate()
@@ -786,6 +801,74 @@ class Supercell(
         summary["actual_density"] = float(f"{actual_relative:.4f}")
 
         return summary
+
+    def bond_relax(
+        self,
+        shell_target,
+        n_iter: int = 40,
+        attract_frac: float = 0.2,
+        repel_frac: float = 1.0,
+        max_step: float = 0.2,
+    ) -> None:
+        """Combined attract-to-bond-peak + repel-from-hard-core sweep.
+
+        A fast O(N log N) alternative to a full FIRE relaxation for
+        cleaning up Voronoi-tiled or ML-predicted positions.  Each
+        iteration:
+
+        - Pulls bonded species pairs (those with non-zero
+          ``shell_target.coordination_target``) toward
+          ``shell_target.pair_peak``.
+        - Pushes any pair below ``shell_target.pair_hard_min`` apart.
+
+        Mutates ``self.atoms.positions`` in place.  Uses
+        :class:`scipy.spatial.cKDTree` so cost scales linearly with N
+        at constant density — at 200³ Å × 600 k atoms, ~1 s/iter on
+        CPU.  Drives Si-O to its 1.61 Å peak and non-bonded pairs
+        (Si-Si, O-O) onto their hard-core walls in 40-80 iterations.
+
+        Parameters
+        ----------
+        shell_target
+            The :class:`CoordinationShellTarget` whose
+            ``pair_peak`` / ``pair_hard_min`` / ``pair_outer`` /
+            ``coordination_target`` matrices drive the forces.
+        n_iter
+            Number of sweeps.  40 typically reaches the bond peak to
+            within 0.01 Å.
+        attract_frac
+            Per-sweep gap-closing fraction toward the bond peak.
+        repel_frac
+            Per-sweep gap-closing fraction away from the hard-core
+            wall.  ``1.0`` (default) closes the gap in one shot,
+            with ``max_step`` providing the safety against overshoot
+            in dense regions.
+        max_step
+            Per-atom displacement cap (Å) per sweep.
+        """
+        from .ml.inference import _bond_relax_sweep
+
+        species_idx = (
+            getattr(self, "_atom_shell_species_index", None)
+            if getattr(self, "_atom_shell_species_index", None) is not None
+            else self._atom_species_index
+        )
+        box = np.diag(np.asarray(self.atoms.cell.array, dtype=np.float64))
+        pos = np.asarray(self.atoms.positions, dtype=np.float64)
+        pos = _bond_relax_sweep(
+            pos, box, np.asarray(species_idx),
+            pair_peak=np.asarray(shell_target.pair_peak, dtype=np.float64),
+            pair_hard_min=np.asarray(shell_target.pair_hard_min, dtype=np.float64),
+            pair_outer=np.asarray(shell_target.pair_outer, dtype=np.float64),
+            coordination_target=np.asarray(
+                shell_target.coordination_target, dtype=np.float64),
+            n_iter=int(n_iter),
+            attract_frac=float(attract_frac),
+            repel_frac=float(repel_frac),
+            max_step=float(max_step),
+        )
+        self.atoms.positions = pos
+        self._rebuild_spatial_index()
 
     def __repr__(self) -> str:
         atom_count = len(self.atoms)
