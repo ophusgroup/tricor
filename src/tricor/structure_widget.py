@@ -333,6 +333,17 @@ class StructureWidget(anywidget.AnyWidget):
                     bvis[k] = False
             self.bond_visible = bvis.tolist()
 
+        # Polyhedra: filter by center-atom visibility and re-emit.
+        # If detection has run before, the cached polys list lets us
+        # avoid re-running the detector on every slab tweak.
+        cache = getattr(self, "_poly_cache", None)
+        if cache is not None and self.show_polyhedra and cache["polys"]:
+            filt = [p for p in cache["polys"] if vis[int(p["center"])]]
+            data = self._render_polyhedra(filt)
+            with self.hold_trait_notifications():
+                for k, v in data.items():
+                    self.set_trait(k, v)
+
     def _on_bond_cutoff_change(self, change: dict) -> None:
         """Recompute bonds when cutoff changes."""
         bond_data = self._compute_bonds(self.bond_cutoff)
@@ -461,7 +472,12 @@ class StructureWidget(anywidget.AnyWidget):
 
     def _compute_polyhedra(self) -> dict[str, Any]:
         """Run the appropriate polyhedron detector and return traitlets
-        update dict with vertex positions, face/edge topology, count."""
+        update dict with vertex positions, face/edge topology, count.
+
+        Side effect: stores the detected polys + their geometry/topology
+        in ``self._poly_cache`` so :meth:`_on_slab_change` can re-emit a
+        slab-filtered subset cheaply without re-running detection.
+        """
         from ._plotting import (
             _detect_tetrahedra, _detect_octahedra, _detect_cuboctahedra,
             _polyhedra_vertex_coords,
@@ -493,21 +509,38 @@ class StructureWidget(anywidget.AnyWidget):
             n_vertices = 4
 
         polys = detector(self._atoms, **args)
+        # Cache for slab re-filtering
+        self._poly_cache = dict(
+            polys=polys,
+            n_vertices=n_vertices,
+            per_poly=per_poly,
+            faces=[list(f) for f in faces],
+            edges=[list(e) for e in edges],
+        )
+        return self._render_polyhedra(polys)
+
+    def _render_polyhedra(self, polys: list[dict]) -> dict[str, Any]:
+        """Convert a list of detected polys into a traitlets update
+        dict.  Used both at first build and on slab-filter re-emit."""
+        from ._plotting import _polyhedra_vertex_coords
+
+        cache = getattr(self, "_poly_cache", None)
+        if cache is None:
+            return dict(num_polyhedra=0, polyhedra_vertex_positions=[])
         verts = _polyhedra_vertex_coords(
             polys, self._atoms.positions, self._atoms.cell.array,
             scale=float(self.polyhedra_scale),
         )
         verts = [round(v, 3) for v in verts]
-
         out: dict[str, Any] = dict(
             polyhedra_vertex_positions=verts,
             num_polyhedra=len(polys),
-            polyhedra_n_vertices=n_vertices,
-            polyhedra_per_poly_topology=per_poly,
-            polyhedra_faces=[list(f) for f in faces],
-            polyhedra_edges=[list(e) for e in edges],
+            polyhedra_n_vertices=cache["n_vertices"],
+            polyhedra_per_poly_topology=cache["per_poly"],
+            polyhedra_faces=cache["faces"],
+            polyhedra_edges=cache["edges"],
         )
-        if per_poly:
+        if cache["per_poly"]:
             out["polyhedra_faces_per_poly"] = [
                 [list(f) for f in p["faces"]] for p in polys
             ]
@@ -528,6 +561,18 @@ class StructureWidget(anywidget.AnyWidget):
             self.set_trait("num_polyhedra", 0)
             return
         data = self._compute_polyhedra()
+        # Apply current slab filter before emitting (cheap — operates
+        # on cached polys list).
+        cache = getattr(self, "_poly_cache", None)
+        if cache is not None and cache["polys"]:
+            frac = self._atoms.get_scaled_positions()
+            vis = (
+                (frac[:, 0] >= self.slab_x_min) & (frac[:, 0] <= self.slab_x_max)
+                & (frac[:, 1] >= self.slab_y_min) & (frac[:, 1] <= self.slab_y_max)
+                & (frac[:, 2] >= self.slab_z_min) & (frac[:, 2] <= self.slab_z_max)
+            )
+            filt = [p for p in cache["polys"] if vis[int(p["center"])]]
+            data = self._render_polyhedra(filt)
         # Use hold_trait_notifications to batch updates.
         with self.hold_trait_notifications():
             for k, v in data.items():

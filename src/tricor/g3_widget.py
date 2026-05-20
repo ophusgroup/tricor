@@ -77,6 +77,42 @@ class G3PlotWidget(anywidget.AnyWidget):
         )
         self._suspend_callbacks = False
 
+    def update_distribution(self, distribution: "G3Distribution") -> None:
+        """Re-point the widget at a different distribution.
+
+        The new distribution must share ``r``, ``phi_deg``,
+        ``phi_num_bins`` and ``pair_labels`` with the original one -
+        i.e. both were measured against the same shell target.  Use
+        this from a dropdown / button callback to switch which
+        per-cell g3 is displayed without unmounting and re-mounting
+        the widget (anywidgets dislike that, and the
+        unmount/remount cycle is what made the in-VBox visibility
+        toggle silently render blank panels).
+
+        Parameters
+        ----------
+        distribution
+            The new :class:`G3Distribution` to display.  Must already
+            have ``measure_g3`` called.
+        """
+        if distribution.g3 is None:
+            raise ValueError(
+                "Measure g3 on the distribution before swapping it in."
+            )
+        if distribution.g3.ndim != 4:
+            raise ValueError(
+                "The interactive widget expects g3 with shape "
+                "(triplet, r, r, phi)."
+            )
+        self._suspend_callbacks = True
+        self._distribution = distribution
+        # The radial / angular grids and triplet labels are shared
+        # across all cells measured under the same shell target, so
+        # we don't push them again.  Only the per-cell payload
+        # (slice image + pair profile) needs to refresh.
+        self._update_payload()
+        self._suspend_callbacks = False
+
     def _on_triplet_index(self, _change: traitlets.Bunch) -> None:
         if self._suspend_callbacks:
             return

@@ -750,6 +750,8 @@ def export_g2_compare_html(
     background_color: str = "#f7f8f5",
     title: str = "",
     show_progress: bool = False,
+    sample_fraction: float = 1.0,
+    sample_rng_seed: int | None = None,
 ) -> str:
     """Export a g(r) overlay viewer comparing multiple supercells.
 
@@ -855,6 +857,8 @@ def export_g2_compare_html(
         dist.measure_g3(
             r_max=r_max, r_step=r_step, phi_num_bins=12,
             show_progress=show_progress,
+            sample_fraction=sample_fraction,
+            sample_rng_seed=sample_rng_seed,
         )
         if dist.g2 is None:
             raise ValueError(f"Distribution measurement for '{lab}' has no g2.")
@@ -933,6 +937,8 @@ def plot_g2_compare(
     title: str = "",
     height: int = 480,
     show_progress: bool = False,
+    sample_fraction: float = 1.0,
+    sample_rng_seed: int | None = None,
 ):
     """Inline Jupyter display of the g(r) overlay-compare viewer.
 
@@ -972,6 +978,8 @@ def plot_g2_compare(
         cells_and_labels, None,
         r_max=r_max, r_step=r_step,
         title=title, show_progress=show_progress,
+        sample_fraction=sample_fraction,
+        sample_rng_seed=sample_rng_seed,
     )
     import html as _html
     escaped = _html.escape(html, quote=True)
