@@ -887,6 +887,66 @@ class Supercell(
         self.atoms.positions = pos
         self._rebuild_spatial_index()
 
+    def enforce_hard_core(
+        self,
+        shell_target,
+        n_iter: int = 40,
+        push_fraction: float = 0.5,
+    ) -> None:
+        """Geometric projection step that clears hard-core overlaps.
+
+        Iteratively finds pairs below
+        ``shell_target.pair_hard_min`` (via :class:`scipy.spatial.cKDTree`)
+        and pushes each violating pair apart along their bond vector
+        by ``push_fraction × deficit``.  Pure geometry - no force
+        springs - so it cannot pull a pair through its wall the way
+        the FIRE finisher's bond springs can.  Use this as a final
+        cleanup whenever you suspect FIRE's bond-spring forces have
+        compressed pairs below their hard-core distance in dense
+        regions (a real failure mode at 100+ Å cells).
+
+        Mutates ``self.atoms.positions`` in place.  Cost: ~1 s per
+        sweep at 200³ Å × 600 k atoms; converges in roughly
+        ``O(log(initial_deficit / push_fraction))`` sweeps for
+        moderate overlaps, more for severe ones from a fresh Voronoi
+        tile.  Defaults are tuned to clear NB 01 / NB 02-scale
+        overlaps in a single call.
+
+        Parameters
+        ----------
+        shell_target
+            The :class:`CoordinationShellTarget` whose
+            ``pair_hard_min`` matrix sets the wall distances.
+        n_iter
+            Number of projection sweeps.  Early-terminates if no
+            violations remain.
+        push_fraction
+            Per-iter fraction of the deficit to close.  ``0.5``
+            (default) is the natural choice - both atoms move
+            symmetrically and meet in the middle.  Larger values
+            risk overshoot; smaller values just need more sweeps.
+        """
+        from .ml.inference import _enforce_hard_core
+
+        species_idx = (
+            getattr(self, "_atom_shell_species_index", None)
+            if getattr(self, "_atom_shell_species_index", None) is not None
+            else self._atom_species_index
+        )
+        box = np.diag(np.asarray(self.atoms.cell.array, dtype=np.float64))
+        pos = np.asarray(self.atoms.positions, dtype=np.float64)
+        pos = _enforce_hard_core(
+            pos,
+            box,
+            np.asarray(species_idx),
+            pair_hard_min=np.asarray(
+                shell_target.pair_hard_min, dtype=np.float64),
+            n_iter=int(n_iter),
+            push_fraction=float(push_fraction),
+        )
+        self.atoms.positions = pos
+        self._rebuild_spatial_index()
+
     def __repr__(self) -> str:
         atom_count = len(self.atoms)
         return (

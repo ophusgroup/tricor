@@ -480,40 +480,54 @@ class _ShellRelaxMixin:
             bond_j = np.array(_bond_j_list, dtype=np.intp)
             bond_r_target = np.array(_bond_rt_list, dtype=np.float64)
 
-            # Build triplet arrays from bonded neighbors
-            _tc: list[int] = []
-            _ta: list[int] = []
-            _tb: list[int] = []
-            _tp: list[float] = []
-            for atom in range(num_atoms):
-                bn = bonded_neighbors[atom]
-                if len(bn) < 2:
-                    continue
-                s_center = species_idx[atom]
-                for ia in range(len(bn)):
-                    for ib in range(ia + 1, len(bn)):
-                        s_a = species_idx[bn[ia]]
-                        s_b = species_idx[bn[ib]]
-                        # Ensure canonical order for angle lookup
-                        if s_a <= s_b:
-                            triplet_idx = int(angle_lookup[s_center, s_a, s_b])
-                        else:
-                            triplet_idx = int(angle_lookup[s_center, s_b, s_a])
-                        # Skip triplets whose angle spring is masked
-                        # off (multi-modal shells; see
-                        # ``CoordinationShellTarget.with_angle_triplets``).
-                        if not angle_enabled_mask[triplet_idx]:
-                            continue
-                        phi_t = float(angle_mode_rad[triplet_idx])
-                        _tc.append(atom)
-                        _ta.append(int(bn[ia]))
-                        _tb.append(int(bn[ib]))
-                        _tp.append(phi_t)
+            # Build triplet arrays from bonded neighbors.  Skip the
+            # whole O(N × k²) Python loop when angle_weight == 0 - the
+            # angle-force block below short-circuits on
+            # ``tri_center.size > 0`` so the triplets would just be
+            # built and thrown away.  At 200³ Å × 608 k atoms this loop
+            # is the dominant cost of a topology rebuild (~10-15 s
+            # each), and rebuilds run every 10 FIRE steps - so for
+            # liquid (angle_weight=0, num_steps=120) this saves
+            # roughly 100-150 s per regime.
+            if float(angle_weight) == 0.0:
+                tri_center = np.empty(0, dtype=np.intp)
+                tri_a = np.empty(0, dtype=np.intp)
+                tri_b = np.empty(0, dtype=np.intp)
+                tri_phi_target = np.empty(0, dtype=np.float64)
+            else:
+                _tc: list[int] = []
+                _ta: list[int] = []
+                _tb: list[int] = []
+                _tp: list[float] = []
+                for atom in range(num_atoms):
+                    bn = bonded_neighbors[atom]
+                    if len(bn) < 2:
+                        continue
+                    s_center = species_idx[atom]
+                    for ia in range(len(bn)):
+                        for ib in range(ia + 1, len(bn)):
+                            s_a = species_idx[bn[ia]]
+                            s_b = species_idx[bn[ib]]
+                            # Ensure canonical order for angle lookup
+                            if s_a <= s_b:
+                                triplet_idx = int(angle_lookup[s_center, s_a, s_b])
+                            else:
+                                triplet_idx = int(angle_lookup[s_center, s_b, s_a])
+                            # Skip triplets whose angle spring is masked
+                            # off (multi-modal shells; see
+                            # ``CoordinationShellTarget.with_angle_triplets``).
+                            if not angle_enabled_mask[triplet_idx]:
+                                continue
+                            phi_t = float(angle_mode_rad[triplet_idx])
+                            _tc.append(atom)
+                            _ta.append(int(bn[ia]))
+                            _tb.append(int(bn[ib]))
+                            _tp.append(phi_t)
 
-            tri_center = np.array(_tc, dtype=np.intp)
-            tri_a = np.array(_ta, dtype=np.intp)
-            tri_b = np.array(_tb, dtype=np.intp)
-            tri_phi_target = np.array(_tp, dtype=np.float64)
+                tri_center = np.array(_tc, dtype=np.intp)
+                tri_a = np.array(_ta, dtype=np.intp)
+                tri_b = np.array(_tb, dtype=np.intp)
+                tri_phi_target = np.array(_tp, dtype=np.float64)
 
         # --- history arrays ---
         loss_history = np.zeros(num_steps + 1, dtype=np.float64)

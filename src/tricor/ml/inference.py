@@ -205,6 +205,12 @@ def _enforce_hard_core(
     max_cutoff = float(pair_hc.max()) * 1.05
     if max_cutoff <= 0.0:
         return pos
+    # Tolerance on the violation check: pairs sitting at the wall can
+    # drift below by FP-ULP noise after the cKDTree round-trip and
+    # `np.add.at` accumulation.  Without slack the loop keeps chasing
+    # imaginary violations indefinitely; with slack the early-termination
+    # kicks in once real overlaps are cleared.
+    _hc_eps = 1e-9
     for _ in range(int(n_iter)):
         wrapped = pos - np.floor(pos / box_np) * box_np
         tree = cKDTree(wrapped, boxsize=box_np)
@@ -217,7 +223,7 @@ def _enforce_hard_core(
         delta = wrapped[pairs[:, 1]] - wrapped[pairs[:, 0]]
         delta -= np.round(delta / box_np) * box_np
         dist = np.linalg.norm(delta, axis=1).clip(min=1e-9)
-        mask = dist < target
+        mask = dist < target - _hc_eps
         if not mask.any():
             break
         unit = delta[mask] / dist[mask, None]
