@@ -363,11 +363,21 @@ class _ShellRelaxMixin:
         tri_b = np.empty(0, dtype=np.intp)
         tri_phi_target = np.empty(0, dtype=np.float64)
         bonded_set: set[tuple[int, int]] = set()
+        # Sorted int64 array of packed (i, j) bond keys (both directions),
+        # used by the per-FIRE-step repulsion-force loop to do an
+        # ``np.isin`` membership test on millions of candidate pairs.
+        # Previously this loop built a fresh Python ``set`` from
+        # ``bonded_set`` every step and iterated over each pair in pure
+        # Python — at 200³ × 608 k atoms that pure-Python loop was the
+        # single slowest part of FIRE (~25% of liquid runtime).  Keeping
+        # the sorted array up-to-date in rebuild_topology() (which runs
+        # 10-50× less often than per-step) is far cheaper.
+        bonded_keys_arr: np.ndarray = np.empty(0, dtype=np.int64)
 
         def rebuild_topology() -> None:
             nonlocal bond_i, bond_j, bond_r_target
             nonlocal tri_center, tri_a, tri_b, tri_phi_target
-            nonlocal bonded_set
+            nonlocal bonded_set, bonded_keys_arr
 
             nl_i, nl_j, nl_d = neighbor_list("ijd", self.atoms, cutoff)
 
@@ -568,6 +578,21 @@ class _ShellRelaxMixin:
                 tri_b = np.array(_tb, dtype=np.intp)
                 tri_phi_target = np.array(_tp, dtype=np.float64)
 
+            # Build the sorted packed-key array for fast per-step
+            # bonded-pair lookup.  ``bonded_set`` already contains both
+            # directions of every bond ((i,j) and (j,i)).
+            if bonded_set:
+                _keys = np.fromiter(
+                    (np.int64(a) * np.int64(num_atoms) + np.int64(b)
+                     for a, b in bonded_set),
+                    dtype=np.int64,
+                    count=len(bonded_set),
+                )
+                _keys.sort()
+                bonded_keys_arr = _keys
+            else:
+                bonded_keys_arr = np.empty(0, dtype=np.int64)
+
         # --- history arrays ---
         loss_history = np.zeros(num_steps + 1, dtype=np.float64)
         best_loss_history = np.zeros(num_steps + 1, dtype=np.float64)
@@ -726,14 +751,29 @@ class _ShellRelaxMixin:
                 hr = hard_ratio[hard_mask] - 1.0
                 hard_mag[hard_mask] = repulsion_weight * 4.0 * (hr + hr ** 2)
 
-                # b) Non-bonded clearance
-                _pair_keys = rep_i_all.astype(np.int64) * num_atoms + rep_j_all.astype(np.int64)
-                _bonded_keys = set(
-                    int(a) * num_atoms + int(b) for a, b in bonded_set
+                # b) Non-bonded clearance.  Membership test on the
+                # packed (i*N + j) keys: vectorised binary search
+                # (``np.searchsorted``) against the pre-sorted
+                # ``bonded_keys_arr`` built in rebuild_topology().
+                # ``np.searchsorted`` is O(M log K) - much faster than
+                # ``np.isin``'s sort-then-merge for M >> K (millions
+                # of candidate pairs vs ~tens of thousands of bonds).
+                # The Python ``set`` comprehension this replaces ran
+                # the inner check in pure Python over each pair, the
+                # single dominant hotspot in the liquid pipeline at
+                # 200³ Å (~25% of runtime).
+                _pair_keys = (
+                    rep_i_all.astype(np.int64) * num_atoms
+                    + rep_j_all.astype(np.int64)
                 )
-                is_bonded = np.array(
-                    [int(k) in _bonded_keys for k in _pair_keys], dtype=bool,
-                )
+                if bonded_keys_arr.size > 0:
+                    _idx = np.searchsorted(bonded_keys_arr, _pair_keys)
+                    # Clip so the indexing below is safe; equality check
+                    # handles the "not found" case.
+                    _idx_clip = np.minimum(_idx, bonded_keys_arr.size - 1)
+                    is_bonded = bonded_keys_arr[_idx_clip] == _pair_keys
+                else:
+                    is_bonded = np.zeros(_pair_keys.shape, dtype=bool)
                 r_push = nonbond_push[s_i, s_j]
                 push_ratio = r_push / r_safe
                 nonbond_mask = (~is_bonded) & (push_ratio > 1.0)
