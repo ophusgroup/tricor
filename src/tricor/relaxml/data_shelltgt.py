@@ -16,6 +16,7 @@ otherwise compute for ``edge_index``.
 from __future__ import annotations
 
 import csv
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional, Union
 
@@ -150,21 +151,29 @@ class ShellTargetData(Data):
 
 
 class _TrajectoryCache:
-    """Lazy per-worker cache of trajectory .npz contents.
+    """LRU-bounded per-worker cache of trajectory .npz contents.
 
-    Keeps things simple: on first access to a trajectory, load positions
-    + cell + species from its .npz into memory.  Subsequent accesses
-    reuse the cached array.  With ~6k atoms × ~41 snapshots × 12 bytes =
-    ~2.9 MB per trajectory, 2000 trajectories fit in ~5.8 GB.
+    With ~6k atoms × ~41 snapshots × 12 bytes ≈ 3 MB per trajectory plus
+    a few MB of best_positions/etc., each cache entry is ~5–10 MB.  With
+    many workers and shuffled pair access patterns, every worker
+    eventually touches most trajectories per epoch, so an unbounded
+    cache balloons to GB × workers × ranks (observed: ~880 GB on the
+    10k-trajectory big dataset before we added this cap).
+
+    ``max_entries=None`` falls back to the legacy unbounded behavior.
     """
 
-    def __init__(self, data_root: Path) -> None:
+    def __init__(self, data_root: Path, max_entries: Optional[int] = 500) -> None:
         self._data_root = data_root
-        self._cache: dict[str, dict] = {}
+        self._max_entries = max_entries
+        # OrderedDict for O(1) LRU eviction: move_to_end on access, popitem
+        # on overflow.
+        self._cache: "OrderedDict[str, dict]" = OrderedDict()
 
     def get(self, filename: str) -> dict:
         cached = self._cache.get(filename)
         if cached is not None:
+            self._cache.move_to_end(filename)
             return cached
         with np.load(self._data_root / filename) as npz:
             files = set(npz.files)
@@ -187,6 +196,9 @@ class _TrajectoryCache:
                 "shell_triplet_features": np.asarray(npz["shell_triplet_features"], dtype=np.float32),
             }
         self._cache[filename] = entry
+        if self._max_entries is not None:
+            while len(self._cache) > self._max_entries:
+                self._cache.popitem(last=False)  # evict LRU
         return entry
 
 
@@ -224,6 +236,7 @@ class RelaxMLDataset(Dataset):
         cutoff: float = 5.0,
         k_stride_snapshots: int = 1,
         rotate: bool = True,
+        cache_max_entries: Optional[int] = 500,
     ) -> None:
         super().__init__()
         if not manifest_rows:
@@ -233,6 +246,7 @@ class RelaxMLDataset(Dataset):
         self.cutoff = float(cutoff)
         self.k_stride_snapshots = int(k_stride_snapshots)
         self.rotate = bool(rotate)
+        self.cache_max_entries = cache_max_entries
 
         # Precompute per-trajectory weight vectors (cheap, read from manifest).
         self._weight_vectors: list[np.ndarray] = [
@@ -263,7 +277,9 @@ class RelaxMLDataset(Dataset):
                 f"too large for the available trajectories."
             )
 
-        self._cache = _TrajectoryCache(self.data_root)
+        self._cache = _TrajectoryCache(
+            self.data_root, max_entries=self.cache_max_entries,
+        )
 
     def len(self) -> int:
         return len(self._pair_index)
@@ -358,6 +374,12 @@ class RelaxMLDataModule(pl.LightningDataModule):
         num_workers: int = 0,
         val_fraction: float = 0.1,
         split_seed: int = 42,
+        # Max trajectories held in each worker's _TrajectoryCache.  At
+        # ~5–10 MB per entry, ``cache_max_entries=500`` × NUM_WORKERS *
+        # len(GPU_IDS) keeps the total dataloader cache budget under ~50
+        # GB on a 16-worker DDP setup.  Set None for unbounded (legacy)
+        # — fine for small datasets but blew up to ~880 GB on big_v1.
+        cache_max_entries: Optional[int] = 500,
     ) -> None:
         super().__init__()
         self.save_hyperparameters(ignore=["manifest_path"])
@@ -366,6 +388,7 @@ class RelaxMLDataModule(pl.LightningDataModule):
         self._ds_kwargs = dict(
             cutoff=cutoff,
             k_stride_snapshots=k_stride_snapshots,
+            cache_max_entries=cache_max_entries,
         )
         self.rotate = bool(rotate)
         self.batch_size = int(batch_size)
@@ -395,16 +418,27 @@ class RelaxMLDataModule(pl.LightningDataModule):
             val_rows, self.data_root, rotate=False, **self._ds_kwargs,
         )
 
+    def _loader_kwargs(self) -> dict:
+        """Shared DataLoader kwargs.  ``persistent_workers`` avoids
+        re-spawning workers between epochs, and ``prefetch_factor``
+        buffers batches ahead of the GPU so brief loader stalls don't
+        starve compute.  Both require ``num_workers > 0``."""
+        kwargs = dict(
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=True,
+        )
+        if self.num_workers > 0:
+            kwargs["persistent_workers"] = True
+            kwargs["prefetch_factor"] = 4
+        return kwargs
+
     def train_dataloader(self) -> DataLoader:
         return DataLoader(
-            self.train_set, shuffle=True,
-            batch_size=self.batch_size, num_workers=self.num_workers,
-            pin_memory=True,
+            self.train_set, shuffle=True, **self._loader_kwargs(),
         )
 
     def val_dataloader(self) -> DataLoader:
         return DataLoader(
-            self.val_set, shuffle=False,
-            batch_size=self.batch_size, num_workers=self.num_workers,
-            pin_memory=True,
+            self.val_set, shuffle=False, **self._loader_kwargs(),
         )
