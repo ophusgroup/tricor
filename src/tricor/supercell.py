@@ -473,41 +473,6 @@ class Supercell(
         refine_orientations: bool = False,
         refine_orientations_kwargs: "dict | None" = None,
         show_progress: bool = True,
-        # ─── ML backend ──────────────────────────────────────────────
-        backend: str = "fire",
-        ml_model: "Any" = None,
-        ml_fire_cleanup_steps: int = 0,
-        ml_chunk_size: int | None = None,
-        # When >0, run the EGNN as an *iterative* next-step predictor
-        # (model trained on TricorMLStepDataset).  Each forward pass
-        # applies ~one FIRE step's worth of relaxation; the loop runs
-        # ``ml_iterative_steps`` times.  Replaces the one-shot
-        # ``predict_positions`` path inside the ML backend.
-        ml_iterative_steps: int = 0,
-        ml_iterative_momentum: float = 0.0,
-        ml_iterative_step_clip: float | None = None,
-        # Repulsion-projection sweeps applied AFTER each EGNN iteration
-        # to push any sub-hard-core pairs apart, keeping the
-        # configuration physical between steps so the model stays in
-        # its training distribution.  ``0`` (default) disables.
-        ml_repulsion_iters_per_step: int = 0,
-        # One-shot repulsion cleanup after the full iter loop — drives
-        # any residual sub-NN bond count to zero.  10–20 is typical.
-        ml_final_repulsion_iters: int = 0,
-        # Repulsion sweeps AFTER the FIRE cleanup step.  Needed because
-        # FIRE's bond + angle forces can re-introduce sub-hard-core
-        # pairs in tight regions (grain boundaries) that FIRE's own
-        # short-range repulsion doesn't resolve in a few steps.
-        ml_post_fire_repulsion_iters: int = 0,
-        # Combined attract-to-bond-peak + repel-from-hard-core sweep
-        # applied AFTER iter/FIRE.  Pulls bonded pairs (e.g. Si–O at
-        # 1.61 Å in SiO₂) to the actual NN peak while keeping
-        # non-bonded pairs at safe distances.  20 iterations typical.
-        # Replaces FIRE cleanup as the bond-shaping step in the ML
-        # pipeline — much faster (cKDTree-based, ~1.5 s/iter at 200³)
-        # and overlap-aware by construction.
-        ml_bond_relax_iters: int = 0,
-        # ────────────────────────────────────────────────────────────
         **shell_relax_kwargs: Any,
     ) -> dict[str, Any]:
         """Generate a disordered supercell from liquid to nanocrystalline.
@@ -540,29 +505,6 @@ class Supercell(
             crystalline grains as thermal broadening.  0 = no jitter.
         show_progress
             Display a text progress bar.
-        backend
-            Which relaxation kernel to use after the (optional) Voronoi
-            tile + orientation refinement.  One of:
-
-            - ``"fire"`` *(default)* — the classical spring-network FIRE
-              quench (``shell_relax``).  Bit-identical to historical
-              behaviour.
-            - ``"ml"`` — single forward pass of the per-material EGNN
-              given by ``ml_model``.  Skips ``refine_orientations`` and
-              ``shell_relax`` entirely.  Use when you want the speed.
-            - ``"ml+fire"`` — ML forward pass, then
-              ``ml_fire_cleanup_steps`` of classical FIRE as a safety net
-              (verifies bond / angle / repulsion losses, catches edge
-              cases where the ML model produced a sub-NN overlap).
-        ml_model
-            Either a path to an EGNN checkpoint (loaded via
-            :func:`tricor.ml.load_model`) or a pre-loaded model object.
-            Required when ``backend != "fire"``.
-        ml_fire_cleanup_steps
-            How many FIRE iterations to run after the ML forward pass
-            when ``backend == "ml+fire"``.  Ignored otherwise.
-            Recommended values: 5–30 depending on how strict the
-            downstream acceptance gate is.
         **shell_relax_kwargs
             Additional keyword arguments forwarded to :meth:`shell_relax`
             (e.g. ``repulsion_weight``, ``hard_core_scale``, ``step_size``).
@@ -657,12 +599,7 @@ class Supercell(
         # (undoing any thermal displacement from
         # ``displacement_sigma`` and giving refinement a clean
         # starting state that matches what trial retiles produce).
-        # Skip orientation refinement when the ML backend is doing the
-        # relaxation — the EGNN forward pass is expected to fix grain
-        # boundaries in one shot, and we benchmarked it without the
-        # SO(3) search.
         if (refine_orientations
-                and backend == "fire"
                 and getattr(self, "_grain_ids", None) is not None
                 and getattr(self, "_grain_cells", None) is not None):
             from ._resample import _retile_grain
@@ -725,57 +662,7 @@ class Supercell(
             self.refine_initial_orientations(shell_target, **r_kwargs)
 
         # --- relax ---
-        if backend not in ("fire", "ml", "ml+fire"):
-            raise ValueError(
-                f"backend must be one of 'fire', 'ml', 'ml+fire'; "
-                f"got {backend!r}",
-            )
-        if backend in ("ml", "ml+fire"):
-            if ml_model is None:
-                raise ValueError(
-                    f"backend={backend!r} requires ml_model "
-                    "(an EGNN instance or checkpoint path)",
-                )
-            from .ml.inference import (
-                load_model as _ml_load_model,
-                predict_and_optionally_relax,
-            )
-            if isinstance(ml_model, (str, bytes)) or hasattr(ml_model, "__fspath__"):
-                ml_model = _ml_load_model(ml_model)
-            n_fire_cleanup = (
-                int(ml_fire_cleanup_steps) if backend == "ml+fire" else 0
-            )
-            # Forward shell_relax_kwargs to the FIRE cleanup pass too
-            # so per-material hard_core / nonbond / repulsion stay
-            # consistent.
-            shell_relax_kw = dict(shell_relax_kwargs)
-            shell_relax_kw.setdefault("bond_weight", float(bond_weight))
-            shell_relax_kw.setdefault("angle_weight", float(angle_weight))
-            shell_relax_kw.setdefault("repulsion_weight", float(repulsion_weight))
-            shell_relax_kw.setdefault("hard_core_scale", float(hard_core_scale))
-            shell_relax_kw.setdefault("nonbond_push_scale", float(nonbond_push_scale))
-            predict_and_optionally_relax(
-                self, shell_target, ml_model,
-                grain_size=(float(grain_size) if grain_size is not None else 0.0),
-                fire_cleanup_steps=n_fire_cleanup,
-                chunk_size=ml_chunk_size,
-                iterative_steps=int(ml_iterative_steps),
-                iterative_momentum=float(ml_iterative_momentum),
-                iterative_step_clip=ml_iterative_step_clip,
-                iterative_repulsion_per_step=int(ml_repulsion_iters_per_step),
-                final_repulsion_iters=int(ml_final_repulsion_iters),
-                post_fire_repulsion_iters=int(ml_post_fire_repulsion_iters),
-                bond_relax_iters=int(ml_bond_relax_iters),
-                **shell_relax_kw,
-            )
-            # Build a minimal summary dict so the rest of generate()
-            # doesn't need branching to render the regime / density.
-            summary = {
-                "backend": backend,
-                "ml_fire_cleanup_steps": n_fire_cleanup,
-                "ml_iterative_steps": int(ml_iterative_steps),
-            }
-        elif int(num_steps) > 0:
+        if int(num_steps) > 0:
             summary = self.shell_relax(
                 shell_target,
                 num_steps=num_steps,
@@ -790,12 +677,11 @@ class Supercell(
         else:
             # num_steps == 0: caller has opted out of FIRE.  Skip
             # shell_relax entirely — it would otherwise spend ~90 s
-            # at 200³ Å rebuilding the bond topology (ASE
-            # neighbor_list + argsort) before running zero relaxation
-            # steps.  Caller is presumably running their own
-            # relaxation afterwards (e.g. cell.bond_relax()).
+            # at 200³ Å rebuilding the bond topology before running
+            # zero relaxation steps.  Caller is presumably running
+            # their own relaxation afterwards (e.g. cell.bond_relax()).
             summary = {
-                "backend": backend,
+                "backend": "fire",
                 "num_steps": 0,
             }
 
@@ -863,7 +749,7 @@ class Supercell(
         max_step
             Per-atom displacement cap (Å) per sweep.
         """
-        from .ml.inference import _bond_relax_sweep
+        from ._pair_relax import _bond_relax_sweep
 
         species_idx = (
             getattr(self, "_atom_shell_species_index", None)
@@ -926,7 +812,7 @@ class Supercell(
             symmetrically and meet in the middle.  Larger values
             risk overshoot; smaller values just need more sweeps.
         """
-        from .ml.inference import _enforce_hard_core
+        from ._pair_relax import _enforce_hard_core
 
         species_idx = (
             getattr(self, "_atom_shell_species_index", None)

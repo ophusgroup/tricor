@@ -391,94 +391,133 @@ class _ShellRelaxMixin:
 
             # Sort candidates by distance (nearest first)
             dist_order = np.argsort(nl_d)
-
-            _bond_i_list: list[int] = []
-            _bond_j_list: list[int] = []
-            _bond_rt_list: list[float] = []
-            bonded_set = set()
-            bonded_neighbors: list[list[int]] = [[] for _ in range(num_atoms)]
-            # Store unit vectors of existing bonds per atom for angle check
-            bond_hats_per_atom: list[list[np.ndarray]] = [[] for _ in range(num_atoms)]
-
             min_accept_angle = np.deg2rad(60.0)  # reject bonds with < 60deg to existing
 
-            def _species_pair_ok(ai: int, aj: int) -> bool:
-                """Check per-species-pair coordination limits."""
-                si, sj = species_idx[ai], species_idx[aj]
-                if bond_count_pair[ai, sj] >= coord_target_int[si, sj]:
-                    return False
-                if bond_count_pair[aj, si] >= coord_target_int[sj, si]:
-                    return False
-                return True
+            # Sort the neighbour arrays by distance once (so the JIT
+            # kernel can just iterate in order without indexing through
+            # dist_order on every pair access).
+            nl_i_sorted = nl_i[dist_order]
+            nl_j_sorted = nl_j[dist_order]
+            nl_hats_sorted = nl_hats[dist_order]
 
-            def _accept_bond(ai: int, aj: int) -> None:
-                """Record a new bond between atoms ai and aj."""
-                si, sj = species_idx[ai], species_idx[aj]
-                _bond_i_list.append(ai)
-                _bond_j_list.append(aj)
-                _bond_rt_list.append(float(pair_peak[si, sj]))
-                bonded_set.add((ai, aj))
-                bonded_set.add((aj, ai))
-                bonded_neighbors[ai].append(aj)
-                bonded_neighbors[aj].append(ai)
-                bond_count[ai] += 1
-                bond_count[aj] += 1
-                bond_count_pair[ai, sj] += 1
-                bond_count_pair[aj, si] += 1
+            # JIT-accelerated bond matching when numba is available.
+            # Falls back to the pure-Python loop if numba is missing or
+            # the JIT cache is stale.  Output is bit-equivalent: same
+            # set of accepted bonds, same order.
+            try:
+                from ._shell_relax_numba import (
+                    build_bond_graph_numba,
+                    HAS_NUMBA,
+                )
+            except ImportError:
+                HAS_NUMBA = False
+                build_bond_graph_numba = None
 
-            for idx in dist_order:
-                ai = int(nl_i[idx])
-                aj = int(nl_j[idx])
-                if bond_count[ai] >= k_atom[ai] or bond_count[aj] >= k_atom[aj]:
-                    continue
-                if (ai, aj) in bonded_set:
-                    continue
-                if not _species_pair_ok(ai, aj):
-                    continue
+            if HAS_NUMBA and build_bond_graph_numba is not None:
+                k_atom_arr = np.array(
+                    [int(k_per_species[species_idx[a]]) for a in range(num_atoms)],
+                    dtype=np.int64,
+                )
+                bond_i, bond_j, bond_r_target, bonded_nbr, bond_count_jit = (
+                    build_bond_graph_numba(
+                        nl_i_sorted, nl_j_sorted, nl_hats_sorted,
+                        species_idx, k_atom_arr,
+                        coord_target_int, pair_peak,
+                        num_atoms, num_sp,
+                        float(min_accept_angle),
+                    )
+                )
+                # Reconstruct the downstream-expected Python structures
+                # from the flat ``bonded_nbr`` array (this is the only
+                # part of rebuild_topology that has to stay in Python).
+                bond_count = bond_count_jit.astype(np.intp, copy=False)
+                bonded_neighbors = [
+                    bonded_nbr[i, :bond_count[i]].tolist()
+                    for i in range(num_atoms)
+                ]
+                bonded_set = set()
+                for i in range(num_atoms):
+                    n_i = int(bond_count[i])
+                    for jj in range(n_i):
+                        nb_idx = int(bonded_nbr[i, jj])
+                        bonded_set.add((i, nb_idx))
+            else:
+                # --- Python fallback (also used as the validation
+                # reference; kept verbatim so tests can pin against it).
+                _bond_i_list: list[int] = []
+                _bond_j_list: list[int] = []
+                _bond_rt_list: list[float] = []
+                bonded_set = set()
+                bonded_neighbors = [[] for _ in range(num_atoms)]
+                bond_hats_per_atom: list[list[np.ndarray]] = [
+                    [] for _ in range(num_atoms)
+                ]
 
-                hat_ij = nl_hats[idx]
-                hat_ji = -hat_ij
+                def _species_pair_ok(ai: int, aj: int) -> bool:
+                    si, sj = species_idx[ai], species_idx[aj]
+                    if bond_count_pair[ai, sj] >= coord_target_int[si, sj]:
+                        return False
+                    if bond_count_pair[aj, si] >= coord_target_int[sj, si]:
+                        return False
+                    return True
 
-                # Check angular compatibility with existing bonds at ai
-                accept = True
-                for existing_hat in bond_hats_per_atom[ai]:
-                    cos_a = np.dot(hat_ij, existing_hat)
-                    if cos_a > np.cos(min_accept_angle):
-                        accept = False
-                        break
-                if not accept:
-                    continue
+                def _accept_bond(ai: int, aj: int) -> None:
+                    si, sj = species_idx[ai], species_idx[aj]
+                    _bond_i_list.append(ai)
+                    _bond_j_list.append(aj)
+                    _bond_rt_list.append(float(pair_peak[si, sj]))
+                    bonded_set.add((ai, aj))
+                    bonded_set.add((aj, ai))
+                    bonded_neighbors[ai].append(aj)
+                    bonded_neighbors[aj].append(ai)
+                    bond_count[ai] += 1
+                    bond_count[aj] += 1
+                    bond_count_pair[ai, sj] += 1
+                    bond_count_pair[aj, si] += 1
 
-                # Check angular compatibility at aj
-                for existing_hat in bond_hats_per_atom[aj]:
-                    cos_a = np.dot(hat_ji, existing_hat)
-                    if cos_a > np.cos(min_accept_angle):
-                        accept = False
-                        break
-                if not accept:
-                    continue
+                cos_thresh_py = float(np.cos(min_accept_angle))
+                for idx in range(len(dist_order)):
+                    ai = int(nl_i_sorted[idx])
+                    aj = int(nl_j_sorted[idx])
+                    if bond_count[ai] >= k_atom[ai] or bond_count[aj] >= k_atom[aj]:
+                        continue
+                    if (ai, aj) in bonded_set:
+                        continue
+                    if not _species_pair_ok(ai, aj):
+                        continue
+                    hat_ij = nl_hats_sorted[idx]
+                    hat_ji = -hat_ij
+                    accept = True
+                    for existing_hat in bond_hats_per_atom[ai]:
+                        if float(np.dot(hat_ij, existing_hat)) > cos_thresh_py:
+                            accept = False
+                            break
+                    if not accept:
+                        continue
+                    for existing_hat in bond_hats_per_atom[aj]:
+                        if float(np.dot(hat_ji, existing_hat)) > cos_thresh_py:
+                            accept = False
+                            break
+                    if not accept:
+                        continue
+                    bond_hats_per_atom[ai].append(hat_ij.copy())
+                    bond_hats_per_atom[aj].append(hat_ji.copy())
+                    _accept_bond(ai, aj)
 
-                bond_hats_per_atom[ai].append(hat_ij.copy())
-                bond_hats_per_atom[aj].append(hat_ji.copy())
-                _accept_bond(ai, aj)
+                for idx in range(len(dist_order)):
+                    ai = int(nl_i_sorted[idx])
+                    aj = int(nl_j_sorted[idx])
+                    if bond_count[ai] >= k_atom[ai] or bond_count[aj] >= k_atom[aj]:
+                        continue
+                    if (ai, aj) in bonded_set:
+                        continue
+                    if not _species_pair_ok(ai, aj):
+                        continue
+                    _accept_bond(ai, aj)
 
-            # Second pass: fill remaining unsatisfied atoms with
-            # distance-only matching (relaxing angle constraint but
-            # still respecting species-pair limits)
-            for idx in dist_order:
-                ai = int(nl_i[idx])
-                aj = int(nl_j[idx])
-                if bond_count[ai] >= k_atom[ai] or bond_count[aj] >= k_atom[aj]:
-                    continue
-                if (ai, aj) in bonded_set:
-                    continue
-                if not _species_pair_ok(ai, aj):
-                    continue
-                _accept_bond(ai, aj)
-
-            bond_i = np.array(_bond_i_list, dtype=np.intp)
-            bond_j = np.array(_bond_j_list, dtype=np.intp)
-            bond_r_target = np.array(_bond_rt_list, dtype=np.float64)
+                bond_i = np.array(_bond_i_list, dtype=np.intp)
+                bond_j = np.array(_bond_j_list, dtype=np.intp)
+                bond_r_target = np.array(_bond_rt_list, dtype=np.float64)
 
             # Build triplet arrays from bonded neighbors.  Skip the
             # whole O(N × k²) Python loop when angle_weight == 0 - the
