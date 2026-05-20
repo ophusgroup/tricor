@@ -2,7 +2,7 @@
 
 [![Documentation Status](https://readthedocs.org/projects/tricor/badge/?version=latest)](https://tricor.readthedocs.io/en/latest/?badge=latest)
 
-Generate disordered atomic supercells guided by three-body (g3) distributions, spanning the full spectrum from liquid to nanocrystalline.  Designed for machine-learning training data generation.
+Generate disordered atomic supercells guided by three-body (g3) distributions, spanning the full spectrum from liquid to nanocrystalline.
 
 **[Documentation](https://tricor.readthedocs.io)**
 
@@ -10,9 +10,6 @@ Generate disordered atomic supercells guided by three-body (g3) distributions, s
 
 ```bash
 pip install tricor
-
-# Optional data-IO extras
-pip install 'tricor[data]'        # h5py, zarr
 ```
 
 Or to install the development checkout:
@@ -184,5 +181,4 @@ cell.plot_g3_compare()
 
 ## Dependencies
 
-- `numpy`, `matplotlib`, `ase`, `anywidget`
-- Optional: `h5py`, `zarr` (for data I/O)
+- `numpy`, `matplotlib`, `ase`, `anywidget`, `numba`, `scipy`

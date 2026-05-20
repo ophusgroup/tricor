@@ -244,40 +244,47 @@ def _push_close_pairs_apart(
     core wall deep enough that shell_relax never escapes them (the
     surrounding bond springs hold them in).
 
-    Returns a new positions array.
+    Implementation note: uses :class:`scipy.spatial.cKDTree` (with the
+    ``boxsize`` PBC parameter).  The previous ``ase.neighbor_list``
+    backend re-built the cell list inside the loop and spent ~12 s per
+    call at 600 k atoms — 40 iterations of that was 8 min just for
+    the random-placement separation at 200³ Å.  cKDTree builds in
+    ~1.5 s and the query for tiny cutoffs is much cheaper.
     """
-    from ase.neighborlist import neighbor_list as _nl
+    from scipy.spatial import cKDTree
 
     if len(positions) == 0 or push_cutoff <= 0:
         return positions
     positions = np.asarray(positions, dtype=np.float64).copy()
     cell_mat = np.asarray(cell_mat, dtype=np.float64)
-    cell_inv = np.linalg.inv(cell_mat)
-    numbers = np.asarray(numbers, dtype=np.int64)
+    # cKDTree's PBC support needs an orthorhombic boxsize.  All tricor
+    # supercells are orthorhombic by construction, so the diagonal of
+    # cell_mat is the box.  Fall back to non-PBC if any pbc=False (rare).
+    box = np.diag(cell_mat).astype(np.float64)
+    use_pbc = bool(np.all(np.asarray(pbc)))
     for _ in range(int(max_iter)):
-        probe = Atoms(
-            numbers=numbers, positions=positions,
-            cell=cell_mat, pbc=pbc,
-        )
-        ii, jj, dd, DD = _nl("ijdD", probe, float(push_cutoff))
-        if ii.size == 0:
+        if use_pbc:
+            wrap = positions - np.floor(positions / box) * box
+            tree = cKDTree(wrap, boxsize=box)
+        else:
+            wrap = positions
+            tree = cKDTree(wrap)
+        pairs = tree.query_pairs(float(push_cutoff), output_type="ndarray")
+        if len(pairs) == 0:
             break
-        mask_pair = ii < jj
-        if not np.any(mask_pair):
-            break
-        ii = ii[mask_pair]
-        jj = jj[mask_pair]
-        dd = dd[mask_pair]
-        DD = DD[mask_pair]
-        needed = push_cutoff - dd
-        d_safe = np.maximum(dd, 1e-6)
-        unit = DD / d_safe[:, None]
+        ii = pairs[:, 0]
+        jj = pairs[:, 1]
+        delta = wrap[jj] - wrap[ii]
+        if use_pbc:
+            delta -= np.round(delta / box) * box
+        d = np.linalg.norm(delta, axis=1).clip(min=1e-9)
+        needed = push_cutoff - d
+        unit = delta / d[:, None]
         step = 0.5 * needed[:, None] * unit
         np.add.at(positions, jj, step)
         np.add.at(positions, ii, -step)
-        frac = positions @ cell_inv
-        frac %= 1.0
-        positions = frac @ cell_mat
+        if use_pbc:
+            positions -= np.floor(positions / box) * box
     return positions
 
 
