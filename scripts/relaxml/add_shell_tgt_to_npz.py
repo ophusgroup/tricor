@@ -45,9 +45,9 @@ from tricor.shells import CoordinationShellTarget
 # Walk this directory recursively (or just at the top level) for .npz files.
 # Use the merged dir to retrofit every compound at once, OR a single
 # per-compound dir to scope the rewrite.
-SOURCE_DIR = "./data/multi_species_v1/Si3N4_trajectories"
+SOURCE_DIR =  "/wigeon/users/ehrdt/prod/relaxml_big_v1/" #"./data/multi_species_v2/Si3N4_trajectories_150"
 
-CIF_DIR = Path("/data/users/ehrdt/prod/cifs_mp_cnos")
+CIF_DIR = Path("/wigeon/users/ehrdt/prod/cifs_mp_cnos")
 HULL_PICKS_FILE = CIF_DIR / "hull_picks.json"
 
 # Compound name → CIF glob pattern.  Mirrors COMPOUND_PRESETS in
@@ -57,12 +57,34 @@ COMPOUND_PATTERNS: dict[str, str] = {
     "Ge":     "*_Ge.cif",
     "SiC":    "*_SiC.cif",
     "BN":     "*_BN.cif",
+    "AlN":     "*_AlN.cif",
     "Si3N4":  "*_Si3N4.cif",
     "SiO2":   "*_SiO2.cif",
     "GeO2":   "*_GeO2.cif",
     "B2O3":   "*_B2O3.cif",
     "Al2O3":  "*_Al2O3.cif",
+    "Ga2O3":  "*_Ga2O3.cif",
+    "TiO2":   "*_TiO2.cif",
     "As2S3":  "*_As2S3.cif",
+}
+
+# Per-compound mp-id pins.  When a compound has multiple polymorphs in MP
+# (Al2O3 corundum vs other Al2O3 phases, Ga2O3 monoclinic-β vs α, TiO2
+# anatase vs rutile vs brookite, ...), specify which one to use for
+# shell_target extraction.  This MUST match the mp-id you used when
+# generating the trajectories — otherwise the shell_target the model is
+# conditioned on at training time won't match the structure it's
+# relaxing.
+#
+# Empty/missing entries fall back to the hull pick (lowest e_above_hull
+# from MP, cached in hull_picks.json), which is the correct default for
+# compounds that only have one stable polymorph in the dataset.
+#
+# Mirrors CompoundSpec.mp_id in generate_surrogate_trajectories_multicomp.py.
+COMPOUND_MP_IDS: dict[str, str] = {
+    # "Al2O3": "mp-1143",   # corundum (only fill when needed)
+    "Ga2O3": "mp-886",    # β-Ga2O3 monoclinic — confirm with `ls *_Ga2O3.cif`
+    "TiO2":  "mp-390",    # anatase — confirm with `ls *_TiO2.cif`
 }
 
 # Set True to re-derive shell_target arrays even when a file already has
@@ -87,8 +109,31 @@ class _CompoundContext:
 
 
 def _resolve_cif(compound: str) -> Path:
-    """Glob CIF_DIR for the compound's pattern; honor hull_picks.json
-    cache when there are multiple matches."""
+    """Resolve the CIF for ``compound``.
+
+    Resolution order:
+      1. ``COMPOUND_MP_IDS[compound]`` — pin to ``{mp_id}_{compound}.cif``
+         exactly.  Use when the trajectories were generated with a
+         specific mp-id pin (e.g. Ga2O3 β-phase, TiO2 anatase).  The
+         shell_target MUST come from the same polymorph the trajectories
+         were generated from, otherwise training/inference is misaligned.
+      2. Single CIF match for ``COMPOUND_PATTERNS[compound]`` glob.
+      3. Multiple matches: hull pick from ``hull_picks.json`` cache.
+    """
+    # 1. Explicit mp-id pin: skip globbing entirely, use the exact filename.
+    pinned_mp = COMPOUND_MP_IDS.get(compound)
+    if pinned_mp is not None:
+        target = CIF_DIR / f"{pinned_mp}_{compound}.cif"
+        if not target.is_file():
+            raise FileNotFoundError(
+                f"Pinned CIF not found: {target}.  Verify mp_id={pinned_mp!r} "
+                f"is correct for compound {compound!r} (check "
+                f"`ls {CIF_DIR}/*_{compound}.cif`).  COMPOUND_MP_IDS "
+                f"must agree with the mp-id used at generation time."
+            )
+        return target
+
+    # 2. Glob fallback: pattern lookup + hull-pick if ambiguous.
     pattern = COMPOUND_PATTERNS.get(compound)
     if pattern is None:
         raise KeyError(
@@ -112,7 +157,8 @@ def _resolve_cif(compound: str) -> Path:
         raise ValueError(
             f"{len(matches)} CIFs match {pattern!r} for {compound!r} and "
             f"there's no entry in {HULL_PICKS_FILE.name}.  Either run the "
-            f"generator once to populate the cache, or hand-edit the file:"
+            f"generator once to populate the cache, or hand-edit the file, "
+            f"or pin via COMPOUND_MP_IDS in this script:"
             f"\n    {listed}"
         )
     chosen = CIF_DIR / cached_name

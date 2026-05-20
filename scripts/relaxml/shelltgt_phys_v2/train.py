@@ -1,67 +1,93 @@
-"""Train the shell_target-conditioned relaxml surrogate (mallard variant).
+"""Train the relaxml surrogate, v2 (per-edge shell_target injection) variant.
 
-Variant of train.py that uses the model + dataset from
-``tricor.relaxml.{model,data}_shelltgt``: every training pair carries
-the per-trajectory shell_target (per-pair distances + counts; per-triplet
-angles + weights) which the model encodes via ShellTargetEncoder.  This
-lets one model serve multiple phases of the same compound.
+Variant of ``shelltgt_phys/train.py`` that uses
+``tricor.relaxml.shelltgt_phys_v2``: pair shell_target features feed
+the edge encoder directly instead of going through a per-graph
+deep-set encoder.  See ``src/tricor/relaxml/shelltgt_phys_v2/model.py``
+for the rationale.
+
+Data layer is unchanged — re-uses ``RelaxMLDataModule`` from
+``tricor.relaxml.data_shelltgt``.  Manifests / .npz files produced for
+v1 training work as-is.
 
 Before running: ``nvtop`` / ``nvidia-smi`` to see which GPU is free,
 set ``GPU_ID`` below, then:
 
-    python train_shelltgt.py
+    python train.py
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG — edit these (MUST be before numpy/torch imports)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# --- mallard resource caps ---
-GPU_ID = 3                # physical GPU index (check with nvidia-smi / nvtop)
-NUM_THREADS = 4           # CPU threads; match NUM_WORKERS below.
-CHECK_GPU_BUSY = False     # abort if the chosen GPU already has another job
+# --- buffle resource caps ---
+GPU_ID = 2
+NUM_THREADS = 4
+CHECK_GPU_BUSY = False
 
 # --- data ---
-# The .npz files at this path must already contain the four shell_target
-# arrays.  For freshly-generated data this is automatic; for older data
-# run scripts/relaxml/add_shell_target_to_npz.py first.
-MANIFEST =  "./data/sio2_polymorphs_v1/merged_train_for_stishovite/manifest.csv" # "./data/multi_species_v1/merged_subset_Si/manifest.csv"  #"./data/si-n-trajectories/300_subset/manifest.csv"
-# from pathlib import Path
-# MANIFEST = str(Path(__file__).parent / "data/multi_species_v1/merged_subset_Si/manifest.csv")
+# Manifest pointing at trajectories for Si + SiC + SiO2 + BN + AlN (or
+# whatever cross-composition training set you've assembled).  v2 .npz
+# schema is identical to v1, so existing manifests work.
+from pathlib import Path
+MANIFEST = str(
+    Path(__file__).parent.parent
+    / "data/sio2_polymorphs_v1/merged_train_for_stishovite/manifest.csv"
+)
 
-CUTOFF = 5.0              # Å
-K_STRIDE_SNAPSHOTS = 1    # consecutive snapshots (= 5 tricor steps per model step)
-ROTATE = True             # SO(3) augmentation at training time
+CUTOFF = 5.0
+K_STRIDE_SNAPSHOTS = 1
+ROTATE = True
 VAL_FRACTION = 0.1
 SPLIT_SEED = 42
 
 # --- model ---
-MAX_Z = 120               # nn.Embedding table size; covers full periodic table
+MAX_Z = 120
 NODE_DIM = 128
 EDGE_DIM = 128
 NUM_CONVS = 4
 WEIGHT_ENCODER_HIDDEN = 64
-SPECIES_PAIR_DIM = 16     # edge-side species embedding (kept small)
+SPECIES_PAIR_DIM = 16
+SPECIES_HIDDEN = 128
 SHELL_TARGET_SPECIES_DIM = 8
 SHELL_TARGET_HIDDEN = 64
-# Per-graph dropout on the shell_target encoder output during training
-# (classifier-free-guidance trick).  0.2 is a sensible default; bump to
-# 0.3-0.5 if the model still ignores the conditioning, lower to 0.1 if
-# val loss with conditioning suffers.  Set to 0.0 to disable.
+# CFG dropout on shell_target conditioning.  In v1 we raised this from
+# 0.2 -> 0.4 trying to recover from the deep-set encoder going inert;
+# v2 sidesteps that pathology structurally (per-edge features have no
+# learnable layer that can collapse to zero), so 0.2 is a reasonable
+# starting point.  Lower it further to 0.0 if you don't care about
+# inference-time CFG / "no shell_target" graceful degradation.
 SHELL_TARGET_DROPOUT = 0.2
+# Auxiliary bond-length loss weight.  When > 0, training adds
+# ``AUX_BOND_WEIGHT * mean(((‖pred_post_step_distance‖ - target_r) /
+# sigma)²)`` over edges whose species pair has a shell_target entry.
+# Directly supervises the model to USE the per-edge target_r feature,
+# fixing the v2 pair-slope-≈0 failure mode (the per-edge channel is
+# structurally present but downstream layers learn tiny weights on it
+# under the relaxation MSE alone).
+#
+# Magnitudes: the displacement MSE is in Å² (typical ~1e-3 Å² per
+# atom-step); aux loss is in σ² units (typical ~1 when the model is
+# wrong, ~0.1 when right).  AUX_BOND_WEIGHT=0.01 makes the aux
+# contribution comparable to the displacement loss early in training;
+# bump to 0.1 for aggressive supervision; 0.0 disables.
+AUX_BOND_WEIGHT = 0.1
 EMA_DECAY = 0.9999
 LR = 1e-3
-LR_SCHEDULE = "cosine"    # "none" | "cosine"
+LR_SCHEDULE = "cosine"
 LR_MIN_RATIO = 0.01
 WARMUP_STEPS = 500
 
 # --- training ---
 MAX_EPOCHS = 100
-BATCH_SIZE = 8            # graphs per batch; each graph ~6k atoms at 50 Å
-NUM_WORKERS = 4           # DataLoader processes (match NUM_THREADS above)
+BATCH_SIZE = 4
+NUM_WORKERS = 4
 LOG_DIR = "./lightning_logs"
-RUN_NAME =  "coord_test_z"  #"relaxml-shelltgt"  #  
-RESUME_CKPT = None        # path to .ckpt or None
+RUN_NAME = "coord_phys_rinject"
+# v2 has a different parameter set than v1 (different module names,
+# edge_encoder.embed first-layer has 5 extra input channels) so v1
+# checkpoints can't be loaded.  Set to a v2 checkpoint to resume.
+RESUME_CKPT = None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Apply resource caps BEFORE importing numpy/torch
@@ -89,7 +115,7 @@ from lightning.pytorch.callbacks import (
 )
 from lightning.pytorch.loggers import TensorBoardLogger
 
-from tricor.relaxml.model_shelltgt import LitRelaxML
+from tricor.relaxml.shelltgt_phys_v2 import LitRelaxML
 from tricor.relaxml.data_shelltgt import RelaxMLDataModule
 
 
@@ -115,7 +141,7 @@ def check_gpu_availability(gpu_id: int) -> None:
     if used_mb is None:
         print(f"[warn] GPU {gpu_id} not found in nvidia-smi output; skipping.")
         return
-    if used_mb > 1024:  # > 1 GiB is not idle
+    if used_mb > 1024:
         print(
             f"[abort] GPU {gpu_id} already has {used_mb} MiB in use — another job "
             f"may be running.  Pick a different GPU_ID or set CHECK_GPU_BUSY=False.",
@@ -146,9 +172,11 @@ def main() -> None:
         num_convs=NUM_CONVS,
         weight_encoder_hidden=WEIGHT_ENCODER_HIDDEN,
         species_pair_dim=SPECIES_PAIR_DIM,
+        species_hidden=SPECIES_HIDDEN,
         shell_target_species_dim=SHELL_TARGET_SPECIES_DIM,
         shell_target_hidden=SHELL_TARGET_HIDDEN,
         shell_target_dropout=SHELL_TARGET_DROPOUT,
+        aux_bond_weight=AUX_BOND_WEIGHT,
         ema_decay=EMA_DECAY,
         learn_rate=LR,
         lr_schedule=LR_SCHEDULE,
@@ -157,12 +185,9 @@ def main() -> None:
     )
 
     # torch.compile the inner model for ~1.5–2x throughput on Ampere/Hopper.
-    # dynamic=True so we don't pay recompilation cost when edge counts vary
-    # slightly between batches (PBC neighbor lists drift with atom positions).
-    # The first epoch will be slower than steady-state due to compilation.
-    # The ShellTargetEncoder's forward is decorated with @_dynamo.disable in
-    # model_shelltgt.py so its variable-length per-pair / per-triplet
-    # tensors don't trigger repeated recompiles of the surrounding model.
+    # build_per_edge_shell_target and TripletTargetEncoder.forward stay in
+    # eager via @_dynamo.disable so variable per-pair / per-triplet shapes
+    # don't trigger recompiles.
     lit.model = torch.compile(lit.model, mode="default", dynamic=True)
 
     logger = TensorBoardLogger(save_dir=LOG_DIR, name=RUN_NAME)

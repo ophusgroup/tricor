@@ -1,16 +1,14 @@
-"""Iterative inference + comparison against tricor ground truth.
+"""Iterative inference + comparison for the physics-feature shell_target model.
 
-Variant of evaluate.py for the shell_target-conditioned model.  The
-shell_target arrays are read from each .npz (or recomputed from a CIF
-if you wire that path up in the future) and passed to every model
-forward inside the iterative inference loop.
-
-Loads a trained LitRelaxML checkpoint, applies it iteratively to its
-own output on a target .npz sample until convergence, then compares
-the predicted final structure to the tricor-generated ``best_positions``.
+Variant of ``evaluate_shelltgt.py`` that loads a checkpoint trained by
+``shelltgt_phys/train.py`` (uses the SpeciesEncoder MLP in place of
+nn.Embedding lookups).  Otherwise identical to evaluate_shelltgt.py:
+loads a checkpoint, applies the model iteratively to its own output on
+target .npz files until convergence, and compares the predicted final
+structure to the tricor-generated ``best_positions``.
 
 Edit the CONFIG block below, then run:
-    python evaluate_shelltgt.py
+    python evaluate.py
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -18,22 +16,24 @@ Edit the CONFIG block below, then run:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # --- mallard resource caps ---
-GPU_ID = 2
+GPU_ID = 0
 NUM_THREADS = 2
 
 # --- what to evaluate ---
-# Path to the Lightning checkpoint to load.  Lightning writes to
-# ./lightning_logs/<RUN_NAME>/version_<N>/checkpoints/.
-CHECKPOINT =  "./lightning_logs/si-n_Zembed/version_0/checkpoints/last.ckpt" #"./lightning_logs/coord_test_z/version_8/checkpoints/last.ckpt" #
+# Path to a Lightning checkpoint from shelltgt_phys/train.py.
+CHECKPOINT = (
+    # "./lightning_logs/coord_test_z/version_0/checkpoints/last.ckpt"
+    "./lightning_logs/si-n-phys_mitigated-fast/version_4/checkpoints/last.ckpt"
+)
 
 # Path to either a single .npz file or a directory of .npz files.
-TARGET = "./data/multi_species_v2/Si3N4_trajectories_150/"  #"/home/ehrdt/tricor/scripts/relaxml/data/sio2_polymorphs_v1/SiO2/stishovite_trajectories" #"./data/multi_species_v1/Si3N4_trajectories/" #"./data/sio2_polymorphs_v1/SiO2/coesite_trajectories" #
+# For the cross-composition test, point this at the held-out Si3N4
+# trajectories (the ones absent from training).
+TARGET = "../data/multi_species_v2/Si3N4_trajectories_150/" # "/home/ehrdt/tricor/scripts/relaxml/data/multi_species_v1/Ga2O3_mp-886_trajectories_150" 
+#"/home/ehrdt/tricor/scripts/relaxml/data/sio2_polymorphs_v1/SiO2/stishovite_trajectories" # ../data/multi_species_v1/Si3N4_trajectories/"
 
-# When True and TARGET is a directory, pick one .npz at random per regime
-# instead of evaluating every file.  Useful for quick sanity checks
-# (6 evaluations total).  When False, evaluates every .npz in TARGET.
 SAMPLE_PER_REGIME = True
-SAMPLE_SEED = 0                  # reproducibility for the per-regime random pick
+SAMPLE_SEED = 0
 
 REGIMES = (
     "liquid", "amorphous", "SRO", "MRO", "LRO", "nanocrystalline",
@@ -41,46 +41,77 @@ REGIMES = (
 
 # --- inference controls ---
 MAX_ITER = 50
-CONVERGENCE_TOL_ANG = 0.01       # Å; stop when max per-atom displacement < tol
-USE_EMA_WEIGHTS = True           # use the EMA snapshot of the model
-SPECIES = [14]
+CONVERGENCE_TOL_ANG = 0.01
+USE_EMA_WEIGHTS = True
+SPECIES = [14, 7]                # Si, N — informational only; not used to gate
 CUTOFF = 5.0
 
-# --- optional tricor "finetune" after ML inference ---
-# Run this many additional shell_relax steps with the original weight
-# parameters after the iterative ML inference converges.  0 disables.
-# 5–20 is the useful range — enough to clean up small residual errors
-# at the disorder extremes without losing the wall-time win.  Uses the
-# weight params stored in the .npz (so behavior matches what tricor
-# would have done from the start, just on a much-better starting state).
 TRICOR_FINETUNE_STEPS = 0
 
-
 # --- PDF / ADF comparison ---
-# PDF_R_MAX is computed slightly past the 8 Å plot crop so that the
-# Gaussian-tail clipping artifact at the neighbor-list cutoff edge stays
-# off-screen.  Bump together if PLOT_R_MAX changes.
 PDF_R_MAX = 10.0
 PDF_R_STEP = 0.05
 PDF_PHI_BINS = 90
-PLOT_R_MAX = 8.0                 # x-axis limit for the g(r) plot panel
+PLOT_R_MAX = 8.0
 
-# Set False to skip the PDF/ADF metric computation entirely (also disables
-# plotting, since plots reuse those arrays).  Useful for pure timing runs.
 EVAL_METRICS = True
+# Computing the ADF used to be ~3-5x slower than g(r) alone because the
+# inner triplet-routing loop was Python-level; the fast eval path added
+# in tricor.differentiable_pdf_fast.compute_eval() vectorizes it via
+# g3_lookup gather, so ADF now costs roughly the same as g(r).  Leave
+# this True unless you have a reason to skip ADF.
+COMPUTE_ADF = True
+# "fast"  -> mod.compute_eval()  (vectorized triplet routing + bincount
+#                                 histogram, ~50-100x faster than ref)
+# "ref"   -> mod.compute()       (reference implementation; slower, gold
+#                                 standard for cross-checking ADF shapes
+#                                 against the fast path).  Swap to "ref"
+#                                 if you suspect the fast eval is
+#                                 producing unexpected ADF shapes.
+ADF_BACKEND = "fast"
+# When True, print per-triplet sum/max of the RAW (un-area-normed) ADF
+# for both predicted and target structures right after compute.  Use to
+# diagnose whether a triplet's "flat" plot is from low counts (noise +
+# normalization) or from a genuine flat distribution.
+DEBUG_ADF_PRINT_RAW = True
+# Cutoff (Å) for the ADF neighbor search.  ADF is a first-shell quantity
+# — angles between *bonded* neighbors of a central atom.  PDF_R_MAX is
+# typically too generous for ADF: at 10 Å on a stishovite-density cell
+# (0.12 atoms/Å³) each center has ~500 neighbors, and the per-batch
+# (B, K_max, K_max) angle tensor OOMs the GPU.  4.0 Å captures the full
+# first shell (Si-O ~1.6 Å, M-O ~2.0 Å) with margin and cuts K_max from
+# ~500 to ~30 → 250× memory reduction.  Bump to PDF_R_MAX for the old
+# behavior if you want long-range angle structure.
+ADF_R_MAX = 4.0
+# Number of centers processed at once when computing angles.  Default
+# 512 in the module is tuned for sparse cells (K_max < 20); on dense
+# oxides drop to 64.  Linear memory cost: each batch holds ~10
+# (B, K_max, K_max) tensors in flight.
+ADF_BATCH_SIZE = 512
+PDF_ADF_DEVICE = "auto"
+PDF_ADF_DTYPE = "float32"
 
-# PDF/ADF compute speed knobs.  ADF is the slow part (triplets scale as
-# O(N * neighbors^2)).  Set COMPUTE_ADF=False for ~3-5x speedup when you
-# only care about g(r); the ADF panel/MSE will be zeros.  PDF_ADF_DEVICE
-# auto-picks GPU when available (much faster than CPU at large N).
-COMPUTE_ADF = False
-PDF_ADF_DEVICE = "auto"          # "auto" | "cuda" | "cpu"
-PDF_ADF_DTYPE = "float32"        # "float32" or "float64"
+# --- g3 (rooted three-body) comparison ---
+# Computes the full (num_triplets, num_r, num_r, num_phi) rooted 3-body
+# distribution via tricor.g3.G3Distribution.measure_g3 (numba kernel) and
+# adds per-triplet 2D heatmap rows (target | predicted | difference) to
+# the comparison plot.  Captures bond+bond+angle correlations that g(r)
+# and ADF separately miss.  Cost: numba scan over origin × neighbors² on
+# every structure; the smaller G3_R_MAX (default 5 Å vs PDF_R_MAX=10) and
+# coarser G3_R_STEP keep the array under ~hundreds of MB even for
+# 15k-atom cells.
+COMPUTE_G3 = True
+G3_R_MAX = 10.0
+G3_R_STEP = 0.05
+G3_PHI_BINS = 60
+# Root-bond r1 window (Å) integrated over for the 2D (r2, phi) heatmap
+# slice.  Default covers first-shell bonds for most oxides/nitrides
+# (Si–O ~1.6, M–O ~1.85–2.05, C–C 1.5, Si–N 1.7).  Bump the upper edge
+# for longer ionic bonds.
+G3_SHELL_R = (1.0, 2.5)
+G3_BACKEND = "numba"  # "numba" | "python"
 
 # --- visualization ---
-# Save 2-panel PNGs (g2 + ADF) overlaying predicted vs tricor target for
-# each evaluated structure.  Initial-state curve is also drawn faintly for
-# context.  Output goes to PLOT_DIR (None = auto: <TARGET>/evaluation_plots/).
 SAVE_PLOTS = True
 PLOT_DIR = None
 INCLUDE_INITIAL_IN_PLOTS = True
@@ -92,7 +123,7 @@ INCLUDE_INITIAL_IN_PLOTS = True
 # Loads in OVITO as a 3-frame trajectory; the 'frame_label' field in
 # each frame's comment line identifies which is which.
 SAVE_XYZ = True
-XYZ_DIR = None      # None = auto: <TARGET parent>/evaluation_xyz_shelltgt/
+XYZ_DIR = None      # None = auto: <TARGET parent>/evaluation_xyz_shelltgt_phys/
 # Stride for capturing intermediate ML iterations into the XYZ file.
 #   1 = every iteration (~50+ frames per file, animates the full relaxation),
 #   5 = every 5th iteration (~10 frames per file),
@@ -113,7 +144,6 @@ for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
 import sys
 import time
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
@@ -125,7 +155,7 @@ from tricor.flowmatch.flow_utils import (
     periodic_radius_graph_chunked,
 )
 
-from tricor.relaxml.model_shelltgt import LitRelaxML
+from tricor.relaxml.shelltgt_phys import LitRelaxML
 from tricor.relaxml.data_shelltgt import (
     ShellTargetData,
     _min_image_displacement,
@@ -143,16 +173,14 @@ def _periodic_graph(pos, cutoff, cell):
 
 def _load_model(ckpt_path: Path, device: torch.device) -> torch.nn.Module:
     # Strip the "._orig_mod." prefix that torch.compile injects into every
-    # state-dict key (train_shelltgt.py wraps lit.model in torch.compile
-    # before fitting).  Catches both `model._orig_mod.…` and
+    # state-dict key (train.py wraps lit.model in torch.compile before
+    # fitting).  Catches both `model._orig_mod.…` and
     # `ema_model.module._orig_mod.…` in one substitution.
     state = torch.load(str(ckpt_path), map_location=device)
     sd = {k.replace("._orig_mod.", "."): v for k, v in state["state_dict"].items()}
     lit = LitRelaxML(**state["hyper_parameters"])
     lit.load_state_dict(sd, strict=True)
     lit.eval().to(device)
-    # Pull the EMA weights into the main model if requested — these are
-    # generally what you want for inference.
     if USE_EMA_WEIGHTS and hasattr(lit, "ema_model"):
         lit.ema_model.eval()
         return lit.ema_model.module.to(device)
@@ -167,11 +195,7 @@ def _build_data(
     shell: dict,
     cutoff: float,
 ) -> Batch:
-    """Wrap one structure into a single-graph PyG Batch with shell_target.
-
-    `shell` is a dict with the four shell_target tensors (already on
-    `device`); same for every iteration of the inference loop.
-    """
+    """Wrap one structure into a single-graph PyG Batch with shell_target."""
     edge_index, edge_vec = _periodic_graph(positions, cutoff, cell)
     edge_len = edge_vec.norm(dim=-1, keepdim=True)
     edge_attr = torch.hstack([edge_vec, edge_len])
@@ -225,18 +249,6 @@ def run_iterative_inference(
     tol: float = CONVERGENCE_TOL_ANG,
     collect_every: int = 0,
 ) -> tuple[np.ndarray, int, list[tuple[int, np.ndarray]]]:
-    """Apply the model iteratively until convergence; return (final_pos, n_iter, intermediates).
-
-    `shell_target` is the dict from ``_load_shell_target_from_npz`` (or
-    equivalent): four numpy arrays describing the per-pair / per-triplet
-    targets the model conditions on.  Constant across iterations.
-
-    When ``collect_every > 0``, also record (iter_idx, positions) every
-    that many iterations into the ``intermediates`` list (always
-    including the final state).  Used by the XYZ writer to animate the
-    relaxation in OVITO.  Set to 0 to skip — no cpu()-copy cost on pure
-    metric runs.
-    """
     pos = torch.tensor(initial_positions, dtype=torch.float32, device=device)
     cell_t = torch.tensor(cell, dtype=torch.float32, device=device)
     w_t = torch.tensor(weight_vector, dtype=torch.float32, device=device)
@@ -253,6 +265,10 @@ def run_iterative_inference(
                                       dtype=torch.float32, device=device),
     }
 
+    # When collect_every > 0, record positions at every Nth iteration so
+    # the XYZ writer can animate the relaxation in OVITO.  The final state
+    # is always recorded (either via early-convergence return or the
+    # post-loop append) so the user never gets a truncated trajectory.
     intermediates: list[tuple[int, np.ndarray]] = []
 
     def _record(iter_idx: int, p: torch.Tensor) -> None:
@@ -268,10 +284,6 @@ def run_iterative_inference(
             batch.shell_trip_species, batch.shell_trip_features,
             batch.shell_trip_batch,
         )
-        # Diagnostic: report the magnitude of model-predicted per-atom
-        # displacements at every iteration.  Compared against the training
-        # target which has |delta|.mean() ≈ 0.1 Å — if these come out
-        # orders-of-magnitude larger, the model is mis-applied at inference.
         d_norms = delta.norm(dim=-1)
         print(
             f"  iter {it:2d}: |delta| mean={d_norms.mean().item():.4f}  "
@@ -284,9 +296,11 @@ def run_iterative_inference(
         if collect_every > 0 and ((it + 1) % collect_every == 0):
             _record(it + 1, pos)
         if max_step < tol:
+            # Always record the converged state, even if not on a stride boundary.
             if collect_every > 0 and (not intermediates or intermediates[-1][0] != it + 1):
                 _record(it + 1, pos)
             return pos.cpu().numpy(), it + 1, intermediates
+    # Hit max_iter without converging — record final state if not already.
     if collect_every > 0 and (not intermediates or intermediates[-1][0] != max_iter):
         _record(max_iter, pos)
     return pos.cpu().numpy(), max_iter, intermediates
@@ -299,16 +313,7 @@ def _tricor_finetune(
     weights: dict,
     n_steps: int,
 ) -> np.ndarray:
-    """Run ``n_steps`` of tricor's shell_relax starting from ``positions``.
-
-    Used as a post-ML cleanup pass: the ML model gets close, then a small
-    number of native tricor steps polishes residual errors using the
-    original weight parameters from the source .npz.  Returns the new
-    positions (best-loss snapshot from the relaxation, since that's what
-    shell_relax restores into ``self.atoms``).
-
-    No-op if ``n_steps <= 0``.
-    """
+    """N steps of native shell_relax starting from the ML-predicted state."""
     if n_steps <= 0:
         return positions
 
@@ -324,8 +329,6 @@ def _tricor_finetune(
     sc = Supercell.from_atoms(
         ref, cell_dim_angstroms=cell_edge, rng_seed=0, relative_density=0.96,
     )
-    # Overwrite the random Supercell.from_atoms placement with our
-    # ML-predicted positions; refresh cached cell matrices.
     sc.atoms = Atoms(
         numbers=species, positions=positions, cell=cell, pbc=ref.pbc,
     )
@@ -341,9 +344,8 @@ def _tricor_finetune(
     return np.asarray(sc.atoms.positions, dtype=np.float32).copy()
 
 
-# Module cache: DifferentiablePDFADF_Fast is expensive to construct and
-# its parameters don't depend on the per-structure positions, so we
-# build one per (species, device, dtype) combination and reuse.
+# Module cache: DifferentiablePDFADF_Fast is expensive to construct; build
+# one per (species, device, dtype) and reuse across structures.
 _PDF_ADF_MOD_CACHE: dict[tuple, "torch.nn.Module"] = {}
 
 
@@ -359,7 +361,6 @@ def _resolve_pdf_adf_dtype() -> torch.dtype:
 
 def _get_pdf_adf_module(species_list: list[int], device: torch.device,
                         dtype: torch.dtype):
-    """Return a cached DifferentiablePDFADF_Fast for this species set."""
     key = (tuple(species_list), str(device), str(dtype))
     mod = _PDF_ADF_MOD_CACHE.get(key)
     if mod is not None:
@@ -368,44 +369,100 @@ def _get_pdf_adf_module(species_list: list[int], device: torch.device,
     mod = DifferentiablePDFADF_Fast(
         r_max=PDF_R_MAX, r_step=PDF_R_STEP,
         phi_num_bins=PDF_PHI_BINS, species=species_list,
+        adf_r_max=ADF_R_MAX, adf_batch_size=ADF_BATCH_SIZE,
     ).to(device=device, dtype=dtype)
     _PDF_ADF_MOD_CACHE[key] = mod
     return mod
 
 
 def _pdf_adf(positions: np.ndarray, species: np.ndarray, cell: np.ndarray):
-    """Compute g2 (+ optionally ADF) for a single structure.
-
-    Speed knobs from the CONFIG block:
-      - PDF_ADF_DEVICE: "auto" / "cuda" / "cpu"
-      - PDF_ADF_DTYPE:  "float32" / "float64"
-      - COMPUTE_ADF:    when False, skips the expensive triplet sum and
-                        returns a zero ADF tensor for API compatibility.
-    Species list is derived from the structure itself so the same evaluator
-    works for any 1+-element compound.
-    """
     species_list = sorted({int(z) for z in species.tolist()})
     device = _resolve_pdf_adf_device()
     dtype = _resolve_pdf_adf_dtype()
     mod = _get_pdf_adf_module(species_list, device, dtype)
+    # Re-apply ADF knobs on the cached module so config edits between
+    # runs in the same Python session take effect without rebuilding.
+    mod.adf_r_max = ADF_R_MAX
+    mod.adf_batch_size = ADF_BATCH_SIZE
     pos_t = torch.as_tensor(positions, dtype=dtype, device=device)
     sp_t = torch.as_tensor(species, dtype=torch.int64, device=device)
     cell_t = torch.as_tensor(cell, dtype=dtype, device=device)
     with torch.no_grad():
         if COMPUTE_ADF:
-            g2, adf = mod.compute(pos_t, sp_t, cell_t)
+            if ADF_BACKEND == "ref":
+                # Reference implementation — slower per-triplet Python
+                # loop in tricor.differentiable_pdf_fast.compute().  Use
+                # for cross-checking ADF shapes against compute_eval.
+                g2, adf = mod.compute(pos_t, sp_t, cell_t)
+            else:
+                # compute_eval() = vectorized-triplet eval path:
+                # numerically identical to compute() but ~5-20x faster
+                # on multi-species cells because g3_lookup gathers
+                # replace the per-triplet Python loop.  No gradients.
+                g2, adf = mod.compute_eval(pos_t, sp_t, cell_t)
         else:
             g2, adf = mod.compute_g2_only(pos_t, sp_t, cell_t)
+
+    if DEBUG_ADF_PRINT_RAW and COMPUTE_ADF:
+        # Print sum and peak of the RAW (un-area-normed) ADF for each
+        # triplet so a "flat" plot can be diagnosed: if a triplet's sum
+        # is orders-of-magnitude smaller than its peers, the flat
+        # appearance is normalization noise on near-zero data; if its
+        # sum is comparable to the peaked triplets, the flat shape is a
+        # real feature of the angle distribution (or a bug worth
+        # tracking).
+        labels = getattr(mod, "triplet_labels", None)
+        adf_cpu = adf.detach().cpu().numpy()
+        backend_tag = ADF_BACKEND
+        for t in range(adf_cpu.shape[0]):
+            label = labels[t] if labels is not None else f"[{t}]"
+            print(
+                f"      ADF[{backend_tag}] triplet {t} ({label}): "
+                f"sum={adf_cpu[t].sum():.3e}  max={adf_cpu[t].max():.3e}"
+            )
+
     return g2.detach().cpu().numpy(), adf.detach().cpu().numpy()
 
 
 def _pdf_adf_grids() -> tuple[np.ndarray, np.ndarray]:
-    """r-axis (Å) and ADF phi-axis (deg) values for the configured PDF settings."""
     num_r = int(round(PDF_R_MAX / PDF_R_STEP))
     r_grid = np.arange(num_r, dtype=np.float64) * PDF_R_STEP + 0.5 * PDF_R_STEP
     phi_edges = np.linspace(0.0, np.pi, PDF_PHI_BINS + 1)
     phi_centers = phi_edges[:-1] + 0.5 * (phi_edges[1] - phi_edges[0])
     return r_grid, np.rad2deg(phi_centers)
+
+
+def _g3_compute(
+    positions: np.ndarray,
+    species: np.ndarray,
+    cell: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return ``(g3, r, phi_deg)`` for ``positions``.
+
+    ``g3`` has shape ``(num_triplets, num_r, num_r, num_phi)`` indexed by
+    the canonical tricor g3_index ordering (c in range(n_species),
+    n1 in range(n_species), n2 in range(n1, n_species)) — same as
+    DifferentiablePDFADF_Fast.g3_index, so triplet rows line up with the
+    ADF panels.
+    """
+    from ase import Atoms
+    from tricor.g3 import G3Distribution
+
+    atoms = Atoms(
+        numbers=np.asarray(species, dtype=np.int64),
+        positions=np.asarray(positions, dtype=np.float64),
+        cell=np.asarray(cell, dtype=np.float64),
+        pbc=True,
+    )
+    dist = G3Distribution(source=atoms, label="eval")
+    g3, r, phi = dist.measure_g3(
+        r_max=G3_R_MAX,
+        r_step=G3_R_STEP,
+        phi_num_bins=G3_PHI_BINS,
+        return_g3=True,
+        backend=G3_BACKEND,
+    )
+    return np.asarray(g3), np.asarray(r), np.rad2deg(np.asarray(phi))
 
 
 def _save_comparison_plot(
@@ -419,21 +476,23 @@ def _save_comparison_plot(
     title: str,
     species: np.ndarray,
     cell: np.ndarray,
+    g3_tgt: np.ndarray | None = None,
+    g3_pred: np.ndarray | None = None,
+    g3_r: np.ndarray | None = None,
+    g3_phi_deg: np.ndarray | None = None,
 ) -> None:
-    """One g(r) panel per unique species pair + one ADF panel for all triplets.
+    """One g(r) panel per unique species pair + one ADF panel per triplet.
 
-    g(r) uses the standard pair-correlation normalization:
-        g_αβ(r) = count_αβ(r) * V / (N_α * (N_β - δ_αβ) * 4π r² * dr)
-    so a uniform random arrangement gives g(r) → 1 at large r.
-
-    ADF stays area-normalized (probability density over φ); when there are
-    multiple triplet types they're overlaid on the same axes with a legend.
+    When g3_tgt/g3_pred are provided, also renders one row of heatmaps
+    (target | predicted | difference) per triplet — slice of the rooted
+    3-body distribution integrated over the G3_SHELL_R root-bond window,
+    leaving a 2D (phi, r2) image.
     """
-    # Lazy import + Agg backend so headless mallard sessions never need a display.
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from ase.data import chemical_symbols
+    from tricor._plotting import _g3_slice_image
 
     r_grid, phi_grid = _pdf_adf_grids()
 
@@ -458,7 +517,6 @@ def _save_comparison_plot(
         area = float(_trapz(y, x))
         return y / area if area > 0 else y
 
-    # Unique pairs (i ≤ j) and their human-readable labels.
     pair_indices = [(i, j)
                     for i in range(len(sorted_species))
                     for j in range(i, len(sorted_species))]
@@ -469,23 +527,68 @@ def _save_comparison_plot(
     n_pairs = len(pair_indices)
     n_triplets = adf_tgt.shape[0]
 
-    # Layout: one row, (n_pairs g(r) panels) + (1 ADF panel).
+    # Triplet labels (n1-center-n2) reconstructed from the canonical
+    # g3_index ordering inside tricor.differentiable_pdf_fast.  Same
+    # enumeration: ``c in range(n_species), n1 in range(n_species),
+    # n2 in range(n1, n_species)``.  Uses chemical symbols (Si-O-Si)
+    # rather than Z numbers (14-8-14) for the subplot titles.
+    n_species = len(sorted_species)
+    triplet_indices = [
+        (c, n1, n2)
+        for c in range(n_species)
+        for n1 in range(n_species)
+        for n2 in range(n1, n_species)
+    ]
+    assert len(triplet_indices) == n_triplets, (
+        f"triplet count mismatch: built {len(triplet_indices)} index entries "
+        f"for {n_species} species, but adf array has {n_triplets} rows"
+    )
+    triplet_labels = [
+        f"{chemical_symbols[sorted_species[n1]]}"
+        f"–{chemical_symbols[sorted_species[c]]}"
+        f"–{chemical_symbols[sorted_species[n2]]}"
+        for (c, n1, n2) in triplet_indices
+    ]
+
+    # 3-column grid: PDFs in their own row(s), then ADFs in subsequent
+    # rows (3 ADF panels per row).  For the common 2-species case
+    # (n_pairs=3, n_triplets=6) this is a clean 3×3 grid — top row
+    # holds the 3 g(r) panels, lower two rows hold one panel per
+    # triplet labeled by chemistry rather than overlaying all 6 on a
+    # single axis.
+    NCOLS = 3
+    import math as _math
+    n_pdf_rows = max(1, _math.ceil(n_pairs / NCOLS))
+    n_adf_rows = max(1, _math.ceil(n_triplets / NCOLS))
+    # g3 panels: a single total-g3 row with NCOLS=3 columns laid out as
+    # (target | predicted | difference) — heatmaps of the (phi, r2) slice
+    # after summing across all triplet channels and integrating the root
+    # bond r1 over G3_SHELL_R.
+    has_g3 = g3_tgt is not None and g3_pred is not None and g3_r is not None
+    n_g3_rows = 1 if has_g3 else 0
+    n_rows = n_pdf_rows + n_adf_rows + n_g3_rows
+
     fig, axes = plt.subplots(
-        1, n_pairs + 1,
-        figsize=(5.5 * (n_pairs + 1), 4.5),
+        n_rows, NCOLS,
+        figsize=(5.5 * NCOLS, 4.0 * n_rows),
         squeeze=False,
     )
-    axes = axes[0]
 
+    # ─── PDF panels ─────────────────────────────────────────────────
+    # Draw order matters when curves coincide: e.g. nanocrystalline
+    # initial ≈ target (shell_relax is nearly a no-op on already-good
+    # crystals).  Plot target / predicted first, then initial last with
+    # the dashed style — dashes alternate with the underlying solid
+    # color so both remain visible even when they're identical.
     for k, ((i, j), lbl) in enumerate(zip(pair_indices, pair_labels)):
-        ax = axes[k]
-        if g2_init is not None:
-            ax.plot(r_grid, _gofr(g2_init[i, j], i, j), color="0.65", lw=1.0,
-                    ls="--", label="initial (pre-relax)")
+        ax = axes[k // NCOLS, k % NCOLS]
         ax.plot(r_grid, _gofr(g2_tgt[i, j], i, j),
                 color="C3", lw=2.0, label="tricor (target)")
         ax.plot(r_grid, _gofr(g2_pred[i, j], i, j),
                 color="C0", lw=1.6, label="model (predicted)")
+        if g2_init is not None:
+            ax.plot(r_grid, _gofr(g2_init[i, j], i, j), color="0.35", lw=1.2,
+                    ls="--", label="initial (pre-relax)")
         ax.set_xlim(0.0, PLOT_R_MAX)
         ax.set_xlabel("r (Å)")
         ax.set_ylabel("g(r)")
@@ -493,25 +596,100 @@ def _save_comparison_plot(
         ax.axhline(1.0, color="0.7", lw=0.7, ls=":")
         ax.legend(framealpha=0.9, fontsize=9)
 
-    ax = axes[-1]
-    # Multi-triplet ADF: each triplet type gets its own line trio
-    # (target solid, predicted dashed-thinner, initial dotted).
-    cmap = plt.get_cmap("tab10")
-    for t in range(n_triplets):
-        c = cmap(t % 10)
+    # Hide unused PDF slots (when n_pairs isn't a multiple of NCOLS).
+    for k in range(n_pairs, n_pdf_rows * NCOLS):
+        axes[k // NCOLS, k % NCOLS].set_visible(False)
+
+    # ─── ADF panels: one per triplet ────────────────────────────────
+    # Same draw-order rationale as the PDF panels — initial drawn last
+    # with dashed style so it remains visible when it coincides with
+    # the target distribution.
+    for t, tri_lbl in enumerate(triplet_labels):
+        row = n_pdf_rows + (t // NCOLS)
+        col = t % NCOLS
+        ax = axes[row, col]
+        ax.plot(phi_grid, _area_norm(adf_tgt[t], phi_grid),
+                color="C3", lw=2.0, label="tricor (target)")
+        ax.plot(phi_grid, _area_norm(adf_pred[t], phi_grid),
+                color="C0", lw=1.6, label="model (predicted)")
         if adf_init is not None:
             ax.plot(phi_grid, _area_norm(adf_init[t], phi_grid),
-                    color=c, lw=0.8, ls=":", alpha=0.6)
-        ax.plot(phi_grid, _area_norm(adf_tgt[t], phi_grid),
-                color=c, lw=2.0,
-                label=(f"tricor [{t}]" if n_triplets > 1 else "tricor (target)"))
-        ax.plot(phi_grid, _area_norm(adf_pred[t], phi_grid),
-                color=c, lw=1.4, ls="--",
-                label=(f"model [{t}]" if n_triplets > 1 else "model (predicted)"))
-    ax.set_xlabel("bond angle φ (deg)")
-    ax.set_ylabel("ADF(φ)  [normalized]")
-    ax.set_title("Angle distribution")
-    ax.legend(framealpha=0.9, fontsize=9)
+                    color="0.35", lw=1.2, ls="--", label="initial (pre-relax)")
+        ax.set_xlabel("bond angle φ (deg)")
+        ax.set_ylabel("ADF(φ)  [normalized]")
+        ax.set_title(f"ADF: {tri_lbl}")
+        ax.legend(framealpha=0.9, fontsize=9)
+
+    # Hide unused ADF slots (when n_triplets isn't a multiple of NCOLS).
+    for t in range(n_triplets, n_adf_rows * NCOLS):
+        row = n_pdf_rows + (t // NCOLS)
+        col = t % NCOLS
+        axes[row, col].set_visible(False)
+
+    # ─── g3 panel row: total g3 (summed over triplets), 3 columns ──────
+    # 2D slice of the rooted 3-body distribution after summing across all
+    # triplet channels and integrating the root bond r1 over G3_SHELL_R,
+    # leaving (phi, r2) for the third atom.  Target / predicted share a
+    # color scale (vmax = max of the two); difference uses a divergent
+    # scale centered at zero so blue = model under-counts, red = over.
+    if has_g3:
+        shell_mask = (g3_r >= G3_SHELL_R[0]) & (g3_r <= G3_SHELL_R[1])
+        if not shell_mask.any():
+            print(
+                f"WARN: G3_SHELL_R={G3_SHELL_R} doesn't overlap g3.r "
+                f"(min={g3_r.min():.2f}, max={g3_r.max():.2f}); "
+                f"skipping g3 panels."
+            )
+        else:
+            # Sum across triplet channels → one (num_r, num_r, num_phi)
+            # array per structure; slice with the same helper as before.
+            g3_tgt_total = g3_tgt.sum(axis=0)
+            g3_pred_total = g3_pred.sum(axis=0)
+
+            extent = [
+                float(g3_r.min()), float(g3_r.max()),
+                float(g3_phi_deg.min()), float(g3_phi_deg.max()),
+            ]
+            row = n_pdf_rows + n_adf_rows
+            img_tgt = _g3_slice_image(
+                g3_tgt_total, shell_mask, g3_r, g3_phi_deg,
+            )
+            img_pred = _g3_slice_image(
+                g3_pred_total, shell_mask, g3_r, g3_phi_deg,
+            )
+            img_diff = img_pred - img_tgt
+            vmax = float(max(np.nanmax(img_tgt), np.nanmax(img_pred), 1e-9))
+            dmax = float(np.nanmax(np.abs(img_diff)) or 1e-9)
+
+            ax_t = axes[row, 0]
+            im_t = ax_t.imshow(
+                img_tgt, origin="lower", extent=extent, aspect="auto",
+                cmap="viridis", vmin=0.0, vmax=vmax,
+            )
+            ax_t.set_xlabel("r₂ (Å)")
+            ax_t.set_ylabel("φ (deg)")
+            ax_t.set_title("g3 target (total)")
+            fig.colorbar(im_t, ax=ax_t, fraction=0.045, pad=0.04)
+
+            ax_p = axes[row, 1]
+            im_p = ax_p.imshow(
+                img_pred, origin="lower", extent=extent, aspect="auto",
+                cmap="viridis", vmin=0.0, vmax=vmax,
+            )
+            ax_p.set_xlabel("r₂ (Å)")
+            ax_p.set_ylabel("φ (deg)")
+            ax_p.set_title("g3 predicted (total)")
+            fig.colorbar(im_p, ax=ax_p, fraction=0.045, pad=0.04)
+
+            ax_d = axes[row, 2]
+            im_d = ax_d.imshow(
+                img_diff, origin="lower", extent=extent, aspect="auto",
+                cmap="RdBu_r", vmin=-dmax, vmax=dmax,
+            )
+            ax_d.set_xlabel("r₂ (Å)")
+            ax_d.set_ylabel("φ (deg)")
+            ax_d.set_title("g3 pred − tgt (total)")
+            fig.colorbar(im_d, ax=ax_d, fraction=0.045, pad=0.04)
 
     fig.suptitle(title, fontsize=11)
     fig.tight_layout()
@@ -577,6 +755,8 @@ def _write_comparison_xyz(
         for it_num, pos in intermediates:
             frames.append(_frame(f"ml_iter_{it_num}", pos, iter_idx=it_num))
     else:
+        # No intermediates collected — include the final ML prediction as
+        # its own frame so the 3-frame fallback still works.
         frames.append(_frame("predicted", predicted))
     frames.append(_frame("best_tricor", best))
 
@@ -589,12 +769,6 @@ def evaluate_one(
     xyz_dir: Path | None = None,
 ) -> dict:
     with np.load(npz_path) as npz:
-        # Use the first trajectory snapshot, NOT npz["initial_positions"].
-        # The latter is the random Supercell.from_atoms placement, captured
-        # before sc.generate() replaces atoms with grain-Voronoi-built ones
-        # for any non-liquid config.  positions[0] is the actual state at
-        # step 0 of shell_relax, which is what we trained the model to step
-        # forward from.
         initial = np.asarray(npz["positions"][0], dtype=np.float32)
         best = np.asarray(npz["best_positions"], dtype=np.float32)
         cell = np.asarray(npz["cell"], dtype=np.float32)
@@ -602,12 +776,6 @@ def evaluate_one(
         weight_vector = _weight_vector_from_npz(npz)
         regime = str(npz["regime"].item())
         best_loss = float(npz["best_loss"])
-        # Un-normalized weight kwargs for the optional tricor finetune.
-        # These are the same values that drove the original tricor
-        # relaxation that produced best_positions.  NOTE: displacement_sigma
-        # is intentionally NOT passed — it controls thermal jitter during
-        # grain CONSTRUCTION (in _build_grain_atoms) and is not a parameter
-        # of shell_relax itself.
         finetune_kwargs = {
             "bond_weight":         float(npz["bond_weight"]),
             "angle_weight":        float(npz["angle_weight"]),
@@ -615,8 +783,6 @@ def evaluate_one(
             "hard_core_scale":     float(npz["hard_core_scale"]),
             "nonbond_push_scale":  float(npz["nonbond_push_scale"]),
         }
-        # Phase conditioning: shell_target arrays.  The model needs these
-        # at every iteration so it knows which phase to relax toward.
         if "shell_pair_species" not in npz.files:
             raise KeyError(
                 f"{npz_path.name} has no shell_target arrays. Run "
@@ -640,8 +806,6 @@ def evaluate_one(
     )
     t_ml = time.perf_counter() - t0
 
-    # Optional tricor finetune.  Runs N steps of native shell_relax with
-    # the source-file weights from the ML-predicted starting state.
     t_ft0 = time.perf_counter()
     if TRICOR_FINETUNE_STEPS > 0:
         predicted = _tricor_finetune(
@@ -651,23 +815,26 @@ def evaluate_one(
     t_ft = time.perf_counter() - t_ft0
     dt = t_ml + t_ft
 
-    # Positional RMSE (min-image displacement between predicted and tricor target).
     predicted_t = torch.tensor(predicted, dtype=torch.float64)
     best_t = torch.tensor(best, dtype=torch.float64)
     cell_t = torch.tensor(cell, dtype=torch.float64)
     disp = _min_image_displacement(predicted_t, best_t, cell_t)
     rmse = disp.pow(2).sum(dim=-1).mean().sqrt().item()
 
-    # PDF / ADF match + optional plot.  Skipped entirely when
-    # EVAL_METRICS is False so timing runs aren't inflated by the
-    # O(N * neighbors^2) ADF computation.
     pdf_mse = float("nan")
     adf_mse = float("nan")
+    g3_mse = float("nan")
     if EVAL_METRICS:
         g2_pred, adf_pred = _pdf_adf(predicted, species, cell)
         g2_tgt, adf_tgt = _pdf_adf(best, species, cell)
         pdf_mse = float(np.mean((g2_pred - g2_tgt) ** 2))
         adf_mse = float(np.mean((adf_pred - adf_tgt) ** 2))
+
+        g3_tgt = g3_pred = g3_r = g3_phi_deg = None
+        if COMPUTE_G3:
+            g3_tgt, g3_r, g3_phi_deg = _g3_compute(best, species, cell)
+            g3_pred, _, _ = _g3_compute(predicted, species, cell)
+            g3_mse = float(np.mean((g3_pred - g3_tgt) ** 2))
 
         if plot_dir is not None:
             if INCLUDE_INITIAL_IN_PLOTS:
@@ -678,7 +845,8 @@ def evaluate_one(
             title = (
                 f"{regime}  ({npz_path.stem})\n"
                 f"atoms={predicted.shape[0]}  iters={n_iter}/{MAX_ITER}  "
-                f"RMSE={rmse:.3f} Å  PDF MSE={pdf_mse:.2e}  ADF MSE={adf_mse:.2e}"
+                f"RMSE={rmse:.3f} Å  PDF MSE={pdf_mse:.2e}  "
+                f"ADF MSE={adf_mse:.2e}  g3 MSE={g3_mse:.2e}"
             )
             _save_comparison_plot(
                 plot_path,
@@ -687,6 +855,10 @@ def evaluate_one(
                 title,
                 species=species,
                 cell=cell,
+                g3_tgt=g3_tgt,
+                g3_pred=g3_pred,
+                g3_r=g3_r,
+                g3_phi_deg=g3_phi_deg,
             )
 
     # XYZ side-channel: dump the structures themselves so we can flip
@@ -706,7 +878,7 @@ def evaluate_one(
         if TRICOR_FINETUNE_STEPS > 0 else ""
     )
     metrics_str = (
-        f"PDF_MSE={pdf_mse:.3e}  ADF_MSE={adf_mse:.3e}  "
+        f"PDF_MSE={pdf_mse:.3e}  ADF_MSE={adf_mse:.3e}  G3_MSE={g3_mse:.3e}  "
         if EVAL_METRICS else ""
     )
     print(
@@ -725,12 +897,13 @@ def evaluate_one(
         "rmse_ang": float(rmse),
         "pdf_mse": float(pdf_mse),
         "adf_mse": float(adf_mse),
+        "g3_mse": float(g3_mse),
         "tricor_best_loss": float(best_loss),
     }
 
 
 def _select_files(target: Path) -> list[Path]:
-    """Resolve the configured TARGET into a list of .npz files to evaluate."""
+    """Resolve TARGET into a list of .npz files to evaluate."""
     if target.is_file() and target.suffix == ".npz":
         return [target]
     if not target.is_dir():
@@ -741,10 +914,6 @@ def _select_files(target: Path) -> list[Path]:
         rng = np.random.default_rng(SAMPLE_SEED)
         picks: list[Path] = []
         for regime in REGIMES:
-            # Compound-agnostic match: filenames are
-            # "<formula>_<regime>_cell###_idx#####_seed#########.npz" (or
-            # "<formula>_<polymorph>_<regime>_..." for the SiO2 polymorph
-            # generator).  Match anything ending in _<regime>_*.npz.
             candidates = sorted(target.glob(f"*_{regime}_*.npz"))
             if not candidates:
                 print(f"  [warn] no files matching *_{regime}_*.npz in {target}")
@@ -772,7 +941,7 @@ def main() -> None:
     if SAVE_PLOTS:
         if PLOT_DIR is None:
             base = target if target.is_dir() else target.parent
-            plot_dir = base / "evaluation_plots_shelltgt_z"
+            plot_dir = base / "evaluation_plots_shelltgt_phys_g3_mitigate"
         else:
             plot_dir = Path(PLOT_DIR).resolve()
         plot_dir.mkdir(parents=True, exist_ok=True)
@@ -782,7 +951,7 @@ def main() -> None:
     if SAVE_XYZ:
         if XYZ_DIR is None:
             base = target if target.is_dir() else target.parent
-            xyz_dir = base / "evaluation_xyz_shelltgt_z"
+            xyz_dir = base / "evaluation_xyz_shelltgt_phys"
         else:
             xyz_dir = Path(XYZ_DIR).resolve()
         xyz_dir.mkdir(parents=True, exist_ok=True)

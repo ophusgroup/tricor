@@ -18,14 +18,19 @@ from pathlib import Path
 SOURCES = [
     "./data/sio2_polymorphs_v1/SiO2/alpha_quartz_trajectories",
     "./data/sio2_polymorphs_v1/SiO2/alpha_cristobalite_trajectories",                                                                                                                                                                            
-    "./data/sio2_polymorphs_v1/SiO2/beta_cristobalite_trajectories",                                                                                                                                                                                                                                                                                                                                                                                                                              
-#     "./data/multi_species_v1/Al2O3_trajectories",
+    "./data/sio2_polymorphs_v1/SiO2/beta_cristobalite_trajectories",   
+    "./data/sio2_polymorphs_v1/SiO2/coesite_trajectories",                                                                                                                                                                                                                                                                                                                                                                                                                              
+    "./data/multi_species_v1/Al2O3_trajectories",
+    "./data/multi_species_v1/Ga2O3_mp-886_trajectories_150",
+    "./data/multi_species_v1/TiO2_mp-390_trajectories_150",
 #     "./data/multi_species_v1/Si3N4_trajectories",
-#     "./data/multi_species_v1/SiC_trajectories",
-#     "./data/multi_species_v1/SiO2_trajectories",
-#     "./data/multi_species_v1/Si_trajectories",
+    # "./data/multi_species_v1/SiC_trajectories",
+    # "./data/multi_species_v1/SiO2_trajectories",
+    # "./data/multi_species_v1/Si_trajectories",
+    # "./data/multi_species_v1/BN_trajectories",
+    # "./data/multi_species_v1/AlN_trajectories",
     ]
-DESTINATION = "./data/sio2_polymorphs_v1/merged_train"
+DESTINATION = "./data/sio2_polymorphs_v1/merged_train_for_stishovite" #"./data/si-n-trajectories" #
 
 # ─────────────────────────────────────────────────────────────────────────────
 

@@ -1,22 +1,47 @@
-"""Generate relaxation trajectories for training a multi-species GNN surrogate.
+"""Generate SiO₂ multi-polymorph trajectories for phase-conditioning training.
 
-Uses the stratified sampler from diagnose_param_space (balanced regime coverage
-with n_crystalline >= 1 for crystalline strata).  Each sample yields one .npz
-with the full shell_relax trajectory, initial/final/best positions, species,
-cell, all weight parameters, grain_size/cf/num_grains/n_crystalline, and the
-initial/best/final losses as metadata.  A manifest CSV indexes every sample.
+Version 2 (2026-05-13): updated for the upstream tricor merge of May 2026.
+Same behavior as v1 EXCEPT:
 
-The compound to generate is selected by COMPOUND_NAME below.  Each compound
-gets its own output dir + filename prefix, so multiple runs for different
-compounds can later be merged via scripts/relaxml/merge_manifests.py.
+  * Passes the new ``refine_orientations`` kwarg to ``Supercell.generate``
+    (default True in this script — runs grain-orientation refinement
+    before the FIRE quench, recommended for directional-bond materials
+    like SiO₂ polymorphs).  No-op when ``grain_size`` is 0.
 
-No quality gate is applied here: the surrogate should learn tricor's full
-output distribution, including noisy/hard configs.  Downstream datasets that
-use the surrogate for large-scale structure generation should filter by
-best_loss (or a structure-based metric) at that stage instead.
+  * Passes the new ``k_restraint`` kwarg (position-tether spring strength,
+    eV/Å²) — defaults to 0.0 (off) but can be raised to preserve regime
+    character during relaxation.
 
-Edit the CONFIG section below, then run:
-    python generate_surrogate_trajectories.py
+  * Default ``DATASET_ROOT`` bumped to ``data/sio2_polymorphs_v2`` so v2
+    outputs don't collide with v1 trajectories on disk.
+
+All other parameters (bond_weight, angle_weight, etc.) come from the same
+stratified sampler as v1.  The relax inner loop is whatever the merged
+upstream tricor provides.
+
+Variant of generate_surrogate_trajectories.py specialized for SiO₂.  In a
+single run it iterates over a list of SiO₂ polymorphs (α-quartz, cristobalite,
+tridymite, etc.) and produces an independent trajectory dataset for each,
+each with that polymorph's own shell_target written into the .npz.  The
+intent is to break the species-↔-shell_target confound: with only one
+polymorph per compound, the model can shortcut around the shell_target
+encoder; with several polymorphs sharing species (Si, O) but differing
+shell_targets, it has to actually use the conditioning input.
+
+Each polymorph's output goes into its own subdir + uses a polymorph-
+distinct filename prefix + seed offset, so they don't collide and so the
+merge step can union or hold them out individually.
+
+To find available SiO₂ CIFs in the library:
+    ls /data/users/ehrdt/prod/cifs_mp_cnos/*_SiO2.cif
+
+Pick polymorphs by inspecting the structures (different space groups +
+densities ≈ different polymorphs); fill POLYMORPHS below; run:
+    python generate_surrogate_trajectories_sio2_polymorphs.py
+
+Held-out evaluation strategy: leave one polymorph out of POLYMORPHS during
+training, generate it separately for testing — that's the real probe of
+whether the shell_target conditioning is doing anything useful.
 """
 
 from __future__ import annotations
@@ -40,6 +65,7 @@ from typing import Optional
 import numpy as np
 from ase.io import read as ase_read
 
+from tricor.relaxml.shell_target import extract_shell_target_arrays
 from tricor.shells import CoordinationShellTarget
 from tricor.supercell import Supercell
 
@@ -47,7 +73,7 @@ from tricor.supercell import Supercell
 # Materials Project API key (used only when multiple polymorphs match a
 # compound's pattern and we need to pick the hull-stable one).  Same key
 # file as scripts/run_mp_nos.py in mc_structgen.
-MP_API_KEY_FILE = Path("/home/ehrdt/materials_project_api.txt")
+MP_API_KEY_FILE = Path("/home/ehrdt/misc/materials_project_api.txt")
 
 # Hull-pick cache filename (lives next to the CIFs).  Maps compound name
 # → chosen CIF filename so we don't requery MP on every script run.
@@ -102,33 +128,12 @@ def _pick_hull_polymorph(compound_name: str, candidates: list[Path]) -> Path:
     return chosen
 
 
-def _resolve_cif(
-    cif_dir: Path,
-    pattern: str,
-    compound_name: str,
-    mp_id: str | None = None,
-) -> Path:
-    """Resolve the CIF for a compound under ``cif_dir``.
+def _resolve_cif(cif_dir: Path, pattern: str, compound_name: str) -> Path:
+    """Glob CIF_DIR for `pattern` and return a single match.
 
-    If ``mp_id`` is given, target ``{mp_id}_{compound_name}.cif`` exactly
-    and raise if it doesn't exist — pins a specific polymorph (e.g.
-    ``mp-1143`` for Al2O3 corundum, distinguishing it from other Al2O3
-    phases in MP).
-
-    Otherwise glob ``cif_dir`` for ``pattern``.  For a single match,
-    return it directly.  For multiple matches, look up the cached hull
-    pick or call MP to pick the lowest e_above_hull.
+    For a single match, return it directly.  For multiple matches, look up
+    the cached hull pick or call MP to pick the lowest e_above_hull.
     """
-    if mp_id is not None:
-        target = cif_dir / f"{mp_id}_{compound_name}.cif"
-        if not target.is_file():
-            raise FileNotFoundError(
-                f"Pinned CIF not found: {target}.  Verify mp_id={mp_id!r} "
-                f"is correct for compound {compound_name!r} (check "
-                f"`ls {cif_dir}/*_{compound_name}.cif`)."
-            )
-        return target
-
     matches = sorted(cif_dir.glob(pattern))
     if not matches:
         raise FileNotFoundError(
@@ -152,9 +157,13 @@ def _resolve_cif(
     return chosen
 
 
-def _build_reference(spec: "CompoundSpec", cif_dir: Path):
-    """Read the reference structure for a compound spec from a CIF file."""
-    cif_path = _resolve_cif(cif_dir, spec.cif_pattern, spec.name, spec.mp_id)
+def _build_polymorph_reference(polymorph: "PolymorphSpec", cif_dir: Path):
+    """Read the reference structure for a polymorph spec from its CIF file."""
+    cif_path = cif_dir / polymorph.cif_filename
+    if not cif_path.is_file():
+        raise FileNotFoundError(
+            f"CIF for polymorph {polymorph.tag!r} not found: {cif_path}"
+        )
     return ase_read(str(cif_path), format="cif")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -163,94 +172,98 @@ def _build_reference(spec: "CompoundSpec", cif_dir: Path):
 
 
 @dataclass(frozen=True)
-class CompoundSpec:
-    """A reference compound loaded from a CIF file under CIF_DIR."""
-    name: str           # short tag used in filenames + output paths
-    cif_pattern: str    # glob (relative to CIF_DIR); must match exactly one file
-    mp_id: str | None = None  # if set (e.g. "mp-1143"), pin to {mp_id}_{name}.cif
-                              # exactly and skip the hull-pick fallback.  Used
-                              # to nail down a specific polymorph when a formula
-                              # has several (e.g. corundum vs other Al2O3 phases)
+class PolymorphSpec:
+    """One SiO₂ polymorph: a tag + an exact CIF filename under CIF_DIR.
+
+    The tag becomes the per-polymorph subdir name and the filename
+    prefix, so it should be filesystem-safe (letters, digits, underscores,
+    hyphens — no spaces or slashes).
+    """
+    tag: str            # e.g. "alpha_quartz"
+    cif_filename: str   # exact filename under CIF_DIR (no glob); MP IDs
+                        # disambiguate polymorphs since they all share
+                        # the formula SiO₂.
 
 
-# CIF library on mallard, populated by mc_structgen/test/run_mp_nos.py
-# (Materials Project: 1-2-element materials containing C/N/O/S +
-# all monatomic, e_above_hull <= 500 meV/atom).  Filenames look like
-# "mp-149_Si.cif".
+# CIF library on mallard, populated by mc_structgen/test/run_mp_nos.py.
 CIF_DIR = Path("/wigeon/users/ehrdt/prod/cifs_mp_cnos")
 
-# Initial multi-species glass-former set.  Patterns use formula globs;
-# if MP returned multiple polymorphs for a formula, _resolve_cif will
-# raise with the candidate list — replace the glob with the chosen
-# filename to pin one polymorph (one phase per structure type for v1).
-COMPOUND_PRESETS: dict[str, CompoundSpec] = {
-    "Si":     CompoundSpec("Si",     "*_Si.cif"),
-    "Ge":     CompoundSpec("Ge",     "*_Ge.cif"),
-    "SiC":    CompoundSpec("SiC",    "*_SiC.cif"),
-    "BN":     CompoundSpec("BN",     "*_BN.cif"),
-    "AlN":     CompoundSpec("AlN",     "*_AlN.cif"),
-    "Si3N4":  CompoundSpec("Si3N4",  "*_Si3N4.cif"),
-    "SiO2":   CompoundSpec("SiO2",   "*_SiO2.cif"),
-    "GeO2":   CompoundSpec("GeO2",   "*_GeO2.cif"),
-    "B2O3":   CompoundSpec("B2O3",   "*_B2O3.cif"),
-    "Al2O3":  CompoundSpec("Al2O3",  "*_Al2O3.cif"),
-    "Ga2O3":  CompoundSpec("Ga2O3",  "*_Ga2O3.cif"),
-    "TiO2":   CompoundSpec("TiO2",  "*_TiO2.cif"),
-    "As2S3":  CompoundSpec("As2S3",  "*_As2S3.cif"),
-}
-
-# Pick which compound this run generates.  Re-run with a different name to
-# build the next compound's dataset; outputs are siloed by name so they
-# don't collide.
-COMPOUND_NAME = "TiO2" #next: Al2O3?
-
-# Optional: pin to a specific MP polymorph by mp-id (e.g. "mp-1143" for
-# Al2O3 corundum, "mp-2657" for TiO2 rutile, "mp-390" for TiO2 anatase).
-# Use this when a formula has multiple stable polymorphs and you need a
-# specific one (e.g. for the cross-coordination test, you want corundum
-# Al2O3 specifically, not other Al2O3 phases).
+# Polymorphs to generate this run.  Replace the placeholder mp-IDs below
+# with the actual filenames you have in CIF_DIR — find them with:
+#     ls /data/users/ehrdt/prod/cifs_mp_cnos/*_SiO2.cif
+# and pick polymorphs by looking at their structures (different space
+# groups + densities = different phases).  Common SiO₂ polymorphs in MP:
+#   α-quartz       (P3₁2₁)  — ground state
+#   β-quartz       (P6₂22)
+#   α-cristobalite (P4₁2₁2)
+#   β-cristobalite (Fd-3m)
+#   α-tridymite    (P2₁/c)
+#   coesite        (C2/c)   — high-pressure
+#   stishovite     (P4₂/mnm) — high-pressure (6-coord Si, very different!)
 #
-# None  -> use the preset's default mp_id (if any) or fall back to the
-#          MP hull pick (lowest e_above_hull).
-# "mp-X" -> pin to {mp_id}_{compound}.cif exactly; raises if missing.
+# For the held-out-phase test: leave one of these out of POLYMORPHS during
+# training, generate it separately afterwards, and evaluate on it.
+POLYMORPHS: list[PolymorphSpec] = [
+    # PolymorphSpec("alpha_quartz",       "mp-7000_SiO2.cif"),
+    # PolymorphSpec("alpha_cristobalite", "mp-6945_SiO2.cif"),
+    # PolymorphSpec("beta_cristobalite",  "mp-546794_SiO2.cif"),
+    # PolymorphSpec("coesite",            "mp-6930_SiO2.cif"),
+    PolymorphSpec("stishovite",         "mp-6947_SiO2.cif"),
+]
+
+# Composition tag — used as the manifest's `compound` column and as the
+# filename prefix.  All polymorphs share it so the merged manifest knows
+# they're the same composition; the polymorph distinction is in the
+# `polymorph` column we add below.
+COMPOUND_NAME = "SiO2"
+
+# Each polymorph gets its own subdir under DATASET_ROOT/COMPOUND_NAME/
+# so they can be merged or held out individually.
 #
-# When set, the chosen mp-id is appended to OUTPUT_DIR below so re-runs
-# with different mp_ids don't collide (e.g. TiO2 rutile and TiO2 anatase
-# can coexist as ./data/multi_species_v1/TiO2_mp-2657_trajectories_150
-# and ./data/multi_species_v1/TiO2_mp-390_trajectories_150).
-MP_ID= "mp-390" #: str | None = None
+# v2 default points at a separate root so v2 outputs don't overwrite v1
+# trajectories on disk.  Change to "./data/sio2_polymorphs_v1" if you
+# want to add v2 trajectories alongside v1 (be aware they'll have
+# different relax behavior — the model's training distribution would
+# be mixed).
+DATASET_ROOT = "./data/sio2_polymorphs_v2"
 
-COMPOUND = COMPOUND_PRESETS[COMPOUND_NAME]
-if MP_ID is not None:
-    # Override the preset's default mp_id with the run-time choice.
-    COMPOUND = CompoundSpec(
-        name=COMPOUND.name,
-        cif_pattern=COMPOUND.cif_pattern,
-        mp_id=MP_ID,
-    )
-
-# Each compound gets its own subdir under a shared root so the merge step
-# can union them all into one training manifest.  When MP_ID is pinned,
-# the mp-id goes into the dir name so different polymorphs don't collide.
-DATASET_ROOT = "./data/multi_species_v1"
-_dir_tag = f"{COMPOUND_NAME}_{COMPOUND.mp_id}" if COMPOUND.mp_id else COMPOUND_NAME
-OUTPUT_DIR = f"{DATASET_ROOT}/{_dir_tag}_trajectories_150"
-
-CELL_SIZE = 50.0                # Å — match the existing training data
+CELL_SIZE = 50.0                # Å
 REL_DENSITY = 0.96
 
-# 750 stratified samples per compound × 5 compounds ≈ 3750 total — same
-# order of magnitude as the merged Si v2 dataset.
+# --- v2 additions: forwarded to Supercell.generate ---
+# Build-time per-grain orientation refinement.  Runs a cheap topology-free
+# coordinate-descent over per-grain rotations BEFORE the FIRE quench, so
+# FIRE starts from a better basin.  Only meaningful when grains exist
+# (no-op for liquid/amorphous strata where grain_size = 0).  Default True
+# in v2 — SiO2 polymorphs are highly directional (Si–O–Si bridges),
+# benefit substantially from grain-orientation refinement.
+REFINE_ORIENTATIONS = True
+
+# Position-tether spring strength (eV/Å²).  0.0 (default) disables.
+# Small values (~0.1-1.0) preserve regime character (grain layout,
+# amorphous topology) while permitting local relaxation.  Large values
+# (≫ 10) hold the structure rigid.  Useful when grains drift apart
+# during relaxation.
+K_RESTRAINT = 0.0
+
+# Per-polymorph stratified samples.  Default 150 × 4 polymorphs = 600
+# trajectories total — enough to break the species-↔-shell_target
+# confound without blowing the generation budget.
 N_PRESET_SAMPLES = 0
 N_STRATIFIED_SAMPLES = 150
 
 N_STEPS_DEFAULT = 200
 TRAJECTORY_STRIDE = 5           # save every 5th step (≈ 40 snapshots / run)
-# Per-compound BASE_SEED so different compounds use disjoint seed ranges
-# (compound_idx * 100k offset).  Keeps filenames unique across compounds
-# even when regimes + idx coincide.
-_COMPOUND_SEED_OFFSET = list(COMPOUND_PRESETS).index(COMPOUND_NAME) * 100_000
-BASE_SEED = 400_000 + _COMPOUND_SEED_OFFSET
+
+# BASE_SEED is set per-polymorph at runtime via _polymorph_seed() so
+# different polymorphs use disjoint seed ranges and filenames are unique.
+# Polymorph idx i gets BASE_SEED_ROOT + i * 50_000.
+BASE_SEED_ROOT = 800_000
+
+# This module-level placeholder is overwritten per polymorph in main();
+# kept around because build_preset_samples / build_stratified_samples
+# read it directly.  See _set_polymorph_seed().
+BASE_SEED = BASE_SEED_ROOT
 
 # Multiprocessing.  None = serial (for debugging).  Integer = number of
 # worker processes.  A good default is half the physical cores to leave
@@ -461,23 +474,26 @@ _WORKER_SHELL_TARGET = None
 _WORKER_CELL_SIZE: float = 0.0
 _WORKER_REL_DENSITY: float = 0.0
 _WORKER_OUT_DIR: Path | None = None
+_WORKER_POLYMORPH_TAG: str = ""
 
 
 def _init_worker(
-    spec: "CompoundSpec",
+    polymorph: "PolymorphSpec",
     cif_dir_str: str,
     cell_size: float,
     rel_density: float,
     out_dir_str: str,
 ) -> None:
-    """Pool initializer: build the reference crystal + shell_target once."""
+    """Pool initializer: build the polymorph reference + shell_target once."""
     global _WORKER_REF, _WORKER_SHELL_TARGET
     global _WORKER_CELL_SIZE, _WORKER_REL_DENSITY, _WORKER_OUT_DIR
-    _WORKER_REF = _build_reference(spec, Path(cif_dir_str))
+    global _WORKER_POLYMORPH_TAG
+    _WORKER_REF = _build_polymorph_reference(polymorph, Path(cif_dir_str))
     _WORKER_SHELL_TARGET = CoordinationShellTarget.from_atoms(_WORKER_REF)
     _WORKER_CELL_SIZE = float(cell_size)
     _WORKER_REL_DENSITY = float(rel_density)
     _WORKER_OUT_DIR = Path(out_dir_str)
+    _WORKER_POLYMORPH_TAG = polymorph.tag
 
 
 def _run_one_worker(cfg: "SampleConfig") -> dict | None:
@@ -486,6 +502,7 @@ def _run_one_worker(cfg: "SampleConfig") -> dict | None:
         return run_trajectory(
             cfg, _WORKER_REF, _WORKER_SHELL_TARGET,
             _WORKER_CELL_SIZE, _WORKER_REL_DENSITY, _WORKER_OUT_DIR,
+            _WORKER_POLYMORPH_TAG,
         )
     except Exception as e:
         print(f"[{cfg.idx+1:4d}] FAILED: {type(e).__name__}: {e}", flush=True)
@@ -499,6 +516,7 @@ def run_trajectory(
     cell_size: float,
     rel_density: float,
     out_dir: Path,
+    polymorph_tag: str,
 ) -> dict[str, float | int | str]:
     """Run Supercell.generate for one sampled config; dump a .npz."""
     t0 = time.perf_counter()
@@ -516,6 +534,10 @@ def run_trajectory(
         nonbond_push_scale=cfg.nonbond_push_scale,
         displacement_sigma=cfg.displacement_sigma,
         crystalline_fraction=cfg.crystalline_fraction,
+        # v2 additions — see CONFIG block.  refine_orientations is a
+        # no-op when grain_size <= 0; k_restraint defaults to 0 (off).
+        refine_orientations=REFINE_ORIENTATIONS,
+        k_restraint=K_RESTRAINT,
     )
     if cfg.grain_size > 0.0:
         kwargs["grain_size"] = cfg.grain_size
@@ -532,10 +554,17 @@ def run_trajectory(
 
     h = sc.shell_relax_history
     filename = (
-        f"{COMPOUND.name}_{cfg.anchor_regime}_cell{int(cell_size):03d}_"
-        f"idx{cfg.idx:05d}_seed{cfg.rng_seed:09d}.npz"
+        f"{COMPOUND_NAME}_{polymorph_tag}_{cfg.anchor_regime}_"
+        f"cell{int(cell_size):03d}_idx{cfg.idx:05d}_"
+        f"seed{cfg.rng_seed:09d}.npz"
     )
     outfile = out_dir / filename
+
+    # Flatten the shell_target driving this trajectory into the four-array
+    # schema the relaxml model conditions on.  Same target for every pair
+    # in this trajectory (it's a per-trajectory constant), so we store it
+    # once per file.
+    shell_target_arrays = extract_shell_target_arrays(shell_target)
 
     np.savez(
         outfile,
@@ -547,10 +576,15 @@ def run_trajectory(
         species_numbers=sc.atoms.numbers.astype(np.int32),
         cell=np.asarray(sc.atoms.cell.array, dtype=np.float32),
         loss_history=h["loss"],                           # (num_steps+1,) float64
+        # Phase conditioning: shell_target arrays consumed by the
+        # ShellTargetEncoder in the relaxml model.
+        **shell_target_arrays,
         # Sampling metadata
         idx=np.int64(cfg.idx),
         source=np.asarray(cfg.source),
         regime=np.asarray(cfg.anchor_regime),
+        compound=np.asarray(COMPOUND_NAME),
+        polymorph=np.asarray(polymorph_tag),
         rng_seed=np.int64(cfg.rng_seed),
         # Structural parameters
         grain_size=np.float32(cfg.grain_size),
@@ -587,7 +621,8 @@ def run_trajectory(
 
     return {
         "idx": int(cfg.idx),
-        "compound": COMPOUND.name,
+        "compound": COMPOUND_NAME,
+        "polymorph": polymorph_tag,
         "source": cfg.source,
         "regime": cfg.anchor_regime,
         "rng_seed": int(cfg.rng_seed),
@@ -611,14 +646,21 @@ def run_trajectory(
     }
 
 
-def main() -> None:
-    out_dir = Path(OUTPUT_DIR)
+def _run_one_polymorph(polymorph: "PolymorphSpec", polymorph_idx: int) -> int:
+    """Generate trajectories for a single polymorph.  Returns the number
+    of successful trajectories written."""
+    out_dir = Path(DATASET_ROOT) / COMPOUND_NAME / f"{polymorph.tag}_trajectories"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if not CIF_DIR.is_dir():
-        raise SystemExit(f"CIF_DIR not found: {CIF_DIR}")
+    # Per-polymorph base seed so the seed ranges (and therefore filenames)
+    # don't collide across polymorphs.
+    polymorph_base_seed = BASE_SEED_ROOT + polymorph_idx * 50_000
+    # build_*_samples reads the module-level BASE_SEED, so we point that
+    # at the per-polymorph value for the duration of this call.
+    global BASE_SEED
+    BASE_SEED = polymorph_base_seed
 
-    ref = _build_reference(COMPOUND, CIF_DIR)
+    ref = _build_polymorph_reference(polymorph, CIF_DIR)
     shell_target = CoordinationShellTarget.from_atoms(ref)
 
     rng = np.random.default_rng(BASE_SEED)
@@ -629,54 +671,43 @@ def main() -> None:
     configs = preset_configs + stratified_configs
     total = len(configs)
     species_present = sorted({int(z) for z in ref.numbers})
-    cif_path = _resolve_cif(CIF_DIR, COMPOUND.cif_pattern, COMPOUND.name,
-                            COMPOUND.mp_id)
-    print(f"Compound: {COMPOUND.name}  CIF: {cif_path.name}")
-    print(f"Reference cell: {len(ref)} atoms, species Z={species_present}")
-    print(f"Cell volume: {ref.cell.volume:.2f} Å³  PBC={ref.pbc.tolist()}")
-    print(f"Supercell target: {CELL_SIZE} Å  base seed: {BASE_SEED}")
-    print(f"Running {total} configs  (presets={len(preset_configs)}, "
+    print()
+    print(f"━━━ Polymorph: {polymorph.tag}  CIF: {polymorph.cif_filename} ━━━")
+    print(f"  Reference cell: {len(ref)} atoms, species Z={species_present}")
+    print(f"  Cell volume: {ref.cell.volume:.2f} Å³  PBC={ref.pbc.tolist()}")
+    print(f"  shell_target: {len(shell_target.pair_labels)} pairs, "
+          f"{len(shell_target.angle_labels)} triplets (pre-filter)")
+    print(f"  Supercell target: {CELL_SIZE} Å  base seed: {BASE_SEED}")
+    print(f"  Running {total} configs  (presets={len(preset_configs)}, "
           f"stratified={len(stratified_configs)})")
-    counts = _stratum_counts(N_STRATIFIED_SAMPLES)
-    print("Stratum quotas (stratified tier only):")
-    for s, c in zip(REGIME_STRATA, counts):
-        print(f"  {s['name']:18s} range={s['gs_range']}  quota={s['quota']:.2f} -> {c}")
-    print(f"Output dir: {out_dir}\n")
+    print(f"  Output dir: {out_dir}")
 
     manifest: list[dict] = []
     t_start = time.perf_counter()
 
     if NUM_WORKERS is None or NUM_WORKERS <= 1:
-        print("Running serially (NUM_WORKERS <= 1)")
         for cfg in configs:
             try:
                 row = run_trajectory(
                     cfg, ref, shell_target, CELL_SIZE, REL_DENSITY, out_dir,
+                    polymorph.tag,
                 )
                 manifest.append(row)
             except Exception as e:
                 print(f"[{cfg.idx+1:4d}] FAILED: {type(e).__name__}: {e}")
     else:
-        print(f"Running in parallel with {NUM_WORKERS} workers")
-        # Using "spawn" for portability (macOS default, works everywhere).
         ctx = mp.get_context("spawn")
         with ctx.Pool(
             processes=NUM_WORKERS,
             initializer=_init_worker,
-            initargs=(COMPOUND, str(CIF_DIR), CELL_SIZE, REL_DENSITY, str(out_dir)),
+            initargs=(polymorph, str(CIF_DIR), CELL_SIZE, REL_DENSITY, str(out_dir)),
         ) as pool:
-            # imap_unordered to let fast configs return without blocking on
-            # slower ones.  chunksize=1 keeps load-balancing responsive for
-            # heterogeneous per-config runtimes.
-            for i, row in enumerate(
-                pool.imap_unordered(_run_one_worker, configs, chunksize=1)
-            ):
+            for row in pool.imap_unordered(_run_one_worker, configs, chunksize=1):
                 if row is not None:
                     manifest.append(row)
 
     elapsed = time.perf_counter() - t_start
 
-    # Write manifest CSV
     manifest_path = out_dir / "manifest.csv"
     if manifest:
         headers = list(manifest[0].keys())
@@ -686,9 +717,47 @@ def main() -> None:
             for row in manifest:
                 writer.writerow(row)
 
-    print(f"\nDone. Wrote {len(manifest)}/{total} trajectories to {out_dir}")
-    print(f"Manifest: {manifest_path}")
-    print(f"Total wall time: {elapsed:.1f}s  ({elapsed/max(total,1):.1f}s/config avg)")
+    print(f"  → {len(manifest)}/{total} trajectories  "
+          f"wall {elapsed:.1f}s  ({elapsed/max(total,1):.1f}s/config avg)")
+    print(f"  Manifest: {manifest_path}")
+    return len(manifest)
+
+
+def main() -> None:
+    if not CIF_DIR.is_dir():
+        raise SystemExit(f"CIF_DIR not found: {CIF_DIR}")
+    if not POLYMORPHS:
+        raise SystemExit("POLYMORPHS is empty — nothing to generate.")
+
+    # Validate every polymorph's CIF up front so we don't crash partway
+    # through a long run with a typo'd MP ID.
+    for p in POLYMORPHS:
+        cif_path = CIF_DIR / p.cif_filename
+        if not cif_path.is_file():
+            raise SystemExit(
+                f"Polymorph {p.tag!r}: CIF not found at {cif_path}"
+            )
+
+    counts = _stratum_counts(N_STRATIFIED_SAMPLES)
+    print(f"Compound: {COMPOUND_NAME}")
+    print(f"Polymorphs to generate: {len(POLYMORPHS)}")
+    for p in POLYMORPHS:
+        print(f"  {p.tag:24s}  {p.cif_filename}")
+    print(f"Per-polymorph: {N_STRATIFIED_SAMPLES} stratified samples")
+    print("Stratum quotas:")
+    for s, c in zip(REGIME_STRATA, counts):
+        print(f"  {s['name']:18s} range={s['gs_range']}  quota={s['quota']:.2f} -> {c}")
+    print(f"Cell size: {CELL_SIZE} Å  workers: {NUM_WORKERS}")
+
+    t_global = time.perf_counter()
+    total_rows = 0
+    for i, polymorph in enumerate(POLYMORPHS):
+        total_rows += _run_one_polymorph(polymorph, i)
+    elapsed = time.perf_counter() - t_global
+
+    print()
+    print(f"━━━ All polymorphs done.  Total: {total_rows} trajectories  "
+          f"wall {elapsed:.1f}s ({elapsed/3600:.2f} hr)")
 
 
 if __name__ == "__main__":

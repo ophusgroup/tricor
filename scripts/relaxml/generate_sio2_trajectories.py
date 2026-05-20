@@ -167,7 +167,7 @@ class PolymorphSpec:
 
 
 # CIF library on mallard, populated by mc_structgen/test/run_mp_nos.py.
-CIF_DIR = Path("/data/users/ehrdt/prod/cifs_mp_cnos")
+CIF_DIR = Path("/wigeon/users/ehrdt/prod/cifs_mp_cnos")
 
 # Polymorphs to generate this run.  Replace the placeholder mp-IDs below
 # with the actual filenames you have in CIF_DIR — find them with:
@@ -185,10 +185,11 @@ CIF_DIR = Path("/data/users/ehrdt/prod/cifs_mp_cnos")
 # For the held-out-phase test: leave one of these out of POLYMORPHS during
 # training, generate it separately afterwards, and evaluate on it.
 POLYMORPHS: list[PolymorphSpec] = [
-    PolymorphSpec("alpha_quartz",       "mp-7000_SiO2.cif"),
-    PolymorphSpec("alpha_cristobalite", "mp-6945_SiO2.cif"),
-    PolymorphSpec("beta_cristobalite",  "mp-546794_SiO2.cif"),
-    PolymorphSpec("coesite",            "mp-6930_SiO2.cif"),
+    # PolymorphSpec("alpha_quartz",       "mp-7000_SiO2.cif"),
+    # PolymorphSpec("alpha_cristobalite", "mp-6945_SiO2.cif"),
+    # PolymorphSpec("beta_cristobalite",  "mp-546794_SiO2.cif"),
+    # PolymorphSpec("coesite",            "mp-6930_SiO2.cif"),
+    PolymorphSpec("stishovite",         "mp-6947_SiO2.cif"),
 ]
 
 # Composition tag — used as the manifest's `compound` column and as the

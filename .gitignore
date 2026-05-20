@@ -16,3 +16,5 @@ scripts/*
 !scripts/relaxml/
 scripts/relaxml/lightning_logs
 data/
+scripts/relaxml/shelltgt_phys/lightning_logs
+scripts/relaxml/shelltgt_phys_v2/lightning_logs

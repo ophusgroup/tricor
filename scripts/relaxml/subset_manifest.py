@@ -19,14 +19,14 @@ from pathlib import Path
 # CONFIG — edit these
 # ─────────────────────────────────────────────────────────────────────────────
 
-SOURCE_MANIFEST = "./data/multicomp_trajectories_merged/manifest.csv"
-DESTINATION = "./data/multi_species_v1/merged_subset_Si"
+SOURCE_MANIFEST =  "./data/si-n-trajectories/manifest.csv" # "./data/multicomp_trajectories_merged/manifest.csv"
+DESTINATION = "./data/si-n-trajectories/300_subset"
 
 # Compounds to include + how many trajectories to keep per compound.
 # Selection is the first N rows in manifest order (deterministic; the
 # generator writes rows by stratum × idx so this gives balanced regimes).
-COMPOUNDS = ["Si", "SiC", "SiO2"]
-N_PER_COMPOUND = 500
+COMPOUNDS = ["Si", "SiC", "SiO2", "BN", "AlN"]
+N_PER_COMPOUND = 300
 
 # ─────────────────────────────────────────────────────────────────────────────
 

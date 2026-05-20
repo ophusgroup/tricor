@@ -1,5 +1,26 @@
 """Generate relaxation trajectories for training a multi-species GNN surrogate.
 
+Version 2 (2026-05-13): updated for the upstream tricor merge of May 2026.
+Same behavior as v1 EXCEPT:
+
+  * Passes the new ``refine_orientations`` kwarg to ``Supercell.generate``
+    (default True in this script — runs a cheap topology-free coordinate
+    descent over per-grain rotations before the FIRE quench, recommended
+    for directional-bond materials like Si and Si3N4).  No-op when
+    ``grain_size`` is 0 (liquid/amorphous regimes).
+
+  * Passes the new ``k_restraint`` kwarg (position-tether spring strength,
+    eV/Å²) — defaults to 0.0 (off) but can be raised to preserve regime
+    character (grain layout, amorphous topology) during relaxation when
+    grains tend to drift apart.
+
+  * Default ``DATASET_ROOT`` bumped to ``data/multi_species_v2`` so v2
+    outputs don't collide with v1 trajectories on disk.
+
+All other parameters (bond_weight, angle_weight, etc.) come from the same
+stratified sampler as v1.  The relax inner loop is whatever the merged
+upstream tricor provides.
+
 Uses the stratified sampler from diagnose_param_space (balanced regime coverage
 with n_crystalline >= 1 for crystalline strata).  Each sample yields one .npz
 with the full shell_relax trajectory, initial/final/best positions, species,
@@ -16,7 +37,7 @@ use the surrogate for large-scale structure generation should filter by
 best_loss (or a structure-based metric) at that stage instead.
 
 Edit the CONFIG section below, then run:
-    python generate_surrogate_trajectories.py
+    python generate_surrogate_trajectories_multicomp_v2.py
 """
 
 from __future__ import annotations
@@ -202,7 +223,7 @@ COMPOUND_PRESETS: dict[str, CompoundSpec] = {
 # Pick which compound this run generates.  Re-run with a different name to
 # build the next compound's dataset; outputs are siloed by name so they
 # don't collide.
-COMPOUND_NAME = "TiO2" #next: Al2O3?
+COMPOUND_NAME = "Si3N4" #next: Al2O3?
 
 # Optional: pin to a specific MP polymorph by mp-id (e.g. "mp-1143" for
 # Al2O3 corundum, "mp-2657" for TiO2 rutile, "mp-390" for TiO2 anatase).
@@ -218,7 +239,7 @@ COMPOUND_NAME = "TiO2" #next: Al2O3?
 # with different mp_ids don't collide (e.g. TiO2 rutile and TiO2 anatase
 # can coexist as ./data/multi_species_v1/TiO2_mp-2657_trajectories_150
 # and ./data/multi_species_v1/TiO2_mp-390_trajectories_150).
-MP_ID= "mp-390" #: str | None = None
+MP_ID: str | None = None
 
 COMPOUND = COMPOUND_PRESETS[COMPOUND_NAME]
 if MP_ID is not None:
@@ -232,17 +253,37 @@ if MP_ID is not None:
 # Each compound gets its own subdir under a shared root so the merge step
 # can union them all into one training manifest.  When MP_ID is pinned,
 # the mp-id goes into the dir name so different polymorphs don't collide.
-DATASET_ROOT = "./data/multi_species_v1"
+#
+# v2 default points at a separate root so v2 outputs don't overwrite v1
+# trajectories on disk.  Change to "./data/multi_species_v1" if you want
+# to add v2 trajectories alongside v1 (be aware they'll have different
+# relax behavior — the model's training distribution would be mixed).
+DATASET_ROOT = "./data/multi_species_v2"
 _dir_tag = f"{COMPOUND_NAME}_{COMPOUND.mp_id}" if COMPOUND.mp_id else COMPOUND_NAME
 OUTPUT_DIR = f"{DATASET_ROOT}/{_dir_tag}_trajectories_150"
 
 CELL_SIZE = 50.0                # Å — match the existing training data
 REL_DENSITY = 0.96
 
+# --- v2 additions: forwarded to Supercell.generate ---
+# Build-time per-grain orientation refinement.  Runs a cheap topology-free
+# coordinate-descent over per-grain rotations BEFORE the FIRE quench, so
+# FIRE starts from a better basin.  Only meaningful when grains exist
+# (no-op for liquid/amorphous strata where grain_size = 0).  Default True
+# in v2 because it helps directional-bond materials (Si, Si3N4, Si4-N3).
+REFINE_ORIENTATIONS = True
+
+# Position-tether spring strength (eV/Å²).  0.0 (default) disables.
+# Small values (~0.1-1.0) preserve regime character (grain layout,
+# amorphous topology) while permitting local relaxation.  Large values
+# (≫ 10) hold the structure rigid.  Useful when grains drift apart
+# during relaxation.
+K_RESTRAINT = 0.0
+
 # 750 stratified samples per compound × 5 compounds ≈ 3750 total — same
 # order of magnitude as the merged Si v2 dataset.
 N_PRESET_SAMPLES = 0
-N_STRATIFIED_SAMPLES = 150
+N_STRATIFIED_SAMPLES = 50
 
 N_STEPS_DEFAULT = 200
 TRAJECTORY_STRIDE = 5           # save every 5th step (≈ 40 snapshots / run)
@@ -516,6 +557,10 @@ def run_trajectory(
         nonbond_push_scale=cfg.nonbond_push_scale,
         displacement_sigma=cfg.displacement_sigma,
         crystalline_fraction=cfg.crystalline_fraction,
+        # v2 additions — see CONFIG block.  refine_orientations is a
+        # no-op when grain_size <= 0; k_restraint defaults to 0 (off).
+        refine_orientations=REFINE_ORIENTATIONS,
+        k_restraint=K_RESTRAINT,
     )
     if cfg.grain_size > 0.0:
         kwargs["grain_size"] = cfg.grain_size
