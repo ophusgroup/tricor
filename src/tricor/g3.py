@@ -530,6 +530,8 @@ class G3Distribution:
         show_progress: bool = False,
         progress_label: str | None = None,
         backend: str = "auto",
+        sample_fraction: float = 1.0,
+        sample_rng_seed: int | None = None,
     ) -> np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Measure the raw rooted three-body distribution.
 
@@ -710,6 +712,35 @@ class G3Distribution:
         origin_xyz_by_species = []
         for ind0 in range(self.num_species):
             origin_xyz_by_species.append(origin_xyz[origin_species_index == ind0, :])
+
+        # Optional Monte-Carlo subsampling of origin atoms.  For very
+        # large cells (e.g. 200³ Å × 600 k atoms) measuring every origin
+        # is wasteful: a uniform random subset preserves g(r) and g3
+        # shape with the same per-pair statistics as a smaller cell.
+        # The tile (all-neighbour) side is left intact - we just iterate
+        # over fewer centres.
+        #
+        # Sampling fraction f roughly recovers the cost of a cell with
+        # f × num_sites atoms; for a 200³ cell sampled at f = 1/125 the
+        # measurement takes the same time as a full 40³ cell, with the
+        # bonus that the underlying PBC is still the true 200³ PBC.
+        if sample_fraction < 1.0:
+            if sample_fraction <= 0.0:
+                raise ValueError("sample_fraction must be > 0.")
+            n_orig = origin_xyz.shape[0]
+            n_keep = max(1, int(round(n_orig * float(sample_fraction))))
+            rng = np.random.default_rng(sample_rng_seed)
+            picked = np.sort(rng.choice(n_orig, size=n_keep, replace=False))
+            origin_xyz = np.ascontiguousarray(origin_xyz[picked])
+            origin_species_index = np.ascontiguousarray(
+                origin_species_index[picked]
+            )
+            origin_xyz_by_species = [
+                origin_xyz[origin_species_index == ind0, :]
+                for ind0 in range(self.num_species)
+            ]
+        self._origin_sample_fraction = float(sample_fraction)
+        self._origin_sample_size = int(origin_xyz.shape[0])
 
         self.origin_xyz = origin_xyz
         self.origin_species_index = origin_species_index

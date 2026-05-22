@@ -561,19 +561,25 @@ class Supercell(
             # non-physical spike at exactly the cutoff radius (that's
             # exactly the artefact the user saw in the Cu liquid
             # panel).
-            from ._grain import _push_close_pairs_apart
-            hard_min = float(np.min(
-                np.asarray(shell_target.pair_hard_min, dtype=np.float64)
-            ))
-            push_cutoff = 0.35 * hard_min
-            self.atoms.positions = _push_close_pairs_apart(
-                self.atoms.positions,
-                self.atoms.numbers,
-                self.atoms.cell.array,
-                pbc=self.atoms.pbc,
-                push_cutoff=push_cutoff,
-                max_iter=40,
-            )
+            #
+            # Skip when num_steps=0 (caller opted out of FIRE) — in
+            # that case the caller is handling relaxation themselves
+            # (typically via :meth:`bond_relax`) which does its own
+            # overlap separation.  At 200³ Å this saves ~2 min.
+            if int(num_steps) > 0:
+                from ._grain import _push_close_pairs_apart
+                hard_min = float(np.min(
+                    np.asarray(shell_target.pair_hard_min, dtype=np.float64)
+                ))
+                push_cutoff = 0.35 * hard_min
+                self.atoms.positions = _push_close_pairs_apart(
+                    self.atoms.positions,
+                    self.atoms.numbers,
+                    self.atoms.cell.array,
+                    pbc=self.atoms.pbc,
+                    push_cutoff=push_cutoff,
+                    max_iter=40,
+                )
             self._rebuild_spatial_index()
             if atom_species_index is not None:
                 asp = np.asarray(atom_species_index, dtype=np.intp)
@@ -656,17 +662,28 @@ class Supercell(
             self.refine_initial_orientations(shell_target, **r_kwargs)
 
         # --- relax ---
-        summary = self.shell_relax(
-            shell_target,
-            num_steps=num_steps,
-            bond_weight=bond_weight,
-            angle_weight=angle_weight,
-            repulsion_weight=repulsion_weight,
-            hard_core_scale=hard_core_scale,
-            nonbond_push_scale=nonbond_push_scale,
-            show_progress=show_progress,
-            **shell_relax_kwargs,
-        )
+        if int(num_steps) > 0:
+            summary = self.shell_relax(
+                shell_target,
+                num_steps=num_steps,
+                bond_weight=bond_weight,
+                angle_weight=angle_weight,
+                repulsion_weight=repulsion_weight,
+                hard_core_scale=hard_core_scale,
+                nonbond_push_scale=nonbond_push_scale,
+                show_progress=show_progress,
+                **shell_relax_kwargs,
+            )
+        else:
+            # num_steps == 0: caller has opted out of FIRE.  Skip
+            # shell_relax entirely — it would otherwise spend ~90 s
+            # at 200³ Å rebuilding the bond topology before running
+            # zero relaxation steps.  Caller is presumably running
+            # their own relaxation afterwards (e.g. cell.bond_relax()).
+            summary = {
+                "backend": "fire",
+                "num_steps": 0,
+            }
 
         # --- summary ---
         ref_density = len(self.target_distribution.atoms) / max(
@@ -687,6 +704,134 @@ class Supercell(
         summary["actual_density"] = float(f"{actual_relative:.4f}")
 
         return summary
+
+    def bond_relax(
+        self,
+        shell_target,
+        n_iter: int = 40,
+        attract_frac: float = 0.2,
+        repel_frac: float = 1.0,
+        max_step: float = 0.2,
+    ) -> None:
+        """Combined attract-to-bond-peak + repel-from-hard-core sweep.
+
+        A fast O(N log N) alternative to a full FIRE relaxation for
+        cleaning up Voronoi-tiled or ML-predicted positions.  Each
+        iteration:
+
+        - Pulls bonded species pairs (those with non-zero
+          ``shell_target.coordination_target``) toward
+          ``shell_target.pair_peak``.
+        - Pushes any pair below ``shell_target.pair_hard_min`` apart.
+
+        Mutates ``self.atoms.positions`` in place.  Uses
+        :class:`scipy.spatial.cKDTree` so cost scales linearly with N
+        at constant density — at 200³ Å × 600 k atoms, ~1 s/iter on
+        CPU.  Drives Si-O to its 1.61 Å peak and non-bonded pairs
+        (Si-Si, O-O) onto their hard-core walls in 40-80 iterations.
+
+        Parameters
+        ----------
+        shell_target
+            The :class:`CoordinationShellTarget` whose
+            ``pair_peak`` / ``pair_hard_min`` / ``pair_outer`` /
+            ``coordination_target`` matrices drive the forces.
+        n_iter
+            Number of sweeps.  40 typically reaches the bond peak to
+            within 0.01 Å.
+        attract_frac
+            Per-sweep gap-closing fraction toward the bond peak.
+        repel_frac
+            Per-sweep gap-closing fraction away from the hard-core
+            wall.  ``1.0`` (default) closes the gap in one shot,
+            with ``max_step`` providing the safety against overshoot
+            in dense regions.
+        max_step
+            Per-atom displacement cap (Å) per sweep.
+        """
+        from ._pair_relax import _bond_relax_sweep
+
+        species_idx = (
+            getattr(self, "_atom_shell_species_index", None)
+            if getattr(self, "_atom_shell_species_index", None) is not None
+            else self._atom_species_index
+        )
+        box = np.diag(np.asarray(self.atoms.cell.array, dtype=np.float64))
+        pos = np.asarray(self.atoms.positions, dtype=np.float64)
+        pos = _bond_relax_sweep(
+            pos, box, np.asarray(species_idx),
+            pair_peak=np.asarray(shell_target.pair_peak, dtype=np.float64),
+            pair_hard_min=np.asarray(shell_target.pair_hard_min, dtype=np.float64),
+            pair_outer=np.asarray(shell_target.pair_outer, dtype=np.float64),
+            coordination_target=np.asarray(
+                shell_target.coordination_target, dtype=np.float64),
+            n_iter=int(n_iter),
+            attract_frac=float(attract_frac),
+            repel_frac=float(repel_frac),
+            max_step=float(max_step),
+        )
+        self.atoms.positions = pos
+        self._rebuild_spatial_index()
+
+    def enforce_hard_core(
+        self,
+        shell_target,
+        n_iter: int = 40,
+        push_fraction: float = 0.5,
+    ) -> None:
+        """Geometric projection step that clears hard-core overlaps.
+
+        Iteratively finds pairs below
+        ``shell_target.pair_hard_min`` (via :class:`scipy.spatial.cKDTree`)
+        and pushes each violating pair apart along their bond vector
+        by ``push_fraction × deficit``.  Pure geometry - no force
+        springs - so it cannot pull a pair through its wall the way
+        the FIRE finisher's bond springs can.  Use this as a final
+        cleanup whenever you suspect FIRE's bond-spring forces have
+        compressed pairs below their hard-core distance in dense
+        regions (a real failure mode at 100+ Å cells).
+
+        Mutates ``self.atoms.positions`` in place.  Cost: ~1 s per
+        sweep at 200³ Å × 600 k atoms; converges in roughly
+        ``O(log(initial_deficit / push_fraction))`` sweeps for
+        moderate overlaps, more for severe ones from a fresh Voronoi
+        tile.  Defaults are tuned to clear NB 01 / NB 02-scale
+        overlaps in a single call.
+
+        Parameters
+        ----------
+        shell_target
+            The :class:`CoordinationShellTarget` whose
+            ``pair_hard_min`` matrix sets the wall distances.
+        n_iter
+            Number of projection sweeps.  Early-terminates if no
+            violations remain.
+        push_fraction
+            Per-iter fraction of the deficit to close.  ``0.5``
+            (default) is the natural choice - both atoms move
+            symmetrically and meet in the middle.  Larger values
+            risk overshoot; smaller values just need more sweeps.
+        """
+        from ._pair_relax import _enforce_hard_core
+
+        species_idx = (
+            getattr(self, "_atom_shell_species_index", None)
+            if getattr(self, "_atom_shell_species_index", None) is not None
+            else self._atom_species_index
+        )
+        box = np.diag(np.asarray(self.atoms.cell.array, dtype=np.float64))
+        pos = np.asarray(self.atoms.positions, dtype=np.float64)
+        pos = _enforce_hard_core(
+            pos,
+            box,
+            np.asarray(species_idx),
+            pair_hard_min=np.asarray(
+                shell_target.pair_hard_min, dtype=np.float64),
+            n_iter=int(n_iter),
+            push_fraction=float(push_fraction),
+        )
+        self.atoms.positions = pos
+        self._rebuild_spatial_index()
 
     def __repr__(self) -> str:
         atom_count = len(self.atoms)

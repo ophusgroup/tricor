@@ -2,49 +2,39 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
-function makeColor(value, vmin, vmax, midpoint = null) {
-  const span = Math.max(vmax - vmin, 1e-12);
-  let t = clamp((value - vmin) / span, 0, 1);
-  const stops = [
-    [0.0, [19, 53, 97]],
-    [0.2, [61, 122, 176]],
-    [0.4, [150, 198, 226]],
-    [0.56, [247, 243, 226]],
-    [0.76, [233, 165, 84]],
-    [1.0, [134, 32, 39]],
-  ];
-  const coolStops = [
-    [0.0, [19, 53, 97]],
-    [0.38, [84, 151, 201]],
-    [0.72, [189, 220, 236]],
-    [1.0, [247, 243, 226]],
-  ];
-  const warmStops = [
-    [0.0, [247, 243, 226]],
-    [0.35, [250, 203, 141]],
-    [0.68, [219, 109, 71]],
-    [1.0, [134, 32, 39]],
-  ];
+// matplotlib RdBu_r — same stops as src/tricor/static/g3_viewer.html so
+// the in-notebook widget matches the docs-site g3 viewer.
+const RDBU_R_STOPS = [
+  [0.000, [  5,  48,  97]],
+  [0.100, [ 33, 102, 172]],
+  [0.250, [ 67, 147, 195]],
+  [0.400, [146, 197, 222]],
+  [0.480, [209, 229, 240]],
+  [0.500, [247, 247, 247]],
+  [0.520, [253, 219, 199]],
+  [0.600, [244, 165, 130]],
+  [0.750, [214,  96,  77]],
+  [0.900, [178,  24,  43]],
+  [1.000, [103,   0,  31]],
+];
 
+function makeColor(value, vmin, vmax, midpoint = null) {
+  // Centre the colormap on `midpoint` so 0.5 of the palette (white) lies
+  // at the random-limit baseline.  When midpoint is null fall back to
+  // linear mapping across [vmin, vmax].
+  let t;
   if (midpoint !== null && midpoint > vmin && midpoint < vmax) {
     if (value <= midpoint) {
-      t = 0.56 * clamp((value - vmin) / Math.max(midpoint - vmin, 1e-12), 0, 1);
+      t = 0.5 * clamp((value - vmin) / Math.max(midpoint - vmin, 1e-12), 0, 1);
     } else {
       t =
-        0.56 +
-        0.44 * clamp((value - midpoint) / Math.max(vmax - midpoint, 1e-12), 0, 1);
+        0.5 +
+        0.5 * clamp((value - midpoint) / Math.max(vmax - midpoint, 1e-12), 0, 1);
     }
-  }
-  if (midpoint !== null && midpoint >= vmax) {
+  } else {
     t = clamp((value - vmin) / Math.max(vmax - vmin, 1e-12), 0, 1);
-    return interpolateColor(coolStops, t);
   }
-  if (midpoint !== null && midpoint <= vmin) {
-    t = clamp((value - vmin) / Math.max(vmax - vmin, 1e-12), 0, 1);
-    return interpolateColor(warmStops, t);
-  }
-
-  return interpolateColor(stops, t);
+  return interpolateColor(RDBU_R_STOPS, t);
 }
 
 function interpolateColor(stops, t) {
@@ -63,6 +53,19 @@ function interpolateColor(stops, t) {
     Math.round(start + local * (right[1][idx] - start))
   );
   return `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
+}
+
+function niceRoundUp(v) {
+  // Snap an upper bound to a "nice" 1/2/4/5 × 10^k value (same as the
+  // docs-site g3 viewer) so the legend ticks land on round numbers.
+  if (v <= 0 || !Number.isFinite(v)) return 2.0;
+  const exp = Math.floor(Math.log10(v));
+  const mag = Math.pow(10, exp);
+  const mant = v / mag;
+  for (const m of [1, 2, 4, 5, 10]) {
+    if (mant <= m + 1e-9) return m * mag;
+  }
+  return 10 * mag;
 }
 
 function percentile(values, p) {
@@ -146,19 +149,20 @@ function drawHeatmap(canvas, imageValues, shape, rEdges, phiEdgesDeg, title, nor
   const phiCount = shape[0];
   const rCount = shape[1];
   const finiteValues = imageValues.filter((value) => Number.isFinite(value));
-  const autoVmax = Math.max(
+  // autoVmax: 99.5th-percentile, floor at 1.5 (so the white midpoint at
+  // 1.0 always sits inside the visible range), then snap to a "nice"
+  // round number — matches src/tricor/static/g3_viewer.html so the
+  // notebook widget renders the same scale as the docs-site g3 viewer.
+  const autoVmax = niceRoundUp(Math.max(
     percentile(finiteValues, 0.995) || 1,
-    normalize ? 1.001 : 1e-6
-  );
+    normalize ? 1.5 : 1e-6
+  ));
   const manualVmax = sliceMax > 0 ? sliceMax : null;
   const vmax = manualVmax ?? autoVmax;
   const vmin = 0;
-  const autoSpikeContrast = normalize && manualVmax === null;
-  const midpoint = autoSpikeContrast
-    ? vmax
-    : normalize
-      ? 1.0
-      : 0.5 * (vmin + vmax);
+  // Diverging RdBu_r centred at 1.0 when normalised (random-limit
+  // baseline = white), otherwise no midpoint (linear ramp).
+  const midpoint = normalize ? 1.0 : null;
   const phiToY = (phiDeg) =>
     margin.top + plotHeight - phiToNormalized(phiDeg) * plotHeight;
 

@@ -16,8 +16,6 @@ keywords = [
     "atomic-supercell",
     "amorphous",
     "nanocrystalline",
-    "machine-learning-potentials",
-    "training-data",
     "three-body-correlation",
     "voronoi",
     "ase",
@@ -60,10 +58,6 @@ Repository = "https://github.com/ophusgroup/tricor"
 Issues = "https://github.com/ophusgroup/tricor/issues"
 
 [project.optional-dependencies]
-data = [
-    "h5py",
-    "zarr",
-]
 test = [
     "pytest>=7.0",
 ]
