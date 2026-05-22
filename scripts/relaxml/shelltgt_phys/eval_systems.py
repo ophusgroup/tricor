@@ -37,11 +37,11 @@ CHECKPOINT = (
 # Root of the curated eval set (output of curate_eval_set.py).  Must
 # contain per-system subdirs ``<compound>_<mp_id>_trajectories/`` whose
 # .npz files have shell_target arrays already retrofitted.
-EVAL_SET_ROOT = "/wigeon/users/ehrdt/prod/eval_set_v1"
+EVAL_SET_ROOT = "/wigeon/users/ehrdt/prod/eval_set_2d"
 
 # Output root for plots and XYZ trajectories.  Each system gets a
 # subdir under this root containing ``plots/`` and ``xyz/``.
-OUTPUT_ROOT = "/home/ehrdt/tricor/eval_results/516_struct_v1"
+OUTPUT_ROOT = "/home/ehrdt/tricor/eval_results/516_struct_v1_2d"
 
 # When True, evaluate one sample per regime (6 total per system, fast).
 # When False, evaluate every .npz in the system subdir (20 per system,
@@ -72,9 +72,16 @@ import sys
 import time
 from pathlib import Path
 
-# Add the shelltgt_phys script dir to sys.path so we can import evaluate.py.
+# Add the dir holding evaluate.py to sys.path.  Works whether this
+# script sits in scripts/relaxml/ or alongside evaluate.py in
+# scripts/relaxml/shelltgt_phys/.
 _HERE = Path(__file__).resolve().parent
-_EVAL_DIR = _HERE / "shelltgt_phys"
+for _cand in (_HERE, _HERE / "shelltgt_phys"):
+    if (_cand / "evaluate.py").is_file():
+        _EVAL_DIR = _cand
+        break
+else:
+    raise SystemExit("eval_systems.py: could not locate evaluate.py")
 sys.path.insert(0, str(_EVAL_DIR))
 
 import torch

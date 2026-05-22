@@ -37,9 +37,15 @@ import numpy as np
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-SOURCE_ROOT = Path("/wigeon/users/ehrdt/prod/relaxml_big_rest")
+# System subdirs are searched for under each SOURCE_ROOTS entry in order,
+# so an eval set can mix in-distribution (relaxml_big_v1) and held-out
+# (relaxml_big_rest) systems.
+SOURCE_ROOTS = [
+    Path("/wigeon/users/ehrdt/prod/relaxml_big_v1"),
+    Path("/wigeon/users/ehrdt/prod/relaxml_big_rest"),
+]
 CIF_DIR     = Path("/wigeon/users/ehrdt/prod/cifs_mp_cnos_le100meV")
-TARGET_ROOT = Path("/wigeon/users/ehrdt/prod/eval_set_v1")
+TARGET_ROOT = Path("/wigeon/users/ehrdt/prod/eval_set_2d")
 
 # Whether to retrofit shell_target arrays into the copied .npz files.
 # Required for the dataloader to load these at eval time.  Idempotent —
@@ -47,30 +53,23 @@ TARGET_ROOT = Path("/wigeon/users/ehrdt/prod/eval_set_v1")
 RETROFIT = True
 
 # Curated eval systems.  (compound_formula, mp_id) — the corresponding
-# subdir under SOURCE_ROOT must be named ``{compound}_{mp_id}_trajectories``.
-# Molecular-solid crystals (CO2, CCl4, etc.) intentionally excluded —
-# their van-der-Waals-dominated bonding is too far from the training
-# distribution of network/ionic/intermetallic solids to give a useful
-# OOD signal.
+# subdir ``{compound}_{mp_id}_trajectories`` is searched for under each
+# SOURCE_ROOTS entry in order.
+#
+# This run: a 2-D-materials probe.  tricor's shell_relax struggles with
+# van-der-Waals-gapped structures, and download_cif_library.py currently
+# drops all 710 2-D layered solids (KEEP_DIMENSIONALITY={3}).  This eval
+# checks how the surrogate actually handles layered materials and whether
+# that exclusion is justified.
 SYSTEMS: list[tuple[str, str]] = [
-    # ── Axis 1: cross-polymorph (formula seen in training, different mp_id) ──
-    ("Ag2S",  "mp-1095694"),
-    ("Ag2S",  "mp-1102900"),
-    ("BaO",   "mp-1008500"),
-    ("C",     "mp-1040425"),
-    ("Cr3N2", "mp-1014303"),
-
-    # ── Axis 2: cross-composition with a new element pair ──
-    #     Ordered easy → hard by min element coverage in training:
-    #     ZnO (Zn:18), Rb2O (Rb:12), Nb2O5 (Nb:11) are positive
-    #     controls — well-trained elements never paired in training.
-    #     AgO (Ag:4), Bi2O3 (Bi:4) are the harder regime where pair
-    #     generalization has to compensate for thin metal-side coverage.
-    ("ZnO",   "mp-1093993"),
-    ("Rb2O",  "mp-1101405"),
-    ("Nb2O5", "mp-1101660"),
-    ("AgO",   "mp-1065190"),
-    ("Bi2O3", "mp-1017552"),
+    # In-distribution reference (was in the 516-CIF training set):
+    ("C",     "mp-48"),         # graphite — graphene layers
+    # Held-out 2-D (relaxml_big_rest — never trained on):
+    ("LiC12", "mp-1021323"),    # graphite-intercalation, carbon layers
+    ("MoS2",  "mp-1018809"),    # classic 2-D TMD
+    ("ZrS2",  "mp-1186"),       # layered TMD
+    ("SnS2",  "mp-1170"),       # layered
+    ("VS2",   "mp-1178763"),    # layered TMD
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -81,12 +80,16 @@ def _subdir_name(compound: str, mp_id: str) -> str:
 
 
 def _copy_system(compound: str, mp_id: str) -> tuple[int, int]:
-    """Copy one system's trajectories + manifest from SOURCE_ROOT to
-    TARGET_ROOT.  Returns (n_copied, n_skipped)."""
-    src = SOURCE_ROOT / _subdir_name(compound, mp_id)
-    dst = TARGET_ROOT / _subdir_name(compound, mp_id)
-    if not src.is_dir():
-        raise FileNotFoundError(f"Source not found: {src}")
+    """Copy one system's trajectories + manifest into TARGET_ROOT.  The
+    system subdir is searched for under each SOURCE_ROOTS entry in order.
+    Returns (n_copied, n_skipped)."""
+    subdir = _subdir_name(compound, mp_id)
+    src = next((r / subdir for r in SOURCE_ROOTS if (r / subdir).is_dir()),
+               None)
+    if src is None:
+        raise FileNotFoundError(
+            f"Source not found in any SOURCE_ROOTS: {subdir}")
+    dst = TARGET_ROOT / subdir
 
     dst.mkdir(parents=True, exist_ok=True)
 
@@ -188,14 +191,15 @@ def _retrofit_subdir(compound: str, mp_id: str) -> tuple[int, int, int]:
 
 
 def main() -> None:
-    if not SOURCE_ROOT.is_dir():
-        raise SystemExit(f"SOURCE_ROOT not found: {SOURCE_ROOT}")
+    missing = [str(r) for r in SOURCE_ROOTS if not r.is_dir()]
+    if missing:
+        raise SystemExit(f"SOURCE_ROOTS not found: {missing}")
     if RETROFIT and not CIF_DIR.is_dir():
         raise SystemExit(f"CIF_DIR not found: {CIF_DIR}")
 
     TARGET_ROOT.mkdir(parents=True, exist_ok=True)
     print(f"Curating {len(SYSTEMS)} systems")
-    print(f"  Source: {SOURCE_ROOT}")
+    print(f"  Sources: {[str(r) for r in SOURCE_ROOTS]}")
     print(f"  Target: {TARGET_ROOT}")
     print(f"  Retrofit shell_target: {RETROFIT}")
     print()
