@@ -14,6 +14,8 @@ src/tricor/.DS_Store
 docs/_build/
 scripts/*
 !scripts/relaxml/
+!scripts/macerelax
+scripts/macerelax/lightning_logs
 scripts/relaxml/lightning_logs
 data/
 scripts/relaxml/shelltgt_phys/lightning_logs
