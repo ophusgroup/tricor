@@ -705,6 +705,228 @@ class Supercell(
 
         return summary
 
+    # ------------------------------------------------------------------
+    # generate_graded: single structure with a spatial disorder gradient
+    # ------------------------------------------------------------------
+
+    # Smooth, period-1 order profiles f(s) -> [0, 1] over the fractional
+    # coordinate s along the long axis.  Both are periodic so the cell's
+    # long-axis wrap joins like-to-like (symmetric-periodic boundary):
+    #   * "cosine_disordered_ends": order 0 at s=0/1 (disordered ends meet
+    #     at the wrap), order 1 at s=0.5 (ordered core).
+    #   * "cosine_ordered_ends": the inverse (ordered ends, disordered core).
+    GRADED_PROFILES: dict[str, "Any"] = {
+        "cosine_disordered_ends": lambda s: 0.5 * (1.0 - np.cos(2.0 * np.pi * s)),
+        "cosine_ordered_ends":    lambda s: 0.5 * (1.0 + np.cos(2.0 * np.pi * s)),
+    }
+
+    def _resolve_order_profile(self, order_profile):
+        """Turn a name or callable into a callable f(s_array) -> order_array."""
+        if callable(order_profile):
+            return order_profile
+        try:
+            return self.GRADED_PROFILES[order_profile]
+        except KeyError:
+            raise ValueError(
+                f"Unknown order_profile {order_profile!r}; expected a callable "
+                f"or one of {sorted(self.GRADED_PROFILES)}."
+            )
+
+    def graded_order_coordinate(self, positions: np.ndarray | None = None) -> np.ndarray:
+        """Per-atom order coordinate in [0, 1] from the graded profile.
+
+        Returns 0 (fully disordered) → 1 (fully ordered) for each atom,
+        evaluated from its fractional position along the long axis.  Only
+        valid after :meth:`generate_graded`.  Handy for colouring an
+        extxyz dump or binning a per-slab order metric.
+        """
+        if getattr(self, "_graded_order_profile", None) is None:
+            raise RuntimeError(
+                "graded_order_coordinate() requires a prior generate_graded() call."
+            )
+        if positions is None:
+            positions = self.atoms.positions
+        axis = self._graded_long_axis
+        length = float(self._build_supercell_cell()[axis, axis])
+        s = np.mod(np.asarray(positions, dtype=np.float64)[:, axis] / length, 1.0)
+        return np.asarray(self._graded_order_profile(s), dtype=np.float64)
+
+    def generate_graded(
+        self,
+        shell_target: "CoordinationShellTarget",
+        *,
+        long_axis: int = 2,
+        order_profile="cosine_disordered_ends",
+        grain_size_min: float = 6.0,
+        grain_size_max: float = 30.0,
+        crystalline_prob_min: float = 0.0,
+        crystalline_prob_max: float = 1.0,
+        crystalline_prob_gamma: float = 1.0,
+        displacement_sigma: float = 0.0,
+        num_steps: int = 0,
+        bond_weight: float = 3.0,
+        angle_weight: float = 1.5,
+        repulsion_weight: float = 3.0,
+        hard_core_scale: float = 1.0,
+        nonbond_push_scale: float = 1.0,
+        show_progress: bool = True,
+        **shell_relax_kwargs: Any,
+    ) -> dict[str, Any]:
+        """Build a single supercell whose disorder varies along one axis.
+
+        Realises a continuous spectrum from amorphous to crystalline within
+        one structure: grains are placed by *variable-density* Poisson
+        seeding (small, dense grains where disorder is high; large, sparse
+        grains where order is high) and each grain is independently made
+        crystalline or amorphous with a *position-dependent* probability.
+        Density is held constant along the axis (only the structural order
+        changes); use an anisotropic ``cell_dim_angstroms`` (e.g.
+        ``[40, 40, 240]``) to get a long axis worth gradating.
+
+        The intended use is to pack with ``num_steps=0``, run
+        :meth:`bond_relax` for geometric cleanup, then relax with an
+        external MLIP (MACE+wall) for only a *few* steps — see
+        ``MACE_RELAX_PILOT.md`` §2g: MACE collapses the order gradient into
+        a common glassy basin after ~40-50 steps, so a graded structure
+        must stop early to keep its spatial gradient.
+
+        Parameters
+        ----------
+        shell_target
+            First-shell coordination targets from the reference crystal.
+        long_axis
+            Axis index (0/1/2) the gradient runs along.
+        order_profile
+            Name in :attr:`GRADED_PROFILES` or a callable ``f(s) -> [0, 1]``
+            over the fractional long-axis coordinate ``s in [0, 1)``.  Must
+            be period-1 so the long-axis wrap joins like-to-like.
+        grain_size_min, grain_size_max
+            Grain diameter (Å) at order 0 (disordered) and order 1 (ordered).
+        crystalline_prob_min, crystalline_prob_max
+            Probability a grain is crystalline at order 0 and order 1.
+        crystalline_prob_gamma
+            Exponent sharpening the order→crystalline-probability map
+            (``p = p_min + (p_max - p_min) * order**gamma``); >1 pushes the
+            ends more firmly toward pure amorphous / pure crystalline.
+        displacement_sigma
+            Optional Gaussian thermal jitter (Å) on all atoms; 0 = none.
+        num_steps
+            Forwarded to :meth:`shell_relax`.  Default 0 = pack only (the
+            recommended path: do cleanup + relaxation externally).
+        Returns
+        -------
+        dict[str, Any]
+            Summary including ``regime="graded"`` and the gradient settings.
+        """
+        if long_axis not in (0, 1, 2):
+            raise ValueError("long_axis must be 0, 1 or 2.")
+        if not (0.0 < grain_size_min <= grain_size_max):
+            raise ValueError(
+                "require 0 < grain_size_min <= grain_size_max."
+            )
+        profile = self._resolve_order_profile(order_profile)
+        self._shell_target = shell_target
+
+        box_dim = np.diag(self._build_supercell_cell()).astype(np.float64)
+        V_box = float(np.prod(box_dim))
+        L_axis = float(box_dim[long_axis])
+
+        def _grain_size_at(order):
+            return grain_size_min + (grain_size_max - grain_size_min) * order
+
+        def _grain_volume_at(order):
+            return (4.0 / 3.0) * np.pi * (0.5 * _grain_size_at(order)) ** 3
+
+        # ---- Variable-density seeding via Poisson thinning ----
+        # The densest seeds (smallest grains) occur at order 0, so the
+        # homogeneous proposal density is lambda_max = 1 / V_grain(order=0).
+        # Each candidate at fractional coordinate s survives with
+        # probability lambda(s)/lambda_max = V_grain(0)/V_grain(order(s)).
+        v_grain_min = _grain_volume_at(0.0)   # smallest grains → most seeds
+        lambda_max = 1.0 / v_grain_min
+        n_candidates = max(1, int(round(lambda_max * V_box)))
+        cand = self.rng.random((n_candidates, 3)) * box_dim
+        s_cand = cand[:, long_axis] / L_axis
+        order_cand = np.clip(np.asarray(profile(s_cand), dtype=np.float64), 0.0, 1.0)
+        keep_prob = v_grain_min / _grain_volume_at(order_cand)
+        seeds = cand[self.rng.random(n_candidates) < keep_prob]
+        if len(seeds) == 0:                   # degenerate (tiny box) fallback
+            seeds = cand[:1]
+
+        # ---- Position-dependent crystalline probability per grain ----
+        order_seed = np.clip(
+            np.asarray(profile(seeds[:, long_axis] / L_axis), dtype=np.float64),
+            0.0, 1.0,
+        )
+        p_cryst = crystalline_prob_min + (
+            crystalline_prob_max - crystalline_prob_min
+        ) * order_seed ** float(crystalline_prob_gamma)
+        is_crystalline = self.rng.random(len(seeds)) < p_cryst
+
+        # ---- Build atoms via the (override-aware) grain builder ----
+        self.atoms = self._build_grain_atoms(
+            shell_target,
+            grain_size=float(grain_size_max),     # cosmetic / radius floor
+            displacement_sigma=displacement_sigma,
+            seeds_override=seeds,
+            is_crystalline_override=is_crystalline,
+        )
+
+        # Refresh cached arrays after rebuilding atoms (mirror generate()).
+        self._cell_matrix = np.asarray(self.atoms.cell.array, dtype=np.float64)
+        self._cell_inverse = np.linalg.inv(self._cell_matrix)
+        self._atom_species_index = np.searchsorted(
+            self._species, self.atoms.numbers,
+        )
+        self._rebuild_spatial_index()
+
+        # Stash gradient state so graded_order_coordinate() can recover it.
+        self._graded_order_profile = profile
+        self._graded_long_axis = int(long_axis)
+
+        # ---- optional relax ----
+        if int(num_steps) > 0:
+            summary = self.shell_relax(
+                shell_target,
+                num_steps=num_steps,
+                bond_weight=bond_weight,
+                angle_weight=angle_weight,
+                repulsion_weight=repulsion_weight,
+                hard_core_scale=hard_core_scale,
+                nonbond_push_scale=nonbond_push_scale,
+                show_progress=show_progress,
+                **shell_relax_kwargs,
+            )
+        else:
+            summary = {"backend": "fire", "num_steps": 0}
+
+        ref_density = len(self.target_distribution.atoms) / max(
+            float(self.target_distribution.atoms.cell.volume), _EPS,
+        )
+        actual_density = len(self.atoms) / max(float(self.atoms.cell.volume), _EPS)
+
+        summary["regime"] = "graded"
+        summary["long_axis"] = int(long_axis)
+        summary["order_profile"] = (
+            order_profile if isinstance(order_profile, str) else "callable"
+        )
+        summary["grain_size_min"] = float(grain_size_min)
+        summary["grain_size_max"] = float(grain_size_max)
+        summary["crystalline_prob_min"] = float(crystalline_prob_min)
+        summary["crystalline_prob_max"] = float(crystalline_prob_max)
+        summary["crystalline_prob_gamma"] = float(crystalline_prob_gamma)
+        summary["n_grains"] = int(len(seeds))
+        summary["n_crystalline_grains"] = int(np.sum(is_crystalline))
+        summary["crystalline_fraction"] = float(
+            np.mean(is_crystalline) if len(is_crystalline) else 0.0
+        )
+        summary["num_atoms"] = len(self.atoms)
+        summary["target_density"] = self.relative_density
+        summary["actual_density"] = float(
+            f"{actual_density / max(ref_density, _EPS):.4f}"
+        )
+        return summary
+
     def bond_relax(
         self,
         shell_target,

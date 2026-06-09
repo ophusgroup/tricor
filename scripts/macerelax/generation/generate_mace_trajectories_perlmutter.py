@@ -1,4 +1,24 @@
-"""CIF-list-driven MACE+wall trajectory generation for the big dataset.
+"""Perlmutter (multi-node SLURM) variant of generate_mace_trajectories.py.
+
+Functionally identical to the local-machine script except for one addition:
+when launched under SLURM (SLURM_JOB_NUM_NODES > 1), each node takes a
+round-robin slice of the CIF index range based on SLURM_NODEID before
+spawning its per-GPU workers.  Local single-machine runs (no SLURM env)
+behave exactly like the sibling script.
+
+Recommended launch path on Perlmutter:
+    sbatch scripts/macerelax/generation/perlmutter_generate.sbatch
+
+The sbatch file launches one srun task per node; this script's main()
+reads SLURM_NODEID / SLURM_JOB_NUM_NODES at startup, partitions the
+CIF list across nodes, then _spawn_workers further partitions across
+the 4 GPUs visible to this node.
+
+Original docstring follows.
+
+────────────────────────────────────────────────────────────────────────
+
+CIF-list-driven MACE+wall trajectory generation for the big dataset.
 
 Walks a CIF directory (or a list file restricting it to a subset), generates
 N_TRAJ_PER_CIF stratified-regime trajectories per CIF, and writes them under
@@ -184,7 +204,7 @@ def _build_local_presets() -> dict:
     base = {}
     for name in REGIME_STRATA:
         if name == "crystalline_30":
-            continue   # synthesized below; not in tricor's PRESETS
+            continue   # synthesized below from tricor's PRESETS isn't applicable
         d = dict(tc.Supercell.PRESETS[name])
         d["displacement_sigma"] = 0.0
         base[name] = d
@@ -922,9 +942,38 @@ def run_cif(cif_path: Path, cif_idx: int, n_cifs: int, calc,
 # ── Multi-GPU partitioning (CIF-index round-robin) ───────────────────────────
 
 
-def _spawn_workers(cif_paths: list[Path]) -> int:
+def _slurm_node_partition(n_cifs: int) -> list[int]:
+    """Return the CIF indices this SLURM node should process.
+
+    Reads SLURM_JOB_NUM_NODES and SLURM_NODEID from the environment.  When
+    not under SLURM (single-machine launch) both default to 1/0 and this
+    returns the full range, behaving identically to the local script.
+
+    Partition is round-robin across nodes so each node sees a mix of
+    big/small/dense CIFs (the CIF list is alphabetical, so contiguous
+    slices would be unbalanced).
+    """
+    n_nodes = int(os.environ.get("SLURM_JOB_NUM_NODES", "1"))
+    node_rank = int(os.environ.get("SLURM_NODEID", "0"))
+    if not (0 <= node_rank < n_nodes):
+        raise SystemExit(
+            f"SLURM_NODEID={node_rank} out of range for "
+            f"SLURM_JOB_NUM_NODES={n_nodes}"
+        )
+    indices = [i for i in range(n_cifs) if i % n_nodes == node_rank]
+    if n_nodes > 1:
+        print(f"[slurm] node {node_rank}/{n_nodes}: assigned "
+              f"{len(indices)}/{n_cifs} CIFs")
+    return indices
+
+
+def _spawn_workers(cif_paths: list[Path], cif_indices: list[int]) -> int:
     """Master mode: spawn one worker subprocess per GPU in GPU_IDS, partitioning
-    CIF indices round-robin.  Returns aggregate non-zero exit count.
+    the provided CIF index slice round-robin across the node's GPUs.
+
+    `cif_indices` is the node-level slice (from _slurm_node_partition); each
+    GPU worker gets a further round-robin subset of these.  Returns aggregate
+    non-zero exit count.
     """
     import subprocess
 
@@ -932,11 +981,21 @@ def _spawn_workers(cif_paths: list[Path]) -> int:
     log_dir = DATASET_ROOT / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    # Node label for log filenames (so multi-node runs don't clobber each
+    # other's logs).  Empty string when single-node — preserves the simpler
+    # gpuN.log naming on a workstation.
+    node_label = ""
+    if int(os.environ.get("SLURM_JOB_NUM_NODES", "1")) > 1:
+        node_label = f"node{os.environ.get('SLURM_NODEID', '0')}_"
+
     procs: list[tuple[int, subprocess.Popen, Path]] = []
-    print(f"Spawning {n_workers} worker(s) across GPUs {GPU_IDS}")
-    n_cifs = len(cif_paths)
+    print(f"Spawning {n_workers} worker(s) across GPUs {GPU_IDS}  "
+          f"(this node: {len(cif_indices)} CIFs)")
     for partition_idx, gpu in enumerate(GPU_IDS):
-        my_indices = [i for i in range(n_cifs)
+        # Round-robin the node's slice across its GPUs.  Indices are CIF
+        # indices in the global cif_paths list — preserved so per-CIF
+        # seeds stay deterministic across the cluster.
+        my_indices = [cif_indices[i] for i in range(len(cif_indices))
                       if i % n_workers == partition_idx]
         if not my_indices:
             print(f"  GPU {gpu}: no CIFs in partition, skipping")
@@ -947,13 +1006,16 @@ def _spawn_workers(cif_paths: list[Path]) -> int:
             "PILOT_CIF_INDICES": ",".join(str(i) for i in my_indices),
             "PYTORCH_CUDA_ALLOC_CONF": os.environ.get(
                 "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
-            # Force unbuffered stdout so per-trajectory `print(...)` lines
-            # flush to the log file as they happen instead of waiting for
-            # the ~4 KB block buffer to fill.  Equivalent to `python -u`.
+            # Force unbuffered stdout in the child so per-trajectory
+            # `print(...)` lines flush to the log file as they happen
+            # instead of waiting for the ~4 KB block buffer to fill.
+            # Equivalent to running `python -u`.
             "PYTHONUNBUFFERED": "1",
         }
-        log_path = log_dir / f"gpu{gpu}.log"
+        log_path = log_dir / f"{node_label}gpu{gpu}.log"
         log_fh = log_path.open("w")
+        # Belt-and-suspenders: `-u` on the command line too, in case
+        # PYTHONUNBUFFERED gets stripped by some intermediate launcher.
         cmd = [sys.executable, "-u", str(Path(__file__).resolve())]
         proc = subprocess.Popen(cmd, env=env, stdout=log_fh,
                                  stderr=subprocess.STDOUT)
@@ -1010,7 +1072,12 @@ def main() -> None:
 
     is_worker = bool(os.environ.get("PILOT_CIF_INDICES", "").strip())
     if len(GPU_IDS) >= 1 and not is_worker:
-        fail = _spawn_workers(cif_paths)
+        # Multi-node partition first: each SLURM node takes a round-robin
+        # slice of the full CIF list, then _spawn_workers further partitions
+        # that slice across the node's 4 GPUs.  Off-SLURM single-machine
+        # runs get the full range here (n_nodes=1, node_rank=0).
+        this_node_cif_indices = _slurm_node_partition(len(cif_paths))
+        fail = _spawn_workers(cif_paths, this_node_cif_indices)
         if fail:
             raise SystemExit(f"{fail} worker(s) exited with errors")
         return
@@ -1019,13 +1086,17 @@ def main() -> None:
     indices_to_run = _parse_cif_indices_env(n_cifs)
 
     # Partition-aware sidecar paths so concurrent workers don't clobber each
-    # other.  The "_p" suffix encodes this worker's partition by GPU label
-    # (read from CUDA_VISIBLE_DEVICES) when running under _spawn_workers.
+    # other.  Under SLURM the suffix encodes both node and GPU; on a single
+    # box it encodes just the GPU.  Calibration cache stays unsuffixed so
+    # all workers share it (atomic append + disjoint partitions = safe).
     suffix = ""
     raw = os.environ.get("PILOT_CIF_INDICES", "").strip()
     if raw:
+        node_part = ""
+        if int(os.environ.get("SLURM_JOB_NUM_NODES", "1")) > 1:
+            node_part = f"n{os.environ.get('SLURM_NODEID', '0')}_"
         gpu_label = os.environ.get("CUDA_VISIBLE_DEVICES", "x")
-        suffix = f"_p{gpu_label}"
+        suffix = f"_p{node_part}g{gpu_label}"
     manifest_path = DATASET_ROOT / f"manifest_all{suffix}.csv"
     failure_log = DATASET_ROOT / f"failures{suffix}.csv"
     # Calibration cache is SHARED across workers — every worker reads the

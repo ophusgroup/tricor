@@ -31,7 +31,9 @@ Key differences vs the relaxml version:
      model checkpoint's eval results sit next to the run that produced
      them.
 
-Run:
+Run (either env works — `mace` is the superset, `tricor` lacks the `mace`
+package but doesn't need it here since evaluate.py never calls `mace_mp`):
+    /home/ehrdt/miniforge3/envs/mace/bin/python   scripts/macerelax/evaluate.py
     /home/ehrdt/miniforge3/envs/tricor/bin/python scripts/macerelax/evaluate.py
 """
 
@@ -44,7 +46,7 @@ GPU_ID = 0
 NUM_THREADS = 2
 
 # --- what to evaluate ---
-# Experiment name from mace/make_experiment_manifests.py.  Picks the most
+# Experiment name from scripts/macerelax/generation/make_experiment_manifests.py.  Picks the most
 # recent ``lightning_logs/<EXPERIMENT_NAME>/version_*`` by default; override
 # with VERSION if you want a specific run.
 EXPERIMENT_NAME = "polymoproh_test_stride5_v2_no_st_dropout_wd1e-5" #"composition_test_stride5_v3_no_st_dropout_wd1e-5"
@@ -679,7 +681,7 @@ def evaluate_one(model, npz_path: Path, device,
         if "shell_pair_species" not in npz.files:
             raise KeyError(
                 f"{npz_path.name} has no shell_target arrays. Run "
-                f"mace/add_shell_target_to_pilot.py first."
+                f"scripts/macerelax/generation/add_shell_target_to_pilot.py first."
             )
         shell_target = {
             "shell_pair_species":     np.asarray(npz["shell_pair_species"]),

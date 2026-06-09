@@ -1,15 +1,26 @@
-"""Step-by-step MACE+wall relaxation surrogate — fork of
-tricor.relaxml.model_shelltgt.
+"""DDP-aware variant of tricor.macerelax.model for multi-GPU training.
 
-Architecturally identical to the relaxml baseline:
-  - global per-graph conditioning vector (NUM_WEIGHT_FEATURES, see
-    .data — 6 for the MACE pilot vs 9 for the shell_relax baseline)
-  - per-graph shell_target conditioning (ShellTargetEncoder; same as
-    relaxml — composition-intrinsic, works for MACE trajectories too)
+Architecturally identical to model.py.  The only changes are inside
+LitRelaxML to make Lightning's training loop behave correctly under DDP:
 
-The WeightEncoder input dim adapts automatically via num_weight_features
-default. No other model code changes vs relaxml. See MACE_RELAX_PILOT.md
-for the reasoning on what conditioning fields apply to MACE+wall.
+  1. Every self.log() call in training_step / validation_step adds
+     ``sync_dist=True`` so the metric is all-reduced across ranks before
+     being shown in TensorBoard / consumed by EarlyStopping +
+     ModelCheckpoint.  Without sync_dist=True, monitored metrics use
+     only rank-0's local batches — usable but noisier and slightly
+     wrong as a "global val_loss" signal.
+
+  2. A brief note on EMA + DDP behavior in optimizer_step (no code
+     change, just documenting the subtlety).
+
+Use this from scripts/macerelax/train_perlmutter.py:
+
+    from tricor.macerelax.model_perlmutter import LitRelaxML
+
+For single-GPU training, the original model.py is unchanged and still
+the right import — sync_dist=True has no effect on single-GPU runs but
+adds a small per-step coordination cost, so keeping the variants
+separate avoids paying it unnecessarily on the workstation.
 """
 
 from __future__ import annotations
@@ -27,9 +38,6 @@ from graphite.nn.models.mgn import Decoder
 from torch_geometric.utils import scatter
 
 from .data import NUM_WEIGHT_FEATURES
-# shell_target helpers stay in the relaxml package — composition-intrinsic,
-# works identically for MACE-source trajectories once the NPZs have the
-# shell_target arrays appended by scripts/macerelax/generation/add_shell_target_to_pilot.py.
 from tricor.relaxml.shell_target import NUM_PAIR_FEATURES, NUM_TRIPLET_FEATURES
 
 
@@ -38,7 +46,7 @@ DEFAULT_MAX_Z: int = 120
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Sub-modules
+# Sub-modules (identical to model.py)
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -55,12 +63,7 @@ class NodeEncoder(nn.Module):
 
 
 class EdgeEncoder(nn.Module):
-    """[dx, dy, dz, r, src_pair_emb, dst_pair_emb] -> edge embedding.
-
-    The geometric features `[dx, dy, dz, r]` are concatenated with a
-    small (`species_pair_dim`) embedding of the source and destination
-    atomic numbers so the network sees pair identity directly.
-    """
+    """[dx, dy, dz, r, src_pair_emb, dst_pair_emb] -> edge embedding."""
 
     def __init__(
         self,
@@ -82,11 +85,7 @@ class EdgeEncoder(nn.Module):
 
 
 class WeightEncoder(nn.Module):
-    """Global weight-parameter vector (NUM_WEIGHT_FEATURES,) -> node-space embedding.
-
-    Called once per graph.  The result is broadcast over every atom in
-    that graph and added to the node embeddings before message passing.
-    """
+    """Global weight-parameter vector -> node-space embedding."""
 
     def __init__(
         self,
@@ -101,42 +100,11 @@ class WeightEncoder(nn.Module):
         )
 
     def forward(self, w: Tensor) -> Tensor:
-        """
-        Args:
-            w: (B, num_weight_features) — one row per graph in the batch.
-
-        Returns:
-            (B, node_dim) — one embedding per graph.
-        """
         return self.embed(w)
 
 
 class ShellTargetEncoder(nn.Module):
-    """Deep-set encoder for shell_target arrays.
-
-    Each (pair, triplet) tuple is mapped to a fixed-size vector via a
-    small MLP, then summed per-graph.  Pair and triplet pools are
-    concatenated and projected to ``out_dim``.  Result is one vector
-    per graph in the batch.
-
-    Forward inputs
-    --------------
-    pair_species   (P_total, 2) long       atomic numbers (Z_a, Z_b) per pair
-    pair_features  (P_total, 4) float      [target_r, sigma, n_ab, n_ba]
-    pair_batch     (P_total,)   long       per-pair graph index in [0, B)
-    trip_species   (T_total, 3) long       atomic numbers (Z_a, Z_b, Z_c)
-    trip_features  (T_total, 2) float      [angle_mode_rad, mass_weight]
-    trip_batch     (T_total,)   long       per-triplet graph index in [0, B)
-    num_graphs     int                     B (the batch size)
-
-    Returns
-    -------
-    (B, out_dim) — one shell_target embedding per graph.
-
-    Notes on batching: when a graph has zero pairs (or zero triplets), the
-    sum scatters to zero for that graph slot, which is the right
-    permutation-invariant aggregation for an empty set.
-    """
+    """Deep-set encoder for shell_target arrays."""
 
     def __init__(
         self,
@@ -147,8 +115,6 @@ class ShellTargetEncoder(nn.Module):
         triplet_hidden: int = 64,
     ) -> None:
         super().__init__()
-        # Independent species embedding (small) so the encoder doesn't pull
-        # on the node_encoder's parameters and so it stays cheap.
         self.species_emb = nn.Embedding(max_z, species_emb_dim)
         pair_in = 2 * species_emb_dim + NUM_PAIR_FEATURES
         trip_in = 3 * species_emb_dim + NUM_TRIPLET_FEATURES
@@ -163,12 +129,6 @@ class ShellTargetEncoder(nn.Module):
             nn.LayerNorm(out_dim),
         )
 
-    # @_dynamo.disable: shell_target tensors are variable-length per
-    # batch (different compounds contribute different P / T counts), and
-    # leaving this branch in eager mode prevents torch.compile from
-    # repeatedly recompiling the surrounding model when shapes change.
-    # The MGN backbone (which dominates compute and benefits most from
-    # compile) keeps its 2× speedup; this small encoder runs in eager.
     @_dynamo.disable
     def forward(
         self,
@@ -180,8 +140,6 @@ class ShellTargetEncoder(nn.Module):
         trip_batch: Tensor,
         num_graphs: int,
     ) -> Tensor:
-        # Pair branch: encode each (Z_a, Z_b, target_r, sigma, n_ab, n_ba)
-        # tuple, then sum over pairs in each graph.
         za = self.species_emb(pair_species[:, 0])
         zb = self.species_emb(pair_species[:, 1])
         h_pair = self.pair_mlp(torch.cat([za, zb, pair_features], dim=-1))
@@ -189,7 +147,6 @@ class ShellTargetEncoder(nn.Module):
             h_pair, pair_batch, dim=0, dim_size=num_graphs, reduce="sum",
         )
 
-        # Triplet branch: same idea over triplet tuples.
         za = self.species_emb(trip_species[:, 0])
         zb = self.species_emb(trip_species[:, 1])
         zc = self.species_emb(trip_species[:, 2])
@@ -227,34 +184,16 @@ class Processor(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Full model
+# Full model (identical to model.py)
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 class RelaxMLModel(nn.Module):
     """Step-by-step relaxation surrogate with shell_target conditioning.
 
-    Predicts per-atom min-image displacement over k tricor steps given
-    the current positions, species, graph, global weight parameters, and
-    shell_target (per-pair distances + counts and per-triplet angles).
-
-    Forward inputs
-    --------------
-    z              (N,)            long  atomic numbers
-    edge_index     (2, E)
-    edge_attr      (E, 4)          [dx, dy, dz, r]
-    w              (B, num_weight_features)  per-graph regime weights
-    batch          (N,)            node→graph index
-    pair_species   (P_total, 2)    long  per-pair (Z_a, Z_b)
-    pair_features  (P_total, 4)    [target_r, sigma, n_ab, n_ba]
-    pair_batch     (P_total,)      pair→graph index
-    trip_species   (T_total, 3)    long  per-triplet (Z_a, Z_b, Z_c)
-    trip_features  (T_total, 2)    [angle_mode_rad, mass_weight]
-    trip_batch     (T_total,)      triplet→graph index
-
-    Returns
-    -------
-    displacement  (N, 3)
+    See tricor.macerelax.model.RelaxMLModel for full docs — this is the
+    same class re-exported under the perlmutter variant so the import
+    sits next to the DDP-aware LitRelaxML in the same module.
     """
 
     def __init__(
@@ -272,19 +211,8 @@ class RelaxMLModel(nn.Module):
     ) -> None:
         super().__init__()
         self.max_z = int(max_z)
-        # Per-graph dropout on the shell_target conditioning signal during
-        # training (classifier-free-guidance style).  When >0, with this
-        # probability the shell_target encoder's output for a graph is
-        # zeroed before being added to the per-atom features — forcing
-        # the model to produce useful predictions both with and without
-        # conditioning, which in turn forces it to actually USE the
-        # conditioning when present (instead of shortcutting via species).
-        # Disabled at eval/inference (uses self.training flag).
         self.shell_target_dropout = float(shell_target_dropout)
         self.node_encoder = NodeEncoder(max_z, node_dim)
-        # Separate small embedding fed into the edge encoder so pair
-        # identity is explicit on every edge.  Independent of the node
-        # embedding so the edge MLP doesn't grow with node_dim.
         self.pair_species_embed = nn.Embedding(max_z, species_pair_dim)
         self.edge_encoder = EdgeEncoder(
             edge_dim=edge_dim, species_pair_dim=species_pair_dim,
@@ -294,9 +222,6 @@ class RelaxMLModel(nn.Module):
             num_weight_features=num_weight_features,
             hidden_dim=weight_encoder_hidden,
         )
-        # Phase conditioning: encodes the shell_target driving this
-        # trajectory into a per-graph vector that gets added to the
-        # weight-encoder output.  Same broadcasting pattern.
         self.shell_target_encoder = ShellTargetEncoder(
             max_z=max_z,
             out_dim=node_dim,
@@ -323,33 +248,23 @@ class RelaxMLModel(nn.Module):
     ) -> Tensor:
         h_node = self.node_encoder(z)
 
-        # Edge features get explicit src/dst species identity.
-        pair_emb = self.pair_species_embed(z)               # (N, species_pair_dim)
+        pair_emb = self.pair_species_embed(z)
         src, dst = edge_index[0], edge_index[1]
         h_edge = self.edge_encoder(edge_attr, pair_emb[src], pair_emb[dst])
 
-        # Per-graph conditioning: regime weights + shell_target.  Both
-        # produce (B, node_dim) vectors which are summed and broadcast
-        # across the atoms of each graph.
         num_graphs = int(w.shape[0])
-        w_emb = self.weight_encoder(w)                      # (B, node_dim)
+        w_emb = self.weight_encoder(w)
         st_emb = self.shell_target_encoder(
             pair_species, pair_features, pair_batch,
             trip_species, trip_features, trip_batch,
             num_graphs,
-        )                                                   # (B, node_dim)
+        )
 
-        # Conditioning dropout: zero the shell_target embedding for a
-        # subset of graphs at training time so the model is forced to
-        # produce useful predictions both with and without conditioning.
-        # That asymmetry is what makes the encoder informative — if the
-        # model could ignore conditioning, the with-conditioning batches
-        # would have higher loss than the without-conditioning ones.
         if self.training and self.shell_target_dropout > 0.0:
             keep = (
                 torch.rand(num_graphs, device=st_emb.device)
                 > self.shell_target_dropout
-            ).to(st_emb.dtype).unsqueeze(-1)                # (B, 1)
+            ).to(st_emb.dtype).unsqueeze(-1)
             st_emb = st_emb * keep
         h_node = h_node + w_emb[batch] + st_emb[batch]
 
@@ -358,24 +273,28 @@ class RelaxMLModel(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Lightning training module
+# Lightning training module — DDP-aware
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 class LitRelaxML(L.LightningModule):
-    """Lightning training wrapper for the shell_target-conditioned RelaxMLModel.
+    """DDP-aware Lightning training wrapper for RelaxMLModel.
 
-    Hyperparameters (sensible defaults for multi-species + phase-conditioned
-    training):
-      - max_z: 120 (full periodic table + safety margin)
-      - num_convs: 4
-      - node_dim / edge_dim: 128
-      - species_pair_dim: 16 (size of edge-side species embedding)
-      - weight_encoder_hidden: 64
-      - shell_target_species_dim: 8 (small embedding inside ShellTargetEncoder)
-      - shell_target_hidden: 64
-      - ema_decay: 0.9999
-      - learn_rate: 1e-3
+    The only behavioral difference from tricor.macerelax.model.LitRelaxML
+    is sync_dist=True on every self.log() call.  Lightning needs that to
+    all-reduce metrics across ranks so that:
+
+      - tensorboard sees a global average rather than rank-0's local view,
+      - EarlyStopping's patience counter triggers on the global val_loss
+        minimum (not rank-0's noisy local one),
+      - ModelCheckpoint saves the global-best checkpoint.
+
+    EMA + DDP note (no code change required, just documenting):
+      Under DDP, parameters are synchronized via gradient averaging in the
+      backward pass.  After optimizer.step() all ranks have bit-identical
+      parameters, so EMA updates (which read from those parameters) yield
+      bit-identical EMA state on every rank.  Lightning's checkpoint logic
+      saves only rank-0's state, which is the correct one.
     """
 
     def __init__(
@@ -392,10 +311,10 @@ class LitRelaxML(L.LightningModule):
         shell_target_dropout: float = 0.0,
         ema_decay: float = 0.9999,
         learn_rate: float = 1e-3,
-        lr_schedule: str = "cosine",    # "none" | "cosine"
+        lr_schedule: str = "cosine",
         lr_min_ratio: float = 0.01,
         warmup_steps: int = 500,
-        weight_decay: float = 0.0,      # decoupled L2 via AdamW; 0 = vanilla Adam
+        weight_decay: float = 0.0,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -413,7 +332,6 @@ class LitRelaxML(L.LightningModule):
             shell_target_dropout=shell_target_dropout,
         )
 
-        # EMA weights — standard trick from the flowmatch training loop.
         _ema = float(ema_decay)
         ema_avg = lambda avg_p, p, num_avg: _ema * avg_p + (1 - _ema) * p
         self.ema_model = torch.optim.swa_utils.AveragedModel(
@@ -427,10 +345,6 @@ class LitRelaxML(L.LightningModule):
         self.weight_decay = weight_decay
 
     def _shared_step(self, batch) -> tuple[Tensor, Tensor]:
-        """Returns (loss, zero_baseline).  Zero-baseline = the loss the
-        same batch would score if the model output zero everywhere; it's
-        the natural comparison target for "is the model actually doing
-        anything?" since per-step displacements are tiny."""
         pred = self.model(
             batch.z, batch.edge_index, batch.edge_attr,
             batch.w, batch.batch,
@@ -446,28 +360,34 @@ class LitRelaxML(L.LightningModule):
     def training_step(self, batch, batch_idx):
         loss, zero_baseline = self._shared_step(batch)
         bs = batch.num_graphs if hasattr(batch, "num_graphs") else 1
-        # relative_loss = 1.0 means model predicts zero (baseline);
-        # 0.0 means perfect.  Much more interpretable than raw MSE.
         rel = loss / zero_baseline.clamp(min=1e-12)
+        # sync_dist=True: average the per-epoch metric across all ranks
+        # before logging.  Without it, tensorboard would show only rank-0.
         self.log("train_loss", loss, on_step=False, on_epoch=True,
-                 prog_bar=True, batch_size=bs)
+                 prog_bar=True, batch_size=bs, sync_dist=True)
         self.log("train_relative_loss", rel, on_step=False, on_epoch=True,
-                 prog_bar=True, batch_size=bs)
+                 prog_bar=True, batch_size=bs, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         loss, zero_baseline = self._shared_step(batch)
         bs = batch.num_graphs if hasattr(batch, "num_graphs") else 1
         rel = loss / zero_baseline.clamp(min=1e-12)
+        # sync_dist=True is especially important here because val_loss is
+        # what EarlyStopping + ModelCheckpoint monitor.  A local rank-0
+        # view of val_loss would cause those callbacks to make decisions
+        # on noisier, sample-biased values.
         self.log("val_loss", loss, on_step=False, on_epoch=True,
-                 prog_bar=True, batch_size=bs)
+                 prog_bar=True, batch_size=bs, sync_dist=True)
         self.log("val_relative_loss", rel, on_step=False, on_epoch=True,
-                 prog_bar=True, batch_size=bs)
+                 prog_bar=True, batch_size=bs, sync_dist=True)
         return loss
 
     def configure_optimizers(self):
-        # AdamW decouples weight decay from the gradient update.  With
-        # weight_decay=0 it's mathematically equivalent to vanilla Adam.
+        # AdamW: decoupled weight decay.  With weight_decay=0, same as Adam.
+        # estimated_stepping_batches is DDP-aware: Lightning divides the
+        # dataset by world_size for the per-rank step count.  No manual
+        # scaling needed here.
         opt = torch.optim.AdamW(
             self.model.parameters(),
             lr=self.learn_rate,
@@ -506,4 +426,7 @@ class LitRelaxML(L.LightningModule):
 
     def optimizer_step(self, *args, **kwargs):
         super().optimizer_step(*args, **kwargs)
+        # Under DDP: post-step parameters are bit-identical across ranks
+        # (gradient sync in backward + same optimizer state on each rank),
+        # so update_parameters yields identical EMA tensors everywhere.
         self.ema_model.update_parameters(self.model)

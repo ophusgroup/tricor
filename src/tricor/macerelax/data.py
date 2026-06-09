@@ -1,8 +1,8 @@
 """Data loading for the MACE+wall pilot — fork of tricor.relaxml.data_shelltgt.
 
 Reads MACE+wall trajectory NPZs produced by
-``mace/generate_mace_trajectories.py``, plus shell_target arrays
-appended by ``mace/add_shell_target_to_pilot.py``.
+``scripts/macerelax/generation/generate_mace_trajectories.py``, plus shell_target arrays
+appended by ``scripts/macerelax/generation/add_shell_target_to_pilot.py``.
 
 The MACE pilot uses a 6-dimensional global conditioning vector instead
 of the relaxml-baseline 9-dim spring-weight vector — the spring fields
@@ -115,7 +115,7 @@ def _min_image_displacement(
 
 def _weight_vector_from_row(row: dict, num_grains: int | None = None) -> np.ndarray:
     """Build the normalized (NUM_WEIGHT_FEATURES,) global vector from a
-    manifest row produced by mace/generate_mace_trajectories.py."""
+    manifest row produced by scripts/macerelax/generation/generate_mace_trajectories.py."""
     if num_grains is None:
         num_grains = int(float(row["num_grains"]))
     fmax_initial = float(row["fmax_initial"])

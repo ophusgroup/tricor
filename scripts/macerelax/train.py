@@ -29,11 +29,11 @@ CHECK_GPU_BUSY = True      # abort if the chosen GPU already has another job
 # Set the experiment name; the train manifest, run name (used for the
 # tensorboard log dir + checkpoint dir), and the metadata logged into
 # hparams.yaml all derive from it via the registry at
-# EXPERIMENTS_REGISTRY.  See mace/make_experiment_manifests.py for the
+# EXPERIMENTS_REGISTRY.  See scripts/macerelax/generation/make_experiment_manifests.py for the
 # canonical EXPERIMENTS declaration.
 #
 # .npz files referenced by these manifests MUST already contain the four
-# shell_target arrays — run mace/add_shell_target_to_pilot.py once after
+# shell_target arrays — run scripts/macerelax/generation/add_shell_target_to_pilot.py once after
 # trajectory generation completes (idempotent, safe to re-run).
 EXPERIMENT_NAME = "polymorph_test"   # one of the keys in EXPERIMENTS
 EXPERIMENTS_REGISTRY = "/home/ehrdt/tricor/mace/data/pilot_v1/manifests/experiments.json"
@@ -121,7 +121,7 @@ torch.set_num_threads(NUM_THREADS)
 
 def resolve_experiment(experiment_name: str, registry_path: str) -> dict:
     """Look up an experiment in the registry written by
-    mace/make_experiment_manifests.py.  Returns a dict with:
+    scripts/macerelax/generation/make_experiment_manifests.py.  Returns a dict with:
       - manifest:           absolute path to train manifest
       - eval_manifest:      absolute path to eval manifest
       - description:        free-text doc
@@ -140,7 +140,7 @@ def resolve_experiment(experiment_name: str, registry_path: str) -> dict:
         raise SystemExit(
             f"[abort] experiment {experiment_name!r} not in registry "
             f"{registry_path}.  Available: {sorted(exps)}.  "
-            f"Re-run mace/make_experiment_manifests.py after editing its "
+            f"Re-run scripts/macerelax/generation/make_experiment_manifests.py after editing its "
             f"EXPERIMENTS config to add new entries."
         )
     e = exps[experiment_name]
