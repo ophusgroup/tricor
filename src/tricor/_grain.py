@@ -302,6 +302,7 @@ class _GrainMixin:
         displacement_sigma: float = 0.0,
         max_density_passes: int = 5,
         grain_sources: "list[dict] | None" = None,
+        rotations_override: "np.ndarray | None" = None,
     ) -> Atoms:
         """Build a supercell with crystalline grains via Voronoi tiling.
 
@@ -443,6 +444,12 @@ class _GrainMixin:
             # distortions that ruin the crystalline structure.
             shared_seed = seeds[0].copy()
             seeds = np.broadcast_to(shared_seed, seeds.shape).copy()
+        elif rotations_override is not None:
+            # Caller supplies the per-grain rotation set (orientation
+            # refinement re-runs this builder with a fixed RNG seed and
+            # trial rotations).  Skip the random draw so the RNG stream
+            # stays aligned across calls.
+            rotations = np.asarray(rotations_override, dtype=np.float64).copy()
         else:
             rotations = _random_rotation_matrices(num_grains, self.rng)
 

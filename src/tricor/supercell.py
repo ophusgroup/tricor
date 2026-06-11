@@ -530,6 +530,15 @@ class Supercell(
                 displacement_sigma=displacement_sigma,
                 grain_sources=grain_sources,
             )
+            # Remember the exact build parameters so
+            # ``refine_initial_orientations`` can re-run the full
+            # grain-assembly procedure with trial rotations.
+            self._grain_build_params = dict(
+                grain_size=float(grain_size),
+                crystalline_fraction=float(crystalline_fraction),
+                displacement_sigma=float(displacement_sigma),
+                grain_sources=grain_sources,
+            )
 
             # Refresh cached arrays after rebuilding atoms
             self._cell_matrix = np.asarray(self.atoms.cell.array, dtype=np.float64)

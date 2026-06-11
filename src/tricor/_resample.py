@@ -2294,42 +2294,16 @@ class _ResampleMixin:
         return history_out
 
     # =====================================================================
-    # refine_initial_orientations — build-time SO(3) coordinate descent
+    # refine_initial_orientations — SO(3) coordinate descent over grains
     # =====================================================================
     #
-    # Goal: choose each grain's rotation BEFORE the global FIRE quench so
-    # that ``generate()`` lands in a deeper basin to begin with.  The big
-    # win over post-hoc ``refine_grains*`` methods is that we don't need
-    # FIRE per trial — the cell hasn't been relaxed yet, so trial scoring
-    # uses *local* energy with a CACHED bond/angle/repulsion topology.
-    # Each trial is ~1 ms instead of ~140 ms, so we can afford 50+ trials
-    # per (amplitude × grain) and converge on good rotations fast.
-    #
-    # Design summary:
-    #   1.  Build the topology ONCE on the as-built (un-relaxed) cell.
-    #   2.  Coarse-to-fine amplitude schedule (default 30° → 15° → 5° →
-    #       2°).  For each (amplitude, round, grain):
-    #         - sample N bounded rotation perturbations of the grain's
-    #           current rotation,
-    #         - retile the grain with the spherical master block,
-    #         - score by ``_total_energy_fast`` using the cached topo
-    #           (sub-millisecond),
-    #         - pick the best, commit if it improves on the baseline.
-    #   3.  Rebuild topology between amplitude phases so it stays
-    #       accurate as positions evolve.
-    #
-    # Why it generalises across chemistry: the energy kernel and topology
-    # builder both consume per-species targets from ``shell_target``
-    # (bond peak, angle mode, hard-core, non-bonded push), so Cu (1
-    # species), Si (1), SiO₂ (2), and SrTiO₃ (3) all use the same code
-    # path.  No per-element heuristics.
-    #
-    # Why "cached topology" is fair: the bonds we care about are the
-    # ones predicted by the IDEAL crystal target — those don't depend on
-    # where the atoms drifted to, only on which atoms got assigned to
-    # the same coordination shell.  Local lattice perturbations don't
-    # break this assignment.  When the topology drifts (after many
-    # rotations), we rebuild between amplitude rounds.
+    # For each grain, re-run the full grain-assembly procedure
+    # (``_build_grain_atoms``: Voronoi fill + boundary-overlap removal +
+    # padding + push-apart) with a fixed RNG seed, changing only the
+    # per-grain SO(3) rotations.  With the seed fixed, two assemblies
+    # with identical rotations are bit-identical, so a trial differs
+    # from the baseline only by the rotation under test.  A trial is
+    # accepted if it lowers the global first-shell pair-distance cost.
     def refine_initial_orientations(
         self: "Supercell",
         shell_target: "CoordinationShellTarget",
@@ -2337,588 +2311,184 @@ class _ResampleMixin:
         amplitudes_deg: tuple = (30.0, 15.0, 5.0, 2.0),
         trials_per_amplitude_per_grain: int = 50,
         max_rounds_per_amplitude: int = 2,
-        # Spring weights (used to score trials)
         bond_weight: float = 1.0,
         angle_weight: float = 0.5,
         repulsion_weight: float = 3.0,
         hard_core_scale: float = 1.0,
         nonbond_push_scale: float = 1.0,
         time_budget_sec: float = 120.0,
-        # Final whole-cell FIRE refinement after coordinate descent.
-        # ``0`` (default) skips it — the user is expected to run
-        # their own ``shell_relax`` afterwards (or
-        # ``generate(refine_orientations=True)`` does it
-        # automatically).  Set > 0 to bake the FIRE quench into the
-        # refinement call so a single ``refine_initial_orientations``
-        # produces a fully-relaxed cell.
-        final_fire_steps: int = 0,
-        # Capture per-frame atom positions for trajectory replay /
-        # cost-decomposition.  ``False`` (default) skips this for
-        # speed.
         capture_trajectory: bool = False,
-        # Cost-function modes:
-        #   ``"pair_distance"`` (default, recommended) — topology-free
-        #     local pair-distance cost ``(d - pair_peak)²`` over grain
-        #     atoms within ``score_cutoff_factor × pair_peak``, plus a
-        #     hard-core clash penalty.  Fast, position-only, no cached
-        #     bond list, so the score is consistent across grains and
-        #     trials.  Generalises to any chemistry (Cu, Si, SiO₂,
-        #     SrTiO₃) via per-pair targets in ``shell_target``.
-        #   ``"cached_topology"`` — uses ``_total_energy_fast`` with a
-        #     bond list rebuilt at the cadence below.  More physically
-        #     faithful (includes angles, repulsion) but the rebuilt
-        #     topology drifts as positions change, which can cause the
-        #     refinement to walk into a worse basin on big cells.
-        cost_function: str = "pair_distance",
-        score_cutoff_factor: float = 1.5,
-        # Topology-rebuild cadence (only used when
-        # ``cost_function="cached_topology"``).
-        topology_rebuild: str = "per_grain",
         rng_seed: "int | None" = None,
         show_progress: bool = True,
+        **_ignored_legacy_kwargs,
     ) -> dict:
-        """Optimise per-grain rotations via SO(3) coordinate descent BEFORE the global FIRE quench.
+        """Optimise per-grain rotations by re-running the full grain
+        assembly with trial rotations and keeping any rotation that
+        lowers a global pair-distance cost.  See the comment above for
+        the procedure.
 
-        Walks each Voronoi grain through a sequence of progressively
-        finer rotation perturbations, accepting any rotation that
-        lowers a fast topology-free pair-distance score against the
-        grain's local environment.  Designed to be called between
-        the Voronoi tile (which assigns random initial rotations) and
-        the global FIRE quench.  The intended workflow is::
-
-            cell.generate(shell, num_steps=0, ...)        # build only
-            cell.refine_initial_orientations(shell)        # this method
-            cell.shell_relax(shell, num_steps=150, ...)    # FIRE quench
-
-        Or equivalently use ``cell.generate(refine_orientations=True,
-        refine_orientations_kwargs=...)`` which chains the three
-        steps in one call.
-
-        Parameters
-        ----------
-        shell_target : CoordinationShellTarget
-            Target whose ``pair_peak`` defines the per-pair bond
-            length the score targets.
-        amplitudes_deg : tuple of float, optional
-            Schedule of rotation amplitudes (degrees) the SO(3)
-            coordinate search walks through.  Default
-            ``(30, 15, 5, 2)``: the largest step lets a misaligned
-            grain escape its starting basin, the smallest step locks
-            in the chosen orientation.
-        trials_per_amplitude_per_grain : int, optional
-            Number of random rotations sampled per (amplitude,
-            grain).  Default ``50``.  The best-scoring trial is
-            accepted if it beats the current orientation by more
-            than ``score_cutoff_factor``.
-        max_rounds_per_amplitude : int, optional
-            Number of full passes over all grains within one
-            amplitude phase.  Default ``2``.
-        bond_weight, angle_weight, repulsion_weight : float, optional
-            Spring weights forwarded to the per-trial score.  Only
-            used when ``cost_function="cached_topology"``; the
-            default ``"pair_distance"`` mode ignores them.
-        hard_core_scale, nonbond_push_scale : float, optional
-            Repulsion thresholds passed through to the per-trial
-            score's clash-penalty term.
-        time_budget_sec : float, optional
-            Wall-time guard rail (seconds).  The search bails after
-            this even if amplitudes remain.  Default ``120``.
-        final_fire_steps : int, optional
-            If > 0, run a whole-cell ``shell_relax`` for this many
-            steps after the SO(3) search completes — bakes a final
-            quench into a single call.  Default ``0`` (caller is
-            expected to run their own ``shell_relax``).
-        capture_trajectory : bool, optional
-            Record the cell's atom positions at every accepted
-            rotation.  Default ``False`` (faster).  Set to ``True``
-            for trajectory-replay HTML export.
-        cost_function : {"pair_distance", "cached_topology"}, optional
-            Score to minimise.  ``"pair_distance"`` (default,
-            recommended) is a topology-free
-            ``Σ (d - pair_peak)²`` over neighbour pairs in the
-            grain's local frame — fast and consistent across grains
-            and trials.  ``"cached_topology"`` uses
-            ``_total_energy_fast`` with a rebuilt bond list (more
-            physically faithful but the rebuilt topology drifts as
-            positions change and can walk into a worse basin on big
-            cells).
-        score_cutoff_factor : float, optional
-            Acceptance threshold relative to the current baseline
-            score.  Higher values accept more aggressively.  Default
-            ``1.5``.
-        topology_rebuild : {"per_grain", "per_amp", "once"}, optional
-            Cadence for rebuilding the bond list (only used when
-            ``cost_function="cached_topology"``).  Default
-            ``"per_grain"``.
-        rng_seed : int, optional
-            Seed for the random rotation sampler.  ``None`` (default)
-            uses the cell's own RNG.
-        show_progress : bool, optional
-            Display a tqdm progress bar over the (amplitudes ×
-            rounds × grains) workload.  Default ``True``.
-
-        Returns
-        -------
-        dict
-            History captured under
-            ``self.refine_initial_orientations_history``:
-
-            - ``iteration`` (ndarray of int) — accept indices,
-              starting at 0 for the initial state.
-            - ``global_cost`` (ndarray of float) — total cost at
-              each accepted state.
-            - ``cost_bond`` / ``cost_angle`` / ``cost_rep`` — cost
-              decomposition (only populated for
-              ``cost_function="cached_topology"``).
-            - ``accepted_grain`` (ndarray of int) — grain index
-              that moved at each acceptance (-1 for the initial
-              state).
-            - ``rotation_amplitude_deg`` (ndarray of float) — the
-              current amplitude phase at each acceptance.
-            - ``amplitude_phase`` (ndarray of int) — phase index
-              into ``amplitudes_deg``.
-            - ``trajectory`` (ndarray of float32, optional) — only
-              present when ``capture_trajectory=True``: positions
-              ``(num_accepts, num_atoms, 3)`` at each accepted
-              rotation.
+        Legacy keyword arguments from the previous cached-topology
+        refiner (``cost_function``, ``score_cutoff_factor``,
+        ``topology_rebuild``, ``final_fire_steps`` …) are accepted and
+        ignored.
         """
-        from ._thermal_mc import _build_thermal_topology, _total_energy_fast
+        import time as _time
+        from scipy.spatial import cKDTree
 
-        if getattr(self, "_grain_ids", None) is None:
+        bp = getattr(self, "_grain_build_params", None)
+        if bp is None:
             raise ValueError(
-                "refine_initial_orientations requires a grain-built "
-                "cell.  Call Supercell.generate(grain_size=...) first."
+                "refine_initial_orientations requires a grain-built cell "
+                "produced by Supercell.generate(grain_size=...).  The build "
+                "parameters were not cached — re-run generate()."
             )
-        if getattr(self, "_grain_cells", None) is None:
+        if getattr(self, "_grain_rotations_initial", None) is None:
             raise ValueError(
-                "refine_initial_orientations requires Voronoi cells "
-                "cached on the supercell.  Re-run generate() to "
-                "populate them."
+                "No grain rotations cached on the cell; re-run generate()."
             )
 
-        rng = (np.random.default_rng(rng_seed)
-               if rng_seed is not None else self.rng)
-
-        weights = dict(
-            bond_weight=float(bond_weight),
-            angle_weight=float(angle_weight),
-            repulsion_weight=float(repulsion_weight),
-            hard_core_scale=float(hard_core_scale),
-            nonbond_push_scale=float(nonbond_push_scale),
-        )
-
-        # Cell + grain metadata
-        grain_ids = np.asarray(self._grain_ids, dtype=np.intp)
-        grain_seeds = np.asarray(self._grain_seeds, dtype=np.float64)
-        voronoi_cells = self._grain_cells
-        masters = self._grain_masters
-        grain_source = self._grain_source
-        if grain_source is None:
-            grain_source = np.zeros(len(grain_seeds), dtype=np.intp)
-        is_crystalline = np.asarray(
-            self._grain_is_crystalline, dtype=bool,
-        )
-        box_dim = np.asarray(self._grain_box_dim, dtype=np.float64)
-        master_lattice = np.asarray(
-            self._grain_master_lattice, dtype=np.float64,
-        )
-        translation_basis = master_lattice * 0.5
-
-        cell_mat = np.ascontiguousarray(
-            self.atoms.cell.array, dtype=np.float64,
-        )
-        cell_inv = np.linalg.inv(cell_mat)
-        species_idx = (
-            self._atom_shell_species_index
-            if getattr(self, "_atom_shell_species_index", None) is not None
-            else self._atom_species_index
-        ).astype(np.intp, copy=True)
-        num_atoms = len(self.atoms)
-
-        unique_grains = [
-            int(g) for g in np.unique(grain_ids[grain_ids >= 0])
-            if is_crystalline[int(g)]
+        rotations = np.asarray(
+            self._grain_rotations_initial, dtype=np.float64).copy()
+        is_cryst = np.asarray(self._grain_is_crystalline, dtype=bool)
+        crystalline_grains = [
+            int(g) for g in range(rotations.shape[0]) if is_cryst[g]
         ]
-        if not unique_grains:
-            raise ValueError(
-                "No crystalline grains found.  "
-                "refine_initial_orientations has nothing to optimise."
-            )
 
-        # Per-grain orientation state (start from generate's choices)
-        max_grain_id = int(grain_ids.max()) + 1
-        current_rotations = np.zeros((max_grain_id, 3, 3),
-                                     dtype=np.float64)
-        for g in range(max_grain_id):
-            current_rotations[g] = (
-                self._grain_rotations_initial[g]
-                if g < len(self._grain_rotations_initial)
-                else np.eye(3)
-            )
-        current_translations = np.zeros((max_grain_id, 3),
-                                        dtype=np.float64)
+        pair_peak = np.asarray(shell_target.pair_peak, dtype=np.float64)
+        pair_hard = np.asarray(shell_target.pair_hard_min, dtype=np.float64)
+        cutoff = 1.5 * float(np.max(pair_peak)) if pair_peak.size else 3.0
+        box = np.diag(np.asarray(self.atoms.cell.array, dtype=np.float64))
 
-        # Per-pair targets (used by both cost-function modes).
-        pair_peak_arr = np.asarray(
-            shell_target.pair_peak, dtype=np.float64,
-        )
-        pair_outer_arr = np.asarray(
-            shell_target.pair_outer, dtype=np.float64,
-        )
-        pair_hard_arr = np.asarray(
-            shell_target.pair_hard_min, dtype=np.float64,
-        )
-        # Cutoff = ``score_cutoff_factor × max(pair_peak)``.  Using
-        # the LARGEST pair-peak gives a wide enough cutoff to capture
-        # boundary pairs of every species combination (Si-O, O-O,
-        # Si-Si in SiO₂; Sr-Ti, Sr-O, Ti-O in SrTiO₃) — those are the
-        # pairs whose distances actually CHANGE under grain rotation
-        # (intra-grain pairs are rigid).  A tighter cutoff loses the
-        # rotation signal entirely on multi-element cells.
-        score_cutoff = (
-            float(score_cutoff_factor)
-            * float(np.max(pair_peak_arr))
-        )
+        ORIENT_SEED = int(rng_seed) if rng_seed is not None else 20240517
+        propose_rng = np.random.default_rng(ORIENT_SEED + 9973)
 
-        # ── Build topology cache + energy kernel (only used when
-        # ``cost_function="cached_topology"``).  For the default
-        # ``"pair_distance"`` mode we never call _build_thermal_topology.
-        def _build_topo():
-            return _build_thermal_topology(
-                self.atoms, species_idx, shell_target,
-                hard_core_scale=float(weights["hard_core_scale"]),
-                nonbond_push_scale=float(weights["nonbond_push_scale"]),
-            )
-
-        topo = _build_topo() if cost_function == "cached_topology" else None
-
-        # Score function for a per-grain trial.  Two modes:
-        #   * "pair_distance": topology-free, position-only, restricted
-        #     to the grain's neighbourhood.  Consistent across grains.
-        #   * "cached_topology": uses _total_energy_fast with the
-        #     current cached topology.  Includes angles + repulsion.
-        def _score(positions, grain_mask, neighborhood_mask):
-            if cost_function == "pair_distance":
-                return _pair_distance_cost(
-                    positions, species_idx, cell_mat, cell_inv,
-                    pair_peak_arr, pair_hard_arr, score_cutoff,
-                    grain_mask=grain_mask,
-                    neighborhood_mask=neighborhood_mask,
+        def _assemble(rot):
+            saved_rng = self.rng
+            self.rng = np.random.default_rng(ORIENT_SEED)
+            try:
+                atoms = self._build_grain_atoms(
+                    shell_target,
+                    grain_size=bp["grain_size"],
+                    crystalline_fraction=bp["crystalline_fraction"],
+                    displacement_sigma=bp["displacement_sigma"],
+                    grain_sources=bp["grain_sources"],
+                    rotations_override=rot,
                 )
-            r_dummy = np.zeros_like(positions)
-            total, _, _, _ = _total_energy_fast(
-                positions, species_idx, cell_mat, cell_inv,
-                topo["bond_i"], topo["bond_j"], topo["bond_r_target"],
-                float(weights["bond_weight"]),
-                topo["tri_center"], topo["tri_a"], topo["tri_b"],
-                topo["tri_phi_target"],
-                float(weights["angle_weight"]),
-                topo["rep_atom_start"], topo["rep_atom_list"],
-                topo["hard_core"], topo["nonbond_push"],
-                float(weights["repulsion_weight"]),
-                topo["bonded_flat"], num_atoms,
-                r_dummy, 0.0,
-            )
-            return float(total) / max(num_atoms, 1)
+            finally:
+                self.rng = saved_rng
+            return atoms
 
-        # ── History
-        history = dict(
-            iteration=[], global_cost=[],
-            accepted_grain=[],
-            amplitude_deg=[],
-            phase_idx=[],
-            trajectory=[] if capture_trajectory else None,
-        )
+        def _cost(atoms):
+            # Global first-shell pair-distance cost via a single KDTree
+            # query (sparse, O(N)).  ``(d - peak)^2`` over in-cutoff pairs
+            # plus a stiff hard-core clash penalty so any sub-hard-core
+            # pair is heavily penalised and never accepted.
+            pos = np.ascontiguousarray(atoms.positions, dtype=np.float64)
+            n = pos.shape[0]
+            if n == 0:
+                return 0.0
+            sp = np.searchsorted(self._species, atoms.numbers).astype(np.intp)
+            wrap = pos - np.floor(pos / box) * box
+            tree = cKDTree(wrap, boxsize=box)
+            pairs = tree.query_pairs(cutoff, output_type="ndarray")
+            if not len(pairs):
+                return 0.0
+            delta = wrap[pairs[:, 1]] - wrap[pairs[:, 0]]
+            delta -= np.round(delta / box) * box
+            d = np.sqrt(np.maximum(np.sum(delta * delta, axis=1), 1e-30))
+            si = sp[pairs[:, 0]]
+            sj = sp[pairs[:, 1]]
+            peak = pair_peak[si, sj]
+            hard = pair_hard[si, sj]
+            bond_err = (d - peak) ** 2
+            clash = np.where(d < hard, (hard - d) ** 2, 0.0) * 50.0
+            return float(np.sum(bond_err) + np.sum(clash)) / max(n, 1)
 
-        # Initial global score (full-cell pair-distance cost, both
-        # origin and target unrestricted).
-        initial_cost = _score(self.atoms.positions, None, None)
-        history["iteration"].append(0)
-        history["global_cost"].append(initial_cost)
-        history["accepted_grain"].append(-1)
-        history["amplitude_deg"].append(0.0)
-        history["phase_idx"].append(-1)
+        def _commit(atoms):
+            self.atoms = atoms
+            self._cell_matrix = np.asarray(atoms.cell.array, dtype=np.float64)
+            self._cell_inverse = np.linalg.inv(self._cell_matrix)
+            self._atom_species_index = np.searchsorted(
+                self._species, atoms.numbers)
+            self._rebuild_spatial_index()
+
+        # ----- baseline: assemble at current rotations -----
+        base_atoms = _assemble(rotations)
+        _commit(base_atoms)
+        best_cost = _cost(base_atoms)
+
+        history = dict(iteration=[0], global_cost=[best_cost],
+                       accepted_grain=[-1], amplitude_deg=[0.0],
+                       phase_idx=[-1], trajectory=[])
         if capture_trajectory:
             history["trajectory"].append(
-                self.atoms.positions.copy().astype(np.float32)
-            )
+                self.atoms.positions.copy().astype(np.float32))
 
         if show_progress:
-            print(
-                "refine_initial_orientations: initial cost = "
-                f"{initial_cost:.4f}, {len(unique_grains)} grains, "
-                f"amplitudes {amplitudes_deg}"
-            )
+            print(f"refine_initial_orientations: baseline cost = "
+                  f"{best_cost:.5f}, {len(crystalline_grains)} grains, "
+                  f"amplitudes {tuple(amplitudes_deg)}", flush=True)
 
-        t0 = time.time()
         iteration = 0
-
-        # ── Main loop
+        t0 = _time.time()
+        stop = False
         for amp_idx, amp_deg in enumerate(amplitudes_deg):
-            if time.time() - t0 >= time_budget_sec:
+            if stop:
                 break
-            amp_rad = np.deg2rad(float(amp_deg))
-            trans_scale = float(amp_deg / 180.0)
-
-            for round_idx in range(max_rounds_per_amplitude):
-                if time.time() - t0 >= time_budget_sec:
-                    break
-                grain_order = list(unique_grains)
-                rng.shuffle(grain_order)
-                improved_round = False
-
-                for gid in grain_order:
-                    if time.time() - t0 >= time_budget_sec:
+            amp_rad = np.radians(float(amp_deg))
+            for round_idx in range(int(max_rounds_per_amplitude)):
+                improved = False
+                for g in crystalline_grains:
+                    if _time.time() - t0 > time_budget_sec:
+                        stop = True
                         break
-
-                    grain_mask = (grain_ids == gid)
-                    target_n = int(np.sum(grain_mask))
-                    if target_n == 0:
-                        continue
-                    seed_world = grain_seeds[gid]
-                    voronoi_cell = voronoi_cells[gid]
-                    src_idx = int(grain_source[gid])
-                    master = masters[src_idx]
-                    master_pos = np.asarray(
-                        master["positions"], dtype=np.float64,
-                    )
-                    master_num = np.asarray(
-                        master["numbers"], dtype=np.int64,
-                    )
-
-                    snapshot_grain_pos = self.atoms.positions[grain_mask].copy()
-                    # Multi-species: retile re-orders atoms within the
-                    # grain (same species count, different positions).
-                    # We must update ``atoms.numbers`` AND
-                    # ``species_idx`` along with positions so the cost
-                    # function sees the correct species at each
-                    # position.  Without this the score is computed
-                    # against a stale species mapping and refinement
-                    # fails on multi-element cells (Si–O, Sr–Ti–O).
-                    snapshot_grain_nums = self.atoms.numbers[grain_mask].copy()
-                    grain_indices = np.flatnonzero(grain_mask)
-                    snapshot_species_idx_grain = species_idx[grain_indices].copy()
-                    # Pre-compute neighbourhood mask for the local
-                    # pair-distance score.  Restricts j-atoms to the
-                    # grain + atoms within ``score_cutoff`` of any
-                    # grain atom, so each trial costs O(N_g · N_n)
-                    # instead of O(N²).
-                    neighborhood_mask = _expand_neighborhood(
-                        grain_mask=grain_mask,
-                        positions=self.atoms.positions,
-                        cell_mat=cell_mat, cell_inv=cell_inv,
-                        radius=score_cutoff,
-                    )
-                    if (cost_function == "cached_topology"
-                            and topology_rebuild == "per_grain"):
-                        topo = _build_topo()
-                    baseline_cost = _score(
-                        self.atoms.positions, grain_mask, neighborhood_mask,
-                    )
-                    best_cost = baseline_cost
-                    best_R = None
-                    best_T = None
-                    best_atoms_grain: "np.ndarray | None" = None
-                    best_nums_grain: "np.ndarray | None" = None
-
-                    for _ in range(trials_per_amplitude_per_grain):
-                        R_delta = _so3_bounded_rotation(rng, amp_rad)
-                        R_trial = current_rotations[gid] @ R_delta
-                        frac = rng.uniform(-1.0, 1.0, size=3)
-                        T_trial = (current_translations[gid]
-                                   + trans_scale * (frac @ translation_basis))
-
-                        retile = _retile_grain(
-                            master_positions=master_pos,
-                            master_numbers=master_num,
-                            voronoi_cell=voronoi_cell,
-                            seed_world=seed_world,
-                            box_dim=box_dim,
-                            rotation=R_trial,
-                            translation=T_trial,
-                            target_n=target_n,
-                        )
-                        if retile is None:
-                            continue
-                        new_pos_world, new_nums_world = retile
-                        self.atoms.positions[grain_mask] = new_pos_world
-                        self.atoms.numbers[grain_mask] = new_nums_world
-                        # Re-map species index for the grain atoms.
-                        # For composite shell targets with virtual
-                        # species (sp²-C and sp³-C both at atomic
-                        # number 6), ``searchsorted(self._species,
-                        # numbers)`` is wrong because every atom
-                        # has the same atomic number and the
-                        # searchsorted result is always 0.  The
-                        # species_offset is a grain-level property
-                        # set when the master block was built — use
-                        # it directly so each grain's atoms keep
-                        # their virtual-species tag through the
-                        # rotation search.
-                        if "species_offset" in master:
-                            species_idx[grain_indices] = int(
-                                master["species_offset"]
-                            )
-                        else:
-                            species_idx[grain_indices] = np.searchsorted(
-                                self._species, new_nums_world,
-                            )
-                        if (cost_function == "cached_topology"
-                                and topology_rebuild == "per_trial"):
-                            topo = _build_topo()
-                        cost = _score(
-                            self.atoms.positions, grain_mask,
-                            neighborhood_mask,
-                        )
-                        if cost < best_cost:
-                            best_cost = cost
-                            best_R = R_trial
-                            best_T = T_trial
-                            best_atoms_grain = new_pos_world.copy()
-                            best_nums_grain = new_nums_world.copy()
-
-                    # Restore snapshot first, then either commit best
-                    # or stay at baseline.
-                    self.atoms.positions[grain_mask] = snapshot_grain_pos
-                    self.atoms.numbers[grain_mask] = snapshot_grain_nums
-                    species_idx[grain_indices] = snapshot_species_idx_grain
-                    if best_atoms_grain is not None:
-                        self.atoms.positions[grain_mask] = best_atoms_grain
-                        self.atoms.numbers[grain_mask] = best_nums_grain
-                        # Same virtual-species fix as the trial loop:
-                        # use the grain's species_offset (set on the
-                        # master block when it was built) instead of
-                        # ``searchsorted(self._species, numbers)``,
-                        # which is wrong when atoms share atomic
-                        # numbers across virtual species.
-                        if "species_offset" in master:
-                            species_idx[grain_indices] = int(
-                                master["species_offset"]
-                            )
-                        else:
-                            species_idx[grain_indices] = np.searchsorted(
-                                self._species, best_nums_grain,
-                            )
-                        current_rotations[gid] = best_R
-                        current_translations[gid] = best_T
+                    best_rot_g = None
+                    best_atoms_g = None
+                    for _ in range(int(trials_per_amplitude_per_grain)):
+                        R_try = rotations.copy()
+                        R_try[g] = rotations[g] @ _so3_bounded_rotation(
+                            propose_rng, amp_rad)
+                        atoms_try = _assemble(R_try)
+                        c = _cost(atoms_try)
+                        if c < best_cost - 1e-9:
+                            best_cost = c
+                            best_rot_g = R_try[g].copy()
+                            best_atoms_g = atoms_try
+                    if best_rot_g is not None:
+                        rotations[g] = best_rot_g
+                        _commit(best_atoms_g)
                         iteration += 1
                         history["iteration"].append(iteration)
                         history["global_cost"].append(best_cost)
-                        history["accepted_grain"].append(int(gid))
+                        history["accepted_grain"].append(int(g))
                         history["amplitude_deg"].append(float(amp_deg))
-                        history["phase_idx"].append(amp_idx)
+                        history["phase_idx"].append(int(amp_idx))
                         if capture_trajectory:
                             history["trajectory"].append(
-                                self.atoms.positions.copy()
-                                .astype(np.float32)
-                            )
-                        improved_round = True
+                                self.atoms.positions.copy().astype(np.float32))
+                        improved = True
                         if show_progress:
-                            elapsed = time.time() - t0
-                            print(
-                                f"  amp {amp_deg:5.1f}° "
-                                f"round {round_idx+1} grain {gid}: "
-                                f"{baseline_cost:.4f} -> {best_cost:.4f} "
-                                f"(iter {iteration}, "
-                                f"elapsed {elapsed:.1f} s)"
-                            )
-
-                if not improved_round:
-                    if show_progress:
-                        print(
-                            f"  amp {amp_deg:5.1f}° round {round_idx+1}:"
-                            " no improvements"
-                        )
+                            print(f"  amp {amp_deg:5.1f}\u00b0 round "
+                                  f"{round_idx + 1} grain {g}: cost -> "
+                                  f"{best_cost:.5f} (iter {iteration}, "
+                                  f"{_time.time() - t0:.0f}s)", flush=True)
+                if stop or not improved:
                     break
 
-            # Rebuild topology between amplitudes — positions changed
-            if (cost_function == "cached_topology"
-                    and topology_rebuild == "per_amplitude"
-                    and amp_idx < len(amplitudes_deg) - 1):
-                topo = _build_topo()
-
-        final_cost = _score(self.atoms.positions, None, None)
-        if show_progress:
-            print(
-                f"refine_initial_orientations: refine cost = "
-                f"{final_cost:.4f} (Δ = {final_cost - initial_cost:+.4f})"
-            )
-            print(f"  total accepts: {iteration}")
-            print(f"  refine time: {time.time() - t0:.1f} s")
-
-        # Optional final FIRE refinement of the rotated state.  This
-        # is the "FIRE refinement at the end" step — the rotation
-        # search produced grain orientations that look good by the
-        # cheap pair-distance metric, and the final FIRE relaxes all
-        # atoms (especially boundary atoms that the rotation search
-        # held rigid) to a deeper basin.  Required for the algorithm
-        # to actually lower the post-quench global cost.
-        if final_fire_steps > 0:
-            if show_progress:
-                print(
-                    f"refine_initial_orientations: final FIRE "
-                    f"({final_fire_steps} steps)"
-                )
-            t_fire = time.time()
-            self.shell_relax(
-                shell_target,
-                num_steps=int(final_fire_steps),
-                neighbor_update_interval=99999,
-                capture_trajectory=False,
-                show_progress=False,
-                **{k: v for k, v in weights.items()
-                   if k in ("bond_weight", "angle_weight",
-                            "repulsion_weight", "hard_core_scale",
-                            "nonbond_push_scale")},
-            )
-            if capture_trajectory:
-                history["iteration"].append(iteration + 1)
-                history["global_cost"].append(
-                    _score(self.atoms.positions, None, None)
-                )
-                history["accepted_grain"].append(-2)  # final-quench sentinel
-                history["amplitude_deg"].append(0.0)
-                history["phase_idx"].append(-1)
-                history["trajectory"].append(
-                    self.atoms.positions.copy().astype(np.float32)
-                )
-            if show_progress:
-                print(f"  final FIRE time: {time.time() - t_fire:.1f} s")
-
-        # Persist optimised rotations on the cell so subsequent
-        # refine_grains*-style methods know the new orientations.
-        for gid in unique_grains:
-            self._grain_rotations_initial[gid] = current_rotations[gid]
-
-        # Re-sync the cell's species-index caches with the current
-        # ``atoms.numbers`` (which may have changed if multi-species
-        # grains rotated and re-ordered Si/O slots).  Without this
-        # the subsequent FIRE quench would see a stale mapping.
-        self._atom_species_index = np.searchsorted(
-            self._species, self.atoms.numbers,
-        )
-        if getattr(self, "_atom_shell_species_index", None) is not None:
-            # The shell-species index follows the same mapping when
-            # we don't have explicit per-atom virtual species.
-            self._atom_shell_species_index = species_idx.copy()
-
-        if hasattr(self, "_rebuild_spatial_index"):
-            self._rebuild_spatial_index()
-
-        traj_arr = (
-            np.asarray(history["trajectory"], dtype=np.float32)
-            if capture_trajectory else None
-        )
+        self._grain_rotations_initial = rotations.copy()
+        traj_arr = (np.asarray(history["trajectory"], dtype=np.float32)
+                    if (capture_trajectory and history["trajectory"])
+                    else None)
         history_out = dict(
             iteration=np.asarray(history["iteration"], dtype=np.intp),
-            global_cost=np.asarray(history["global_cost"],
-                                   dtype=np.float64),
-            accepted_grain=np.asarray(history["accepted_grain"],
-                                      dtype=np.intp),
-            amplitude_deg=np.asarray(history["amplitude_deg"],
-                                     dtype=np.float64),
+            global_cost=np.asarray(history["global_cost"], dtype=np.float64),
+            accepted_grain=np.asarray(history["accepted_grain"], dtype=np.intp),
+            amplitude_deg=np.asarray(history["amplitude_deg"], dtype=np.float64),
             phase_idx=np.asarray(history["phase_idx"], dtype=np.intp),
             trajectory=traj_arr,
         )
+        if show_progress:
+            print(f"refine_initial_orientations: final cost = {best_cost:.5f}, "
+                  f"{iteration} accepts, {_time.time() - t0:.1f}s", flush=True)
         self.refine_initial_orientations_history = history_out
         return history_out
