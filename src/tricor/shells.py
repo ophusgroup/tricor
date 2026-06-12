@@ -231,9 +231,9 @@ class CoordinationShellTarget:
             silences the second-shell ``Si-Si`` / ``O-O`` springs in
             ``SiO2``, the ``Sr-Sr`` / ``Ti-Ti`` / ``O-O`` / ``Sr-Ti``
             springs in ``SrTiO3``, etc.  Set to ``False`` to keep every
-            extracted pair (pre-2026 behaviour); callers can also
-            override the filter by chaining
-            :meth:`with_bonded_species_pairs` after extraction.
+            extracted pair; callers can also override the filter by
+            chaining :meth:`with_bonded_species_pairs` after
+            extraction.
         label : str, optional
             Free-text identifier carried along on the returned target
             (used in plot legends and HTML viewer titles).  Default
@@ -420,8 +420,8 @@ class CoordinationShellTarget:
         #            Sr-Ti > min(Sr) > min(Ti)   → artefact (zeroed)
         #   Cu/Si:   only one species, sole pair → real
         #
-        # Set ``auto_filter_lattice_artifacts=False`` to disable and
-        # recover the pre-fix behaviour (every pair_mask entry kept).
+        # Set ``auto_filter_lattice_artifacts=False`` to disable
+        # (every pair_mask entry kept).
         # Callers can always override afterwards via
         # :meth:`with_bonded_species_pairs` /
         # :meth:`with_cross_species_bonds_only`.

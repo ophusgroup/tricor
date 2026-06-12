@@ -100,7 +100,7 @@ class G3Distribution:
         label
             Human-readable label used in reprs and interactive plots.
         r_min, blur_sigma
-            Legacy aliases retained for compatibility with older notebooks.
+            Aliases accepted for backward compatibility.
         **kwargs
             Additional metadata stored on the distribution for future use.
         """
@@ -128,7 +128,7 @@ class G3Distribution:
         )
         self.r_sigma_at = None if r_sigma_at is None else float(r_sigma_at)
         self.phi_sigma_deg = None if phi_sigma_deg is None else float(phi_sigma_deg)
-        # Legacy alias retained for backward compatibility with existing notebooks.
+        # Alias kept for backward compatibility.
         self.blur_sigma = self.r_sigma
 
         if isinstance(source, G3Distribution):

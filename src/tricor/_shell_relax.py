@@ -211,12 +211,11 @@ class _ShellRelaxMixin:
             If ``True``, atoms identified as deep grain interior (more
             than ``0.5 × max(pair_peak)`` away from the nearest
             grain-boundary plane) are held fixed during relaxation.
-            ``False`` (default since 2026-05) lets every atom relax,
-            which is required for multi-species systems where the
-            interior atoms must accommodate cross-species spring
-            strain (SiO2, SrTiO3, sp²/sp³ carbon).  Setting ``True``
-            reproduces the pre-2026 behaviour and is occasionally
-            useful for single-species nanocrystalline cells where the
+            ``False`` (the default) lets every atom relax, which is
+            required for multi-species systems where the interior
+            atoms must accommodate cross-species spring strain (SiO2,
+            SrTiO3, sp²/sp³ carbon).  ``True`` is occasionally useful
+            for single-species nanocrystalline cells where the
             interiors are already at their target geometry.  Has no
             effect on cells built without a ``grain_size``.
         show_progress
@@ -349,13 +348,11 @@ class _ShellRelaxMixin:
         # --- grain-aware force scaling ---
         # When _grain_ids is set AND the caller asks for it, interior
         # atoms are frozen to preserve crystalline order; boundary
-        # atoms get full relaxation forces.  The default since 2026-05
-        # is ``freeze_grain_interiors=False``: every atom relaxes.
-        # Pre-fix behaviour (interior frozen) caused multi-species
-        # systems (SiO2, SrTiO3, sp²/sp³ carbon) to plateau in a
-        # high-energy basin because the interior atoms could not
-        # accommodate cross-species spring strain that propagated in
-        # from the boundaries.
+        # atoms get full relaxation forces.  Off by default: frozen
+        # interiors leave multi-species systems (SiO2, SrTiO3,
+        # sp²/sp³ carbon) stuck in a high-energy basin because the
+        # interior atoms cannot accommodate cross-species spring
+        # strain that propagates in from the boundaries.
         grain_ids = self._grain_ids
         grain_seeds = self._grain_seeds
         if (
@@ -1160,8 +1157,8 @@ class _ShellRelaxMixin:
             Whether to store per-sweep positions.  Disable for very
             long runs where only cost / T / accept_rate matter.
         freeze_interior
-            Legacy hard-freeze of crystalline grain interiors.  Only
-            takes effect when explicitly set to ``True`` *and* the cell
+            Hard-freeze of crystalline grain interiors.  Only takes
+            effect when explicitly set to ``True`` *and* the cell
             has populated ``_grain_ids`` / ``_grain_seeds`` (i.e. came
             from :meth:`generate` with ``grain_size``).  Default
             ``None`` leaves all atoms free; prefer ``k_restraint > 0``
@@ -1219,12 +1216,10 @@ class _ShellRelaxMixin:
 
         # --- resolve freeze_mask ---
         # Priority: explicit mask > explicit freeze_interior=True.
-        # ``freeze_interior=None`` (default) leaves all atoms free; the
-        # modern way to preserve regime structure is the differentiable
-        # ``k_restraint`` term (see kwarg above), which gives a smooth
-        # tether instead of a hard freeze.  ``freeze_interior=True`` is
-        # retained for back-compat with workflows that explicitly opted
-        # into the legacy hard-freeze behaviour.
+        # ``freeze_interior=None`` (default) leaves all atoms free;
+        # the preferred way to preserve regime structure is the
+        # differentiable ``k_restraint`` term (see kwarg above), which
+        # gives a smooth tether instead of a hard freeze.
         if freeze_mask is not None:
             _freeze_mask_arr = np.asarray(freeze_mask, dtype=bool)
         elif (

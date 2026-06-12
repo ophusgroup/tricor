@@ -2320,17 +2320,15 @@ class _ResampleMixin:
         capture_trajectory: bool = False,
         rng_seed: "int | None" = None,
         show_progress: bool = True,
-        **_ignored_legacy_kwargs,
+        **_ignored_kwargs,
     ) -> dict:
         """Optimise per-grain rotations by re-running the full grain
         assembly with trial rotations and keeping any rotation that
         lowers a global pair-distance cost.  See the comment above for
         the procedure.
 
-        Legacy keyword arguments from the previous cached-topology
-        refiner (``cost_function``, ``score_cutoff_factor``,
-        ``topology_rebuild``, ``final_fire_steps`` …) are accepted and
-        ignored.
+        Unrecognised keyword arguments are accepted and ignored for
+        backward compatibility.
         """
         import time as _time
         from scipy.spatial import cKDTree

@@ -1275,7 +1275,7 @@ def export_overview_html(
                 )
                 for gcfg in groups_cfg
             ]
-            # Clear the legacy single-group fields: viewer will read
+            # Clear the single-group fields: the viewer reads
             # polyhedra_groups in preference.
             if groups_payload:
                 tet_vertices_flat = []
