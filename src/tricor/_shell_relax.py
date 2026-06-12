@@ -128,8 +128,9 @@ class _ShellRelaxMixin:
         num_steps: int = 200,
         *,
         bond_weight: float = 1.0,
-        angle_weight: float = 0.5,
+        angle_weight: float = 1.0,
         repulsion_weight: float = 3.0,
+        bond_potential: str = "auto",
         k_restraint: float = 0.0,
         r_initial_override: "np.ndarray | None" = None,
         freeze_mask: "np.ndarray | None" = None,
@@ -167,6 +168,16 @@ class _ShellRelaxMixin:
             ``angle_mode_deg``.
         repulsion_weight
             Strength of the short-range repulsive force below ``pair_hard_min``.
+        bond_potential
+            ``"auto"`` (default) uses Morse bond forces for species
+            pairs whose shell target carries MACE-calibrated Morse
+            parameters (:meth:`CoordinationShellTarget.calibrate_to_mace`)
+            and harmonic springs otherwise.  ``"harmonic"`` forces
+            harmonic everywhere; ``"morse"`` requires a calibrated
+            target.  Calibrated per-pair / per-triplet stiffnesses are
+            normalised to the mean bonded stiffness, so only the
+            relative weights change and ``bond_weight`` /
+            ``angle_weight`` still scale the overall terms.
         k_restraint
             Spring constant (eV / Å²) for a global position-restraint
             energy ``½ k_restraint Σ ‖r_i - r_initial_i‖²`` that tethers
@@ -236,6 +247,53 @@ class _ShellRelaxMixin:
         angle_mode_rad = np.deg2rad(
             np.asarray(shell_target.angle_mode_deg, dtype=np.float64)
         )
+
+        # --- MACE-calibrated stiffnesses (optional) ---
+        # When ``shell_target.calibrate_to_mace()`` has run, the target
+        # carries per-pair bond stiffness, per-triplet bend stiffness,
+        # Morse anharmonicity, and a MACE-derived hard-core estimate.
+        # Stiffnesses are normalised by the mean bonded k so the force
+        # scale (and therefore integrator stability) matches the
+        # uncalibrated defaults — only the *ratios* change.
+        # ``bond_weight`` / ``angle_weight`` multiply on top.
+        _k_cal = getattr(shell_target, "pair_k_bond", None)
+        _ak_cal = getattr(shell_target, "angle_k", None)
+        _a_cal = getattr(shell_target, "pair_morse_a", None)
+        _hard_cal = getattr(shell_target, "pair_hard_min_mace", None)
+        calibrated = (
+            _k_cal is not None
+            and np.isfinite(np.asarray(_k_cal, dtype=np.float64)).any()
+        )
+        if calibrated:
+            _k_arr = np.asarray(_k_cal, dtype=np.float64)
+            _bonded = (coord_target > 0) & np.isfinite(_k_arr) & (_k_arr > 0)
+            _k_mean = float(_k_arr[_bonded].mean()) if _bonded.any() else 1.0
+            pair_k_rel = np.where(
+                np.isfinite(_k_arr), _k_arr / _k_mean, 1.0)
+            if _ak_cal is not None:
+                _ak_arr = np.asarray(_ak_cal, dtype=np.float64)
+                angle_k_rel = np.where(
+                    np.isfinite(_ak_arr), _ak_arr / _k_mean, 1.0)
+            else:
+                angle_k_rel = np.ones(angle_mode_rad.size, dtype=np.float64)
+            if _a_cal is not None:
+                pair_morse_a = np.nan_to_num(
+                    np.asarray(_a_cal, dtype=np.float64), nan=0.0)
+            else:
+                pair_morse_a = np.zeros_like(pair_peak)
+            # (the calibrated wall is applied to ``hard_core`` below,
+            # replacing the max(hard_min, pair_inner) geometry estimate)
+        else:
+            pair_k_rel = np.ones_like(pair_peak)
+            angle_k_rel = np.ones(angle_mode_rad.size, dtype=np.float64)
+            pair_morse_a = np.zeros_like(pair_peak)
+        if bond_potential == "harmonic":
+            pair_morse_a = np.zeros_like(pair_peak)
+        elif bond_potential == "morse" and not np.any(pair_morse_a > 0):
+            raise ValueError(
+                "bond_potential='morse' requires a MACE-calibrated "
+                "shell target (run shell_target.calibrate_to_mace())."
+            )
         angle_lookup = np.asarray(shell_target.angle_lookup, dtype=np.intp)
         # Per-triplet angle-spring mask.  Defaults to all-True for
         # shell targets produced by older builds that predate the
@@ -262,7 +320,20 @@ class _ShellRelaxMixin:
         # Hard core: use max of pair_hard_min and pair_inner to
         # prevent any bonds shorter than the shell inner boundary.
         pair_inner = np.asarray(shell_target.pair_inner, dtype=np.float64)
-        hard_core = np.maximum(pair_hard_min, pair_inner) * float(hard_core_scale)
+        # MACE-calibrated wall positions are physical exclusion radii
+        # and replace the geometry estimate outright; the crystal
+        # fallback keeps max(hard_min, first-peak inner edge).  Taking
+        # the max against ``pair_inner`` (≈ the inner edge of the bond
+        # peak) would swallow a calibrated wall that sits below it and
+        # flag every legitimate bond as a violation.
+        if calibrated and _hard_cal is not None:
+            _h_arr = np.asarray(_hard_cal, dtype=np.float64)
+            hard_core = np.where(
+                np.isfinite(_h_arr), _h_arr,
+                np.maximum(pair_hard_min, pair_inner),
+            ) * float(hard_core_scale)
+        else:
+            hard_core = np.maximum(pair_hard_min, pair_inner) * float(hard_core_scale)
         mask_zero = hard_core < _EPS
         hard_core[mask_zero] = 0.4 * pair_peak[mask_zero]
         global_floor = float(np.min(pair_peak[pair_peak > _EPS])) * 0.4 if np.any(pair_peak > _EPS) else 1.0
@@ -358,10 +429,13 @@ class _ShellRelaxMixin:
         bond_i = np.empty(0, dtype=np.intp)
         bond_j = np.empty(0, dtype=np.intp)
         bond_r_target = np.empty(0, dtype=np.float64)
+        bond_k = np.empty(0, dtype=np.float64)
+        bond_a = np.empty(0, dtype=np.float64)
         tri_center = np.empty(0, dtype=np.intp)
         tri_a = np.empty(0, dtype=np.intp)
         tri_b = np.empty(0, dtype=np.intp)
         tri_phi_target = np.empty(0, dtype=np.float64)
+        tri_k = np.empty(0, dtype=np.float64)
         bonded_set: set[tuple[int, int]] = set()
         # Sorted int64 array of packed (i, j) bond keys (both directions),
         # used by the per-FIRE-step repulsion-force loop to do an
@@ -375,8 +449,8 @@ class _ShellRelaxMixin:
         bonded_keys_arr: np.ndarray = np.empty(0, dtype=np.int64)
 
         def rebuild_topology() -> None:
-            nonlocal bond_i, bond_j, bond_r_target
-            nonlocal tri_center, tri_a, tri_b, tri_phi_target
+            nonlocal bond_i, bond_j, bond_r_target, bond_k, bond_a
+            nonlocal tri_center, tri_a, tri_b, tri_phi_target, tri_k
             nonlocal bonded_set, bonded_keys_arr
 
             nl_i, nl_j, nl_d = neighbor_list("ijd", self.atoms, cutoff)
@@ -538,16 +612,23 @@ class _ShellRelaxMixin:
             # each), and rebuilds run every 10 FIRE steps - so for
             # liquid (angle_weight=0, num_steps=120) this saves
             # roughly 100-150 s per regime.
+            # Per-bond calibrated stiffness + Morse parameter (all ones
+            # / zeros when the shell target is uncalibrated).
+            bond_k = pair_k_rel[species_idx[bond_i], species_idx[bond_j]]
+            bond_a = pair_morse_a[species_idx[bond_i], species_idx[bond_j]]
+
             if float(angle_weight) == 0.0:
                 tri_center = np.empty(0, dtype=np.intp)
                 tri_a = np.empty(0, dtype=np.intp)
                 tri_b = np.empty(0, dtype=np.intp)
                 tri_phi_target = np.empty(0, dtype=np.float64)
+                tri_k = np.empty(0, dtype=np.float64)
             else:
                 _tc: list[int] = []
                 _ta: list[int] = []
                 _tb: list[int] = []
                 _tp: list[float] = []
+                _tk: list[float] = []
                 for atom in range(num_atoms):
                     bn = bonded_neighbors[atom]
                     if len(bn) < 2:
@@ -572,11 +653,13 @@ class _ShellRelaxMixin:
                             _ta.append(int(bn[ia]))
                             _tb.append(int(bn[ib]))
                             _tp.append(phi_t)
+                            _tk.append(float(angle_k_rel[triplet_idx]))
 
                 tri_center = np.array(_tc, dtype=np.intp)
                 tri_a = np.array(_ta, dtype=np.intp)
                 tri_b = np.array(_tb, dtype=np.intp)
                 tri_phi_target = np.array(_tp, dtype=np.float64)
+                tri_k = np.array(_tk, dtype=np.float64)
 
             # Build the sorted packed-key array for fast per-step
             # bonded-pair lookup.  ``bonded_set`` already contains both
@@ -672,20 +755,36 @@ class _ShellRelaxMixin:
                 bond_r_safe = np.maximum(bond_r, _EPS)
                 bond_hat = bond_vec / bond_r_safe[:, None]
                 delta_r = bond_r - bond_r_target
-                bond_loss = float(np.mean(delta_r ** 2))
-                f_bond = (bond_weight * delta_r)[:, None] * bond_hat
+                morse_m = bond_a > 0
+                if morse_m.any():
+                    # Morse where calibrated: F = (k/a)(1-e^-aΔ)e^-aΔ,
+                    # which reduces to kΔ for small Δ (D = k / 2a²).
+                    mag = bond_k * delta_r
+                    am = bond_a[morse_m]
+                    ex = np.exp(-am * delta_r[morse_m])
+                    mag[morse_m] = (bond_k[morse_m] / am) * (1.0 - ex) * ex
+                    e_pair = 0.5 * bond_k * delta_r ** 2
+                    e_pair[morse_m] = (bond_k[morse_m] / (2.0 * am * am)) \
+                        * (1.0 - ex) ** 2
+                else:
+                    mag = bond_k * delta_r
+                    e_pair = 0.5 * bond_k * delta_r ** 2
+                # Weighted spring energy — the same objective the
+                # forces descend, so the best-frame restore selects
+                # consistently (an unweighted metric rejects frames
+                # whenever stiff calibrated angles trade bond strain
+                # for larger weighted angle gains).
+                bond_loss = float(np.mean(bond_weight * e_pair))
+                f_bond = (bond_weight * mag)[:, None] * bond_hat
                 np.add.at(force, bond_i, f_bond)
                 np.add.at(force, bond_j, -f_bond)
                 if atom_cost is not None:
-                    # Spring-energy contribution: 0.5 * k * delta_r^2
-                    # with k = bond_weight.  Before this the cost
-                    # stored just delta_r^2/2 (unscaled), so weak-
-                    # relax liquids with large residual delta_r
-                    # reported spuriously enormous per-atom costs in
-                    # the trajectory viewer (e.g. Cu liquid with
-                    # bond_weight=0.05 showed cost_max=100 vs Si's
-                    # bond_weight=0.4 showing cost_max=4).
-                    half_bond_cost = 0.5 * float(bond_weight) * delta_r ** 2
+                    # Spring-energy contribution split half to each
+                    # bond partner.  Weighted so weak-relax liquids
+                    # with large residual delta_r don't report
+                    # spuriously enormous per-atom costs in the
+                    # trajectory viewer.
+                    half_bond_cost = 0.5 * float(bond_weight) * e_pair
                     np.add.at(atom_cost, bond_i, half_bond_cost)
                     np.add.at(atom_cost, bond_j, half_bond_cost)
 
@@ -708,13 +807,14 @@ class _ShellRelaxMixin:
                 sin_phi_safe = np.maximum(sin_phi, 1e-7)
 
                 delta_phi = phi - tri_phi_target
-                angle_loss = float(np.mean(delta_phi ** 2))
+                angle_loss = float(
+                    np.mean(0.5 * angle_weight * tri_k * delta_phi ** 2))
                 if atom_cost is not None:
-                    # 0.5 * angle_weight * delta_phi^2 split 1/3 to
-                    # each of the three triplet atoms.  Same scaling
+                    # 0.5 * angle_weight * k_t * delta_phi^2 split 1/3
+                    # to each of the three triplet atoms.  Same scaling
                     # rationale as the bond cost above.
                     third_angle_cost = (
-                        0.5 * float(angle_weight) * delta_phi ** 2 / 3.0
+                        0.5 * float(angle_weight) * tri_k * delta_phi ** 2 / 3.0
                     )
                     np.add.at(atom_cost, tri_center, third_angle_cost)
                     np.add.at(atom_cost, tri_a, third_angle_cost)
@@ -723,8 +823,9 @@ class _ShellRelaxMixin:
                 perp_a = (hat_b - cos_phi[:, None] * hat_a) / sin_phi_safe[:, None]
                 perp_b = (hat_a - cos_phi[:, None] * hat_b) / sin_phi_safe[:, None]
 
-                f_angle_a = (angle_weight * delta_phi / r_a_safe)[:, None] * perp_a
-                f_angle_b = (angle_weight * delta_phi / r_b_safe)[:, None] * perp_b
+                _kphi = angle_weight * tri_k * delta_phi
+                f_angle_a = (_kphi / r_a_safe)[:, None] * perp_a
+                f_angle_b = (_kphi / r_b_safe)[:, None] * perp_b
 
                 np.add.at(force, tri_a, f_angle_a)
                 np.add.at(force, tri_b, f_angle_b)
@@ -784,7 +885,11 @@ class _ShellRelaxMixin:
 
                 total_rep_mag = hard_mag + nonbond_mag
                 active = total_rep_mag > 0.0
-                repulsion_loss = float(np.sum(hard_mask)) + 0.1 * float(np.sum(nonbond_mask))
+                # Hard-core violations only: the non-bonded clearance
+                # zone is a soft preference, and counting it in the
+                # selection metric punishes legitimate second-shell
+                # settling (the count dwarfs the spring terms).
+                repulsion_loss = float(np.sum(hard_mask))
 
                 if np.any(active):
                     f_rep = total_rep_mag[:, None] * rep_hat
@@ -832,7 +937,7 @@ class _ShellRelaxMixin:
             total_loss = (
                 bond_loss
                 + angle_loss
-                + repulsion_loss / max(num_atoms, 1)
+                + repulsion_weight * repulsion_loss / max(num_atoms, 1)
                 + restraint_loss * k_restraint_f
             )
             loss_history[step] = total_loss

@@ -457,7 +457,7 @@ class Supercell(
         grain_size: float | None = None,
         crystalline_fraction: float = 1.0,
         bond_weight: float = 1.0,
-        angle_weight: float = 0.5,
+        angle_weight: float = 1.0,
         repulsion_weight: float = 3.0,
         hard_core_scale: float = 1.0,
         nonbond_push_scale: float = 1.0,
