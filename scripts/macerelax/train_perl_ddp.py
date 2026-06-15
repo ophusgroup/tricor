@@ -82,15 +82,16 @@ CHECK_VAL_EVERY_N_EPOCHS    = 5
 EARLY_STOP_PATIENCE_EPOCHS  = 10
 LIMIT_TRAIN_BATCHES         = None              # int or None
 LIMIT_VAL_BATCHES           = None              # int or None
-LOG_EVERY_N_STEPS           = 50
+LOG_EVERY_N_STEPS           = 500
 
 # --- I/O ---
 LOG_DIR  = "/pscratch/sd/e/ehrdt/macerelax/lightning_logs"
-RUN_NAME = "ddp_test_v1"                        # tensorboard + checkpoint subdir name
+RUN_NAME = "ddp_v1"                        # tensorboard + checkpoint subdir name
 RESUME_CKPT = None                              # path to .pt to resume from, or None
-                                                # (env var RESUME_CKPT_OVERRIDE wins
-                                                # if set — used by sbatch auto-resume)
 
+# Allow RESUME_CKPT to be overridden by env var, e.g. set by sbatch's
+# auto-resume block (submit_train.sh) or run_interactive.sh.  This is what
+# enables chained / interactive runs to pick up from each other's last.pt.
 import os as _os
 _env_resume = _os.environ.get("RESUME_CKPT_OVERRIDE")
 if _env_resume:

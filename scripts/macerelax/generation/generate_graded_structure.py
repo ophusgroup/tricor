@@ -13,14 +13,17 @@ Pipeline:
      the cell's long-axis wrap joins like-to-like (symmetric-periodic).
   2. bond_relax geometric cleanup (NOT shell_relax) — heals Voronoi-boundary
      overlaps without erasing the gradient.
-  3. MACE-MPA + min-distance wall, LBFGS, N_STEPS steps.
+  3. MACE-MPA + min-distance wall, FIRE, N_STEPS steps.  Uses the SAME FIRE
+     params as the big_v1 generator (generate_mace_trajectories.py):
+     maxstep=0.3, N_STEPS=60.  Every frame is saved (stride 1).
 
-       *** N_STEPS IS DELIBERATELY SMALL. ***
+       *** Watch the gradient vs step count. ***
      Per MACE_RELAX_PILOT.md §2g, MACE amplifies the order gradient for the
-     first ~10 steps then collapses every regime into a common glassy basin
-     by step ~40-50.  For a graded structure we WANT to keep the spatial
-     gradient, so we stop at ~20 steps.  Raising N_STEPS will homogenise the
-     structure toward glass and destroy the very gradient we are building.
+     first ~10 steps then tends to collapse regimes toward a common glassy
+     basin as the relaxation deepens.  We do NOT pre-empt that by under-
+     relaxing — we relax with the standard params and let
+     analyze_graded_structure.py scan the saved frames (SCAN_STEPS) to find
+     where the spatial gradient is strongest and where it starts to wash out.
 
   4. save NPZ trajectory + extxyz frames (initial / cleaned / final), each
      carrying a per-atom `order` coordinate (0=disordered, 1=ordered) for
@@ -48,7 +51,7 @@ import numpy as np
 import torch
 from ase import Atoms
 from ase.io import read as ase_read, write as ase_write
-from ase.optimize import LBFGS
+from ase.optimize import FIRE
 from mace.calculators import mace_mp
 
 torch.set_num_threads(4)
@@ -68,20 +71,31 @@ REFERENCE_CIF = Path("/wigeon/users/ehrdt/prod/cifs_mp_cnos/mp-7000_SiO2.cif")
 SYSTEM_LABEL  = "SiO2_quartz_graded"   # used for output filenames
 
 # --- Geometry (anisotropic box: long axis gets the gradient) ---
-CROSS_SECTION_ANGSTROMS = 40.0    # the two short axes (Å)
-LONG_AXIS_ANGSTROMS     = 240.0   # the elongated axis (Å) — gradient runs here
+# 25 x 25 x 200 Å at quartz density (~0.075 atoms/Å³ @ rel_density 0.94) is
+# ~9.4k atoms — comfortably inside the validated MACE-MPA H100 envelope
+# (the pilot OOM'd at ~14-15k; see MACE_RELAX_PILOT.md §10.1).  Bump the box
+# only if you confirm headroom, or port the OOM auto-shrink loop first.
+CROSS_SECTION_ANGSTROMS = 25.0    # the two short axes (Å)
+LONG_AXIS_ANGSTROMS     = 200.0   # the elongated axis (Å) — gradient runs here
 LONG_AXIS               = 2        # 0=x, 1=y, 2=z
 RELATIVE_DENSITY        = 0.94     # HELD CONSTANT along the axis (order-only gradient)
 RNG_SEED                = 12345
 
 # --- Gradient shape ---
 ORDER_PROFILE        = "cosine_disordered_ends"  # disordered ends, ordered core
-GRAIN_SIZE_MIN       = 6.0    # grain diameter (Å) at the disordered end
-GRAIN_SIZE_MAX       = 30.0   # grain diameter (Å) at the ordered end (crystalline_30)
-CRYST_PROB_MIN       = 0.0    # P(crystalline grain) at order 0
-CRYST_PROB_MAX       = 1.0    # P(crystalline grain) at order 1
-CRYST_PROB_GAMMA     = 1.5    # >1 sharpens ends toward pure amorphous / crystalline
-DISPLACEMENT_SIGMA   = 0.0    # thermal jitter (Å); 0 = none (keeps the signal clean)
+# Gradient is driven SOLELY by grain size, exactly like tricor's real regime
+# ladder: every preset from `amorphous` (grain_size=6) to `crystalline_30`
+# (grain_size=30) packs at crystalline_fraction=1.0 — the disorder comes from
+# grain SIZE (tiny randomly-oriented crystallites → amorphous-like), not from
+# amorphous-filled grains.  So crystalline_prob is pinned to 1.0 here; the
+# crystalline_prob_* knobs (not a real tricor packing param) stay inert.
+GRAIN_SIZE_MIN       = 6.0    # = tricor amorphous preset grain_size (disordered end)
+GRAIN_SIZE_MAX       = 30.0   # = tricor crystalline_30 grain_size (ordered end)
+CRYST_PROB_MIN       = 1.0    # all grains crystalline (matches the regime ladder)
+CRYST_PROB_MAX       = 1.0    # all grains crystalline
+CRYST_PROB_GAMMA     = 1.0    # inert when min==max
+DISPLACEMENT_SIGMA   = 0.0    # thermal jitter (Å); amorphous preset uses 0.08 but
+                              # the big_v1 MACE pipeline zeroes it — we match that.
 
 # --- Geometric overlap cleanup (before MACE) ---
 BOND_RELAX_N_ITER    = 80
@@ -91,9 +105,16 @@ BOND_RELAX_MAX_STEP  = 0.1
 MACE_MODEL           = "medium-mpa-0"
 MACE_DEVICE          = "cuda"
 MACE_DEFAULT_DTYPE   = "float32"
-N_STEPS              = 20      # *** keep small — see module docstring + §2g ***
-OPT_MAXSTEP          = 0.1     # LBFGS maxstep (Å) — matches the validated sweep
-FMAX_TARGET          = 0.05    # rarely reached in 20 steps; N_STEPS is the real stop
+N_STEPS              = 60      # MATCHES big_v1 generate_mace_trajectories.py.
+                               # We SAVE EVERY FRAME (stride 1); FIRE evolves
+                               # deterministically, so the frames at any step in
+                               # this single trajectory ARE that step's result —
+                               # analyze_graded_structure.py slices them
+                               # (SCAN_STEPS) to find where the spatial gradient
+                               # is strongest and where it collapses (§2g).
+OPT_MAXSTEP          = 0.3     # FIRE maxstep (Å) — MATCHES big_v1 (was 0.1, which
+                               # under-relaxed: atoms barely moved, fmax ~unchanged).
+FMAX_TARGET          = 0.05    # may not be reached in 60 steps; N_STEPS is the cap
 WALL_K               = 1000.0
 WALL_EXPONENT        = 4
 WALL_MARGIN          = 0.0
@@ -136,8 +157,10 @@ def build_graded_pack():
 
 
 def run_mace_relax(atoms, base_calc):
-    """LBFGS on the MACE+wall PES, saving every step.  Wall thresholds are
-    derived per-run from the bond_relax-cleaned structure."""
+    """FIRE on the MACE+wall PES, saving every step.  Wall thresholds are
+    derived per-run from the bond_relax-cleaned structure.  FIRE is the
+    optimizer used by the big_v1 trajectory generator (it is memory-less,
+    so each step's displacement is a clean function of the current state)."""
     r_min_per_pair = per_pair_min_from_atoms(atoms, margin=WALL_MARGIN)
     atoms.calc = MinDistanceWallCalculator(
         base_calc=base_calc, r_min_per_pair=r_min_per_pair,
@@ -155,7 +178,7 @@ def run_mace_relax(atoms, base_calc):
     snapshot_steps.append(0)
     energy_history.append(e0)
 
-    opt = LBFGS(atoms, maxstep=OPT_MAXSTEP, logfile=None)
+    opt = FIRE(atoms, maxstep=OPT_MAXSTEP, logfile=None)
 
     def per_step_callback():
         energy_history.append(float(atoms.get_potential_energy()))
@@ -194,7 +217,8 @@ def main() -> None:
           f"{LONG_AXIS_ANGSTROMS} Å  rel_density={RELATIVE_DENSITY}")
     print(f"  gradient: {ORDER_PROFILE}  grain {GRAIN_SIZE_MIN}->{GRAIN_SIZE_MAX} Å  "
           f"P_cryst {CRYST_PROB_MIN}->{CRYST_PROB_MAX} (gamma={CRYST_PROB_GAMMA})")
-    print(f"  MACE: {MACE_MODEL}  LBFGS steps={N_STEPS} (kept small — §2g)\n")
+    print(f"  MACE: {MACE_MODEL}  FIRE steps={N_STEPS} maxstep={OPT_MAXSTEP} "
+          f"(matches big_v1)\n")
 
     # ---- 1+2. graded pack + cleanup ----
     t0 = time.perf_counter()
@@ -264,12 +288,20 @@ def main() -> None:
         system_label=np.asarray(SYSTEM_LABEL),
         reference_cif=np.asarray(str(REFERENCE_CIF)),
         backend=np.asarray("mace+wall"),
-        optimizer=np.asarray("LBFGS"),
+        optimizer=np.asarray("FIRE"),
         mace_model=np.asarray(MACE_MODEL),
     )
     size_mb = out_npz.stat().st_size / (1024 * 1024)
+
+    # Also dump the full trajectory as a multi-frame extxyz so it opens
+    # directly in OVITO (animation), coloured by the per-atom `order` column.
+    from npz_trajectory_to_xyz import npz_to_trajectory_xyz
+    out_traj_xyz = OUTPUT_DIR / f"{SYSTEM_LABEL}_trajectory.xyz"
+    n_frames = npz_to_trajectory_xyz(out_npz, out_traj_xyz)
+
     print(f"\nDone in {(time.perf_counter()-t0)/60:.1f} min")
     print(f"  trajectory: {out_npz}  ({size_mb:.1f} MB)")
+    print(f"  trajectory (OVITO): {out_traj_xyz}  ({n_frames} frames, colour by 'order')")
     print(f"  xyz frames: {SYSTEM_LABEL}_{{initial,cleaned,final}}.xyz in {OUTPUT_DIR}")
     print(f"  next: python scripts/macerelax/generation/analyze_graded_structure.py")
 

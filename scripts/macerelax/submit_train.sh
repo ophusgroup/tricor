@@ -12,7 +12,7 @@
 # which train_perl_ddp.py's setup_distributed() reads.
 
 #SBATCH --job-name=macetrain_ddp
-#SBATCH --nodes=1                              # → CHANGE to N for multi-node
+#SBATCH --nodes=2                              # → CHANGE to N for multi-node
 #SBATCH --qos=regular                          # "debug" allows ≤30 min, ≤2 nodes
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
@@ -20,7 +20,7 @@
 #SBATCH --cpus-per-task=64
 #SBATCH -A m5241
 #SBATCH -C "gpu&hbm80g"
-#SBATCH -t 12:00:00                            # adjust walltime per epoch * MAX_EPOCHS
+#SBATCH -t 14:00:00                            # adjust walltime per epoch * MAX_EPOCHS
 #SBATCH --signal=B:USR1@300                    # send SIGUSR1 5 min before walltime
 #SBATCH --output=logs/train-%j.out
 #SBATCH --error=logs/train-%j.err
