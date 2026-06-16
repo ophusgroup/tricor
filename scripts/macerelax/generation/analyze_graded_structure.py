@@ -38,9 +38,12 @@ DATA_DIR     = Path("/home/ehrdt/tricor/mace/data/graded_v1")
 SYSTEM_LABEL = "SiO2_quartz_graded"
 TRAJ_NPZ     = DATA_DIR / f"{SYSTEM_LABEL}_trajectory.npz"
 
-N_SLABS = 24      # bins along the long axis
-R_MAX   = 6.0     # Å — pair-distance cutoff for the per-slab g(r)
-R_BINS  = 120     # radial bins
+N_SLABS    = 24            # bins along the long axis
+R_MAX      = 6.0           # Å — pair-distance cutoff for the per-slab g(r)
+R_BINS     = 120           # radial bins
+SCAN_STEPS = [15, 30, 45, 60]  # MACE/FIRE step counts to compare (sliced from the
+                           # single saved trajectory — see generate script's
+                           # N_STEPS note).  The frame nearest each step is used.
 OUT_PNG = DATA_DIR / f"{SYSTEM_LABEL}_gradient_analysis.png"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -104,15 +107,23 @@ def main() -> None:
     numbers = z["species_numbers"]
     cell = z["cell"].astype(np.float64)
     long_axis = int(z["long_axis"])
-    order = z["order"]
+    order = z["order"]                       # per-atom target order (initial frame)
+    traj = z["positions"].astype(np.float64)         # (S, N, 3) every saved frame
+    snap_steps = z["snapshot_steps"].astype(int)     # (S,) step index per frame
+    max_step = int(snap_steps.max())
 
-    frames = {
-        "initial":  z["initial_positions"].astype(np.float64),
-        "cleaned":  z["cleaned_positions"].astype(np.float64),
-        "final (MACE)": z["final_positions"].astype(np.float64),
-    }
+    def frame_at_step(step):
+        """Trajectory frame nearest the requested FIRE step (clamped)."""
+        target = min(step, max_step)
+        return traj[int(np.argmin(np.abs(snap_steps - target)))]
 
-    fig, axes = plt.subplots(2, len(frames), figsize=(5 * len(frames), 8),
+    # Baseline = bond_relax-cleaned (pre-MACE) + one frame per scan step, so the
+    # bottom row shows how the spatial gradient evolves with MACE step count.
+    frames = {"cleaned (0)": z["cleaned_positions"].astype(np.float64)}
+    for st in SCAN_STEPS:
+        frames[f"step {min(st, max_step)}"] = frame_at_step(st)
+
+    fig, axes = plt.subplots(2, len(frames), figsize=(4.2 * len(frames), 8),
                              constrained_layout=True)
 
     contrasts = {}
@@ -132,11 +143,18 @@ def main() -> None:
         fig.colorbar(im, ax=ax, shrink=0.8)
 
     # Bottom row: order metric + the target order profile, shared across frames.
-    target_order_by_slab = []
-    for sb in range(N_SLABS):
-        s = (sb + 0.5) / N_SLABS
-        target_order_by_slab.append(0.5 * (1.0 - np.cos(2.0 * np.pi * s)))
-    target_order_by_slab = np.array(target_order_by_slab)
+    # Build the target straight from the stored per-atom `order` (works for any
+    # profile), binned by initial-frame slab membership.
+    init_pos = z["initial_positions"].astype(np.float64)
+    L = float(cell[long_axis, long_axis])
+    slab_init = np.clip(
+        (np.mod(init_pos[:, long_axis] / L, 1.0) * N_SLABS).astype(int),
+        0, N_SLABS - 1,
+    )
+    target_order_by_slab = np.array([
+        order[slab_init == sb].mean() if np.any(slab_init == sb) else np.nan
+        for sb in range(N_SLABS)
+    ])
 
     for col, name in enumerate(frames):
         ax = axes[1, col]
@@ -154,20 +172,23 @@ def main() -> None:
         ax.set_title(f"{name}: order vs position")
 
     fig.suptitle(
-        f"{SYSTEM_LABEL}: spatial disorder gradient "
-        f"(does it survive MACE? — compare 'final' bottom row to red target)",
+        f"{SYSTEM_LABEL}: spatial disorder gradient vs MACE step count "
+        f"(per-slab order should track the red target; watch it fade as steps grow)",
         fontsize=12,
     )
     fig.savefig(OUT_PNG, dpi=130)
     print(f"wrote {OUT_PNG}")
 
-    # Quick numeric readout: correlation of final peak-contrast with target.
-    cf = contrasts["final (MACE)"]
-    good = np.isfinite(cf)
-    if good.sum() > 3:
-        corr = np.corrcoef(cf[good], target_order_by_slab[good])[0, 1]
-        print(f"final-frame order-vs-target correlation: {corr:+.3f}  "
-              f"(closer to +1 = gradient preserved)")
+    # Numeric readout: gradient retention (order-vs-target correlation) for every
+    # frame.  A correlation that stays high at step 10/20 but drops by step 30
+    # tells you where the gradient starts collapsing into a uniform glass (§2g).
+    print("\ngradient retention (peak-contrast vs target order, +1 = preserved):")
+    for name in frames:
+        c = contrasts[name]
+        good = np.isfinite(c) & np.isfinite(target_order_by_slab)
+        corr = (np.corrcoef(c[good], target_order_by_slab[good])[0, 1]
+                if good.sum() > 3 else float("nan"))
+        print(f"  {name:>12s}: {corr:+.3f}")
 
 
 if __name__ == "__main__":

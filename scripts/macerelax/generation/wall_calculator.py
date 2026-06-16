@@ -223,27 +223,15 @@ class MinDistanceWallCalculatorLoop(Calculator):
         self.results["wall_max_penetration"] = max_penetration
 
 
-def per_pair_min_from_atoms(atoms, margin: float = 0.0,
-                              cutoff: float = 5.0) -> dict:
-    """Compute observed min pair distance per (Z, Z) from the current atoms.
+def _per_pair_min_from_atoms_ase(atoms, margin: float = 0.0,
+                                  cutoff: float = 5.0) -> dict:
+    """Original ase.neighborlist implementation — fallback for non-
+    orthogonal cells where cKDTree's ``boxsize`` torus metric is wrong.
 
-    Uses ASE's `neighbor_list` cell-list lookup at `cutoff` (default 5 Å)
-    instead of an O(N²) all-pairs distance matrix — sub-second at
-    N~10k atoms versus 5-15 seconds for the old implementation.
-
-    Cutoff rationale: typical bond_relax-cleaned structures have all
-    meaningful pair distances < 4 Å. 5 Å gives margin while keeping the
-    neighbor list small. If for some reason no pair of a given (Z, Z)
-    appears within cutoff (unusually low density / pair absent), that
-    pair is omitted from the output — the wall is silent on it, which
-    is correct: there's nothing to push apart.
-
-    Subtracts ``margin`` (Å) from each observed min — set margin = 0 to
-    use the observed minimum as the floor (recommended); set margin > 0
-    if you want to allow small additional compression.
+    Sub-second at N~10k atoms; can hit ~10 s at N~200k due to large
+    per-atom neighbor counts at 5 Å cutoff.  See the vectorized
+    ``per_pair_min_from_atoms`` below for the fast path.
     """
-    from ase.neighborlist import neighbor_list
-
     i_idx, j_idx, dist = neighbor_list(
         "ijd", atoms, cutoff, self_interaction=False,
     )
@@ -264,4 +252,91 @@ def per_pair_min_from_atoms(atoms, margin: float = 0.0,
                 continue
             min_d = float(dist[mask].min())
             out[(a, b)] = max(0.0, min_d - float(margin))
+    return out
+
+
+def per_pair_min_from_atoms(atoms, margin: float = 0.0,
+                              cutoff: float = 5.0) -> dict:
+    """Compute observed min pair distance per (Z, Z) from the current atoms.
+
+    For orthogonal cells (the common case for tricor supercells): uses
+    ``scipy.spatial.cKDTree.query_pairs`` with periodic ``boxsize``.
+    Drops wall-clock from ~7 s → ~0.3 s at N=180k atoms vs the
+    ase.neighborlist path, which the supercell ``setup`` stage in
+    ``generate_with_student.py`` hit on 100×100×400 boxes.
+
+    For non-orthogonal cells, falls back to the original
+    ``_per_pair_min_from_atoms_ase`` implementation (cKDTree's
+    ``boxsize`` argument needs an axis-aligned box).
+
+    Cutoff rationale: typical bond_relax-cleaned structures have all
+    meaningful pair distances < 4 Å. 5 Å gives margin while keeping the
+    neighbor list small. If for some reason no pair of a given (Z, Z)
+    appears within cutoff (unusually low density / pair absent), that
+    pair is omitted from the output — the wall is silent on it, which
+    is correct: there's nothing to push apart.
+
+    Subtracts ``margin`` (Å) from each observed min — set margin = 0 to
+    use the observed minimum as the floor (recommended); set margin > 0
+    if you want to allow small additional compression.
+    """
+    from scipy.spatial import cKDTree
+
+    pos = np.asarray(atoms.positions, dtype=np.float64)
+    if len(pos) < 2:
+        return {}
+
+    cell_arr = np.asarray(atoms.cell.array, dtype=np.float64)
+    diag = np.diag(cell_arr)
+    # cKDTree(boxsize=...) only supports axis-aligned periodic cells —
+    # fall back to the ase neighborlist path for anything else.
+    if not np.allclose(cell_arr, np.diag(diag), atol=1e-6):
+        return _per_pair_min_from_atoms_ase(atoms, margin=margin, cutoff=cutoff)
+
+    # cKDTree's boxsize requires every input coordinate to lie in
+    # [0, L).  bond_relax leaves atoms slightly outside the box (per-
+    # atom-magnitude clipping doesn't re-wrap after displacement), and
+    # ase.neighborlist silently handles this — but cKDTree raises
+    # ``ValueError: Some input data are greater than the size of the
+    # periodic box.``  Wrap explicitly here.  Min-image below works
+    # identically on wrapped vs unwrapped positions.
+    pos_wrapped = pos - np.floor(pos / diag) * diag
+
+    tree = cKDTree(pos_wrapped, boxsize=diag)
+    pair_arr = tree.query_pairs(float(cutoff), output_type="ndarray")
+    if len(pair_arr) == 0:
+        return {}
+
+    i_idx = pair_arr[:, 0]
+    j_idx = pair_arr[:, 1]
+
+    # Distances with minimum-image convention (orthogonal box).
+    delta = pos_wrapped[j_idx] - pos_wrapped[i_idx]
+    delta -= np.round(delta / diag) * diag
+    dist = np.sqrt(np.einsum("ij,ij->i", delta, delta))
+
+    z = np.asarray(atoms.numbers, dtype=np.int64)
+    z_i = z[i_idx]
+    z_j = z[j_idx]
+    # Canonical ordering: (z_lo, z_hi) with z_lo <= z_hi.  Pack into a
+    # single int64 key so we can group with one sort + reduceat.
+    z_lo = np.minimum(z_i, z_j)
+    z_hi = np.maximum(z_i, z_j)
+    # Z fits comfortably in 16 bits; pack as (z_lo << 32) | z_hi so no
+    # collisions even with hypothetical superheavy elements.
+    keys = (z_lo.astype(np.int64) << 32) | z_hi.astype(np.int64)
+
+    sort_idx = np.argsort(keys, kind="stable")
+    keys_sorted = keys[sort_idx]
+    dist_sorted = dist[sort_idx]
+
+    unique_keys, group_starts = np.unique(keys_sorted, return_index=True)
+    group_mins = np.minimum.reduceat(dist_sorted, group_starts)
+
+    out: dict = {}
+    margin_f = float(margin)
+    for k, dmin in zip(unique_keys, group_mins):
+        a = int(k >> 32)
+        b = int(k & 0xFFFFFFFF)
+        out[(a, b)] = max(0.0, float(dmin) - margin_f)
     return out

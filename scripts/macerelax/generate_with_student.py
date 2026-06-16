@@ -68,16 +68,18 @@ NUM_THREADS = 4
 
 # --- input ---
 # Recommend: keep this constrained to training-chemistry CIFs.
-CIF_DIR       = Path("/pscratch/sd/e/ehrdt/tricor/cifs_mp_cnos_le100meV_training")
+# ── BUFFLE E2E VALIDATION (revert with git checkout) ─────────────────────────
+CIF_DIR       = Path("/home/ehrdt/cifs_mp_exp_le100meV")
 # One filename per line.  None = use every *.cif in CIF_DIR.
-CIF_LIST_FILE: Path | None = None
+CIF_LIST_FILE: Path | None = Path("/home/ehrdt/tricor/scratch/validate_e2e_cifs.txt")
 # Stop after this many CIFs (smoke-testing); None = process all.
 MAX_CIFS: int | None = None
 
 # --- model ---
-MODEL_LOG_DIR        = "/pscratch/sd/e/ehrdt/macerelax/lightning_logs"
-MODEL_RUN_NAME       = "ddp_v1"
-MODEL_RUN_TIMESTAMP: str | None = None   # None → most recent run_*
+# ── BUFFLE E2E VALIDATION (revert with git checkout) ─────────────────────────
+MODEL_LOG_DIR        = "/home/ehrdt"
+MODEL_RUN_NAME       = "perl_tb_logs"
+MODEL_RUN_TIMESTAMP: str | None = "1781193088"  # known-good checkpoint, Jun 11
 MODEL_EPOCH          = "best"            # "last" | "best" | "<path>"
 USE_EMA_WEIGHTS      = True
 
@@ -99,7 +101,8 @@ SEEDS = [2_000_000]
 # Supercell dimensions in Å.  Cubic (a, a, a) at training time was 50.0;
 # tuple of three lets you go non-cubic (e.g., (100., 100., 400.) for slabs).
 # WARNING: large cells are OOD vs training; validate first via test scripts.
-CELL_DIMS = (50.0, 50.0, 50.0)
+# ── BUFFLE E2E VALIDATION (revert with git checkout) ─────────────────────────
+CELL_DIMS = (100.0, 100.0, 400.0)
 DENSITY_BY_REGIME = {
     "amorphous":       0.92,
     "SRO":             0.92,
@@ -134,7 +137,8 @@ CONVERGENCE_TOL_ANG  = 0.001
 CUTOFF               = 5.0
 
 # --- output ---
-OUTPUT_ROOT = Path("/pscratch/sd/e/ehrdt/macerelax/generated_v1")
+# ── BUFFLE E2E VALIDATION (revert with git checkout) ─────────────────────────
+OUTPUT_ROOT = Path("/home/ehrdt/tricor/scratch/validate_e2e_out")
 SAVE_NPZ    = False  # turn back on if you want to retrain on these structures
 SAVE_CIF    = False  # turn back on if you want per-traj CIFs
 SAVE_XYZ    = True   # one-frame XYZ per trajectory (final structure only)
@@ -365,8 +369,16 @@ def build_supercell(cif_path: Path, regime: str, rho: float, seed: int):
     return cell, shell, ref, summary
 
 
-def cleanup(cell, shell):
-    cell.bond_relax(shell, n_iter=BOND_RELAX_N_ITER, max_step=BOND_RELAX_MAX_STEP)
+def cleanup(cell, shell, device=None):
+    # Pass through the GPU device — tricor's bond_relax dispatches to a
+    # hybrid CPU-cKDTree + GPU-force-scatter path with pair-list caching
+    # when device is non-None.  Drops bond_relax wall-clock from ~17 s →
+    # ~4 s at 100×100×400 / 358 k atoms (TiO2), with sub-machine-
+    # precision agreement vs the CPU path.
+    cell.bond_relax(
+        shell, n_iter=BOND_RELAX_N_ITER, max_step=BOND_RELAX_MAX_STEP,
+        device=device,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -654,7 +666,7 @@ def generate_for_cif(model, cif_path: Path, device) -> list[GenResult]:
                 t_pack = time.time() - _ts
 
                 _ts = time.time()
-                cleanup(cell, shell)
+                cleanup(cell, shell, device=device)
                 t_cleanup = time.time() - _ts
 
                 _ts = time.time()

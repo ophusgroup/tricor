@@ -225,6 +225,158 @@ def _random_rotation_matrices(num_grains: int, rng: np.random.Generator) -> np.n
     return matrices
 
 
+def _grain_assign_fast(
+    master_positions: np.ndarray,
+    master_numbers: np.ndarray,
+    seeds: np.ndarray,
+    rotations: np.ndarray,
+    box_dim: np.ndarray,
+    source_offset: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorized single-source grain assembly via nearest-seed assignment.
+
+    Mathematically equivalent to the original per-grain loop that filters
+    rotated master-block atoms through each Voronoi cell's convex-hull
+    equations — nearest-seed assignment IS the Voronoi diagram by
+    definition.  Avoids both ``scipy.spatial.Voronoi`` (~47 s for amorphous
+    on a 100×100×400 box) and the Python-overhead-bound per-grain loop
+    (~137 s on the same trajectory).
+
+    Returns ``(positions, numbers, grain_ids, shell_species_idx)`` in the
+    same layout as the slow path so the downstream overlap-removal /
+    species-target / push-pairs steps can run unchanged.
+    """
+    from scipy.spatial import cKDTree
+
+    G = int(seeds.shape[0])
+    K = int(master_positions.shape[0])
+
+    # Rotate the master block by each grain's rotation.  einsum:
+    #   rotated[g, k, j] = sum_i master_positions[k, i] * rotations[g, j, i]
+    rotated = np.einsum("ki,gji->gkj", master_positions, rotations)
+
+    # Translate by each grain's seed and wrap into [0, box_dim).
+    world_pos = np.mod(rotated + seeds[:, None, :], box_dim)
+
+    # Nearest-seed assignment with periodic Euclidean metric.  cKDTree's
+    # ``boxsize`` triggers the torus metric — exactly what Voronoi face
+    # equations would produce.
+    tree = cKDTree(seeds, boxsize=box_dim)
+    flat = world_pos.reshape(-1, 3)
+    _, nearest = tree.query(flat, k=1)
+    nearest = nearest.reshape(G, K)
+
+    grain_idx_col = np.arange(G, dtype=np.intp)[:, None]
+    keep = nearest == grain_idx_col
+
+    positions = world_pos[keep]
+    numbers = np.broadcast_to(master_numbers, (G, K))[keep]
+    grain_ids = np.broadcast_to(grain_idx_col, (G, K))[keep].astype(np.intp)
+    shell_species_idx = np.full(
+        positions.shape[0], int(source_offset), dtype=np.intp,
+    )
+    return positions, numbers, grain_ids, shell_species_idx
+
+
+def _sample_padding_atoms(
+    existing_positions: np.ndarray,
+    box_dim: np.ndarray,
+    n_missing: int,
+    pad_min_sep: float,
+    rng: np.random.Generator,
+    *,
+    max_rounds: int = 8,
+    oversample: float = 4.0,
+) -> tuple[np.ndarray, int]:
+    """Batched rejection sampling for step 7b padding.
+
+    Equivalent in spirit to the original serial trial-and-error loop:
+    pick uniform-random positions inside the box that respect
+    ``pad_min_sep`` against every existing atom AND every padding atom
+    already accepted in this call.  But instead of doing one trial per
+    iteration with an O(N) distance scan, this generates trial atoms in
+    big batches and filters them with ``scipy.spatial.cKDTree`` (torus
+    metric via ``boxsize=box_dim``).  Drops step 7b padding wall-clock
+    from ~131 s → ~3 s for amorphous at 100×100×400.
+
+    Returns ``(accepted_positions, total_trials)`` — ``total_trials``
+    mirrors the old ``tries`` counter for telemetry parity.
+
+    Caller is responsible for the loose-placement fallback if this
+    returns fewer than ``n_missing`` atoms (it shouldn't except in
+    pathologically over-dense boxes).
+    """
+    from scipy.spatial import cKDTree
+
+    if n_missing <= 0:
+        return np.empty((0, 3), dtype=np.float64), 0
+
+    tree_existing = (
+        cKDTree(existing_positions, boxsize=box_dim)
+        if len(existing_positions) > 0 else None
+    )
+
+    accepted = np.empty((0, 3), dtype=np.float64)
+    total_trials = 0
+    for _round in range(max_rounds):
+        need = n_missing - len(accepted)
+        if need <= 0:
+            break
+        # Over-sample by ``oversample`` to absorb a typical ~25 %
+        # rejection rate in a single round.  Floor at 256 so very
+        # small ``need`` values still amortize the KDTree query.
+        n_trial = max(int(np.ceil(oversample * need)), 256)
+        trials = rng.random((n_trial, 3)) * box_dim
+        total_trials += n_trial
+
+        # 1) Drop trials that collide with EXISTING atoms.
+        if tree_existing is not None:
+            d_nn, _ = tree_existing.query(trials, k=1)
+            cand = trials[d_nn >= pad_min_sep]
+        else:
+            cand = trials
+        if cand.shape[0] == 0:
+            continue
+
+        # 2) Drop trials that collide with PREVIOUSLY-ACCEPTED padding
+        #    atoms.  Cheap KDTree on the small accepted set.
+        if len(accepted) > 0:
+            tree_acc = cKDTree(accepted, boxsize=box_dim)
+            d_nn_acc, _ = tree_acc.query(cand, k=1)
+            cand = cand[d_nn_acc >= pad_min_sep]
+        if cand.shape[0] == 0:
+            continue
+
+        # 3) Drop intra-batch collisions.  ``query_pairs`` returns the
+        #    upper-triangular (i, j) for i<j; greedy mark j as dropped.
+        #    Skipping this would let two close trials both slip through
+        #    the same round, which the original serial loop would have
+        #    caught.
+        if len(cand) > 1:
+            tree_cand = cKDTree(cand, boxsize=box_dim)
+            pairs = tree_cand.query_pairs(
+                pad_min_sep, output_type="ndarray",
+            )
+            if len(pairs) > 0:
+                to_drop = np.zeros(len(cand), dtype=bool)
+                # Sort pairs by first index so the greedy choice (drop
+                # j when i is still alive) keeps a deterministic
+                # winner for chains of overlapping trials.
+                for i, j in pairs[np.argsort(pairs[:, 0])]:
+                    if not to_drop[i] and not to_drop[j]:
+                        to_drop[j] = True
+                cand = cand[~to_drop]
+
+        # Take just enough to hit the target.
+        take = min(need, cand.shape[0])
+        accepted = (
+            cand[:take] if accepted.shape[0] == 0
+            else np.concatenate([accepted, cand[:take]], axis=0)
+        )
+
+    return accepted, total_trials
+
+
 def _push_close_pairs_apart(
     positions: np.ndarray,
     numbers: np.ndarray,
@@ -394,168 +546,252 @@ class _GrainMixin:
             num_grains = max(1, int(np.ceil(V_box / V_grain)))
             seeds = self.rng.random((num_grains, 3)) * box_dim
 
-        # ---- 2. Periodic Voronoi cells ----
-        cells = _periodic_voronoi_3d(box_dim, seeds)
-
-        # ---- 3. Master atom block (one per source) ----
-        radius = _grain_radius_3d(cells)
-        masters: list[dict] = []
-        for src in sources:
-            src_cell = np.asarray(src["atoms"].cell.array, dtype=np.float64)
-            src_basis = np.asarray(
-                src["atoms"].get_scaled_positions(wrap=True), dtype=np.float64
-            )
-            src_numbers = np.asarray(src["atoms"].numbers, dtype=np.int64)
-            master = _build_master_atom_block_3d(
-                src_cell, src_basis, src_numbers, radius,
-            )
-            # Tag each master with its source's species_offset so the
-            # orientation-refinement retile can restore the correct
-            # virtual-species index for the rotated grain.  Without
-            # this, multi-source composite cells (sp²/sp³ carbon,
-            # SiO₂/Si₃N₄ blends, ...) lose all virtual-species
-            # information after refinement because every atom carries
-            # the SAME atomic number — searchsorted(self._species,
-            # numbers) returns 0 for every atom and tags them all as
-            # the first virtual species.
-            master["species_offset"] = int(src.get("species_offset", 0))
-            masters.append(master)
-
-        # Per-grain source assignment: draw by weight (or uniform for
-        # legacy single-source).  Store on self so the trajectory
-        # exporter can introspect which grain is which type.
-        num_grains_total = len(cells)
-        if multi_source:
-            grain_source = self.rng.choice(
-                len(sources), size=num_grains_total, p=source_probs,
-            ).astype(np.intp)
-        else:
-            grain_source = np.zeros(num_grains_total, dtype=np.intp)
-
-        # ---- 4. Decide which grains are crystalline ----
-        if is_crystalline_override is not None:
-            # Per-grain crystalline/amorphous decision supplied by the
-            # caller (the graded builder draws it from a position-dependent
-            # probability so order varies smoothly along the long axis).
-            is_crystalline = np.asarray(is_crystalline_override, dtype=bool)
-            if is_crystalline.shape[0] != num_grains:
-                raise ValueError(
-                    f"is_crystalline_override length ({is_crystalline.shape[0]}) "
-                    f"must match the number of grains ({num_grains})."
-                )
-            crystalline_fraction = (
-                float(np.mean(is_crystalline)) if num_grains else 0.0
-            )
-        else:
-            crystalline_fraction = float(np.clip(crystalline_fraction, 0.0, 1.0))
-            num_crystalline = int(np.round(crystalline_fraction * num_grains))
-            is_crystalline = np.zeros(num_grains, dtype=bool)
-            if num_crystalline > 0:
-                chosen = self.rng.permutation(num_grains)[:num_crystalline]
-                is_crystalline[chosen] = True
-
-        # ---- 5. Rotations: random SO(3) except for the single-grain
-        # ---- spans-the-whole-box case, where identity keeps the
-        # ---- rotated lattice commensurate with PBC wrap-around.
-        single_box_grain = (
-            seeds_override is None
+        # ---- Fast-path dispatch ----
+        # Every production preset has crystalline_fraction = 1.0 (default)
+        # and a single source.  In that regime we don't need exact Voronoi
+        # cell faces — nearest-seed assignment IS the Voronoi diagram by
+        # definition.  Skipping scipy.spatial.Voronoi + the per-grain
+        # Python loop drops _build_grain_atoms wall-clock from 184 s →
+        # ~3 s for amorphous at 100×100×400 (35 000 grains) and from 26
+        # s → ~1 s for crystalline_30.  See scratch/profile_pack*.out for
+        # the attribution.
+        #
+        # Multi-source, partial-crystalline, or overridden-input runs
+        # still use the original slow path below.
+        # ``_USE_FAST_GRAIN_PATH`` is a class-level escape hatch: setting
+        # ``Supercell._USE_FAST_GRAIN_PATH = False`` from outside forces
+        # the original Voronoi + per-grain loop, which is useful for
+        # head-to-head validation (see scratch/validate_fast_path.py).
+        # Defaults to True so production code uses the fast path
+        # transparently.
+        use_fast = getattr(type(self), "_USE_FAST_GRAIN_PATH", True)
+        can_fast = (
+            use_fast
+            and seeds_override is None
             and is_crystalline_override is None
-            and int(np.sum(is_crystalline)) <= 1
-            and grain_radius_user >= 0.5 * float(np.min(box_dim))
+            and not multi_source
+            and float(crystalline_fraction) >= 0.9999
         )
-        if single_box_grain:
-            rotations = np.broadcast_to(np.eye(3), (num_grains, 3, 3)).copy()
-            # Every grain shares the same seed offset so that the tiles
-            # produced by the (identity-rotated) master block match at
-            # the Voronoi cell boundaries - without this, each grain
-            # has a different random offset and adjacent grains produce
-            # mismatched copies of the same lattice, creating boundary
-            # distortions that ruin the crystalline structure.
-            shared_seed = seeds[0].copy()
-            seeds = np.broadcast_to(shared_seed, seeds.shape).copy()
-        else:
+
+        if can_fast:
+            # Master-block radius must cover the longest Voronoi cell at
+            # this seed density.  For N seeds in volume V the typical
+            # cell radius is r_typ = (3V / (4 pi N))^(1/3) and the
+            # empirical max scales as r_typ * (log N)^(1/3) for Poisson
+            # seeds.  1.3× that envelope catches the long tail; the
+            # KDTree drop step rejects any extras cleanly.  ``max`` with
+            # ``grain_radius_user`` guards the few-grains case where the
+            # statistical estimate would underrate the requested grain
+            # size.
+            r_typ = (3.0 * V_box / (4.0 * np.pi * num_grains)) ** (1.0 / 3.0)
+            radius = max(
+                grain_radius_user,
+                1.3 * r_typ * (float(np.log(max(num_grains, 2))) ** (1.0 / 3.0)),
+            )
+
+            master = _build_master_atom_block_3d(
+                ref_cell, ref_basis_frac, ref_numbers, radius,
+            )
+            master["species_offset"] = 0
+            masters = [master]
+
+            # All grains crystalline; trivial source assignment.
+            is_crystalline = np.ones(num_grains, dtype=bool)
+            grain_source = np.zeros(num_grains, dtype=np.intp)
+            # _grain_cells is unused in the fast path (refinement is
+            # tied to the slow path's exact cell metadata; production
+            # always passes refine_orientations=False).  Setting it
+            # None is the documented "fast path" sentinel — see
+            # refine_initial_orientations docstring.
+            cells = None
+            single_box_grain = False
+
             rotations = _random_rotation_matrices(num_grains, self.rng)
 
-        # ---- 6. Fill each grain ----
-        ref_volume = float(abs(np.linalg.det(ref_cell)))
-        species_density = float(len(ref_numbers) / max(ref_volume, _EPS))
+            positions, numbers, grain_ids, shell_species_idx = (
+                _grain_assign_fast(
+                    master["positions"], master["numbers"],
+                    seeds, rotations, box_dim, source_offset=0,
+                )
+            )
 
-        # Per-species probabilities (for amorphous sampling) preserve the
-        # reference composition on average.
-        unique_species, species_counts = np.unique(ref_numbers, return_counts=True)
-        species_probs = species_counts.astype(float) / float(species_counts.sum())
+            # Jump past the slow-path Voronoi / loop / concat block —
+            # skip to step 7a (overlap removal) below.
+            num_grains_total = num_grains
+            # Stash a placeholder for the variables read after the loop
+            # so the code below behaves as if the slow path had run.
+            unique_species, species_counts = np.unique(
+                ref_numbers, return_counts=True,
+            )
+            species_probs = (species_counts.astype(float)
+                             / float(species_counts.sum()))
+            ref_volume = float(abs(np.linalg.det(ref_cell)))
+            species_density = float(
+                len(ref_numbers) / max(ref_volume, _EPS)
+            )
+        else:
+            # ---- 2. Periodic Voronoi cells (slow path) ----
+            cells = _periodic_voronoi_3d(box_dim, seeds)
 
-        # For multi-source builds the exact-count enforcement below
-        # would otherwise trim every regime to sources[0]'s density,
-        # destroying the denser phase (e.g. diamond atoms trimmed down
-        # to graphite density when sources[0] is graphite).  Use a
-        # weight-averaged reference density and a weight-averaged
-        # formula-unit count so each regime's target atom count scales
-        # with its actual phase mix.
-        if multi_source:
-            weighted_density = 0.0
-            weighted_ref_volume = 0.0
-            weighted_formula_count = 0.0
-            for ki, src in enumerate(sources):
-                _sc = np.asarray(src["atoms"].cell.array, dtype=np.float64)
-                _svol = float(abs(np.linalg.det(_sc)))
-                _snum = int(len(src["atoms"].numbers))
-                _w = float(source_probs[ki])
-                weighted_density += _w * (_snum / max(_svol, _EPS))
-                weighted_ref_volume += _w * _svol
-                weighted_formula_count += _w * _snum
-            species_density = float(weighted_density)
+            # ---- 3. Master atom block (one per source) ----
+            radius = _grain_radius_3d(cells)
+            masters: list[dict] = []
+            for src in sources:
+                src_cell = np.asarray(src["atoms"].cell.array, dtype=np.float64)
+                src_basis = np.asarray(
+                    src["atoms"].get_scaled_positions(wrap=True), dtype=np.float64
+                )
+                src_numbers = np.asarray(src["atoms"].numbers, dtype=np.int64)
+                master = _build_master_atom_block_3d(
+                    src_cell, src_basis, src_numbers, radius,
+                )
+                # Tag each master with its source's species_offset so the
+                # orientation-refinement retile can restore the correct
+                # virtual-species index for the rotated grain.  Without
+                # this, multi-source composite cells (sp²/sp³ carbon,
+                # SiO₂/Si₃N₄ blends, ...) lose all virtual-species
+                # information after refinement because every atom carries
+                # the SAME atomic number — searchsorted(self._species,
+                # numbers) returns 0 for every atom and tags them all as
+                # the first virtual species.
+                master["species_offset"] = int(src.get("species_offset", 0))
+                masters.append(master)
 
-        positions_all: list[np.ndarray] = []
-        numbers_all: list[np.ndarray] = []
-        grain_ids_all: list[np.ndarray] = []
-        shell_species_all: list[np.ndarray] = []
+            # Per-grain source assignment: draw by weight (or uniform for
+            # legacy single-source).  Store on self so the trajectory
+            # exporter can introspect which grain is which type.
+            num_grains_total = len(cells)
+            if multi_source:
+                grain_source = self.rng.choice(
+                    len(sources), size=num_grains_total, p=source_probs,
+                ).astype(np.intp)
+            else:
+                grain_source = np.zeros(num_grains_total, dtype=np.intp)
 
-        for i, (seed, cell) in enumerate(zip(seeds, cells)):
-            src_idx = int(grain_source[i])
-            master = masters[src_idx]
-            src_offset = int(sources[src_idx]["species_offset"])
-            if is_crystalline[i]:
-                rotated = master["positions"] @ rotations[i].T
-                keep = _points_in_cell(rotated, cell)
-                pos = rotated[keep]
-                num = master["numbers"][keep]
-                # All atoms from this grain get the source's species
-                # offset (plus 0 for single-species sources).
-                shell_species = np.full(
-                    len(pos), src_offset, dtype=np.intp
+            # ---- 4. Decide which grains are crystalline ----
+            if is_crystalline_override is not None:
+                # Per-grain crystalline/amorphous decision supplied by the
+                # caller (the graded builder draws it from a position-dependent
+                # probability so order varies smoothly along the long axis).
+                is_crystalline = np.asarray(is_crystalline_override, dtype=bool)
+                if is_crystalline.shape[0] != num_grains:
+                    raise ValueError(
+                        f"is_crystalline_override length ({is_crystalline.shape[0]}) "
+                        f"must match the number of grains ({num_grains})."
+                    )
+                crystalline_fraction = (
+                    float(np.mean(is_crystalline)) if num_grains else 0.0
                 )
             else:
-                expected = species_density * cell["volume"]
-                n_atoms = int(np.floor(expected))
-                if self.rng.random() < expected - n_atoms:
-                    n_atoms += 1
-                pos = _sample_points_in_cell(cell, n_atoms, self.rng)
-                num = self.rng.choice(
-                    unique_species, size=n_atoms, p=species_probs,
-                ).astype(np.int64)
-                shell_species = np.full(
-                    n_atoms, src_offset, dtype=np.intp
-                )
+                crystalline_fraction = float(np.clip(crystalline_fraction, 0.0, 1.0))
+                num_crystalline = int(np.round(crystalline_fraction * num_grains))
+                is_crystalline = np.zeros(num_grains, dtype=bool)
+                if num_crystalline > 0:
+                    chosen = self.rng.permutation(num_grains)[:num_crystalline]
+                    is_crystalline[chosen] = True
 
-            pos = np.mod(pos + seed, box_dim)
-            positions_all.append(pos)
-            numbers_all.append(num)
-            grain_ids_all.append(np.full(len(pos), i, dtype=np.intp))
-            shell_species_all.append(shell_species)
+            # ---- 5. Rotations: random SO(3) except for the single-grain
+            # ---- spans-the-whole-box case, where identity keeps the
+            # ---- rotated lattice commensurate with PBC wrap-around.
+            single_box_grain = (
+                seeds_override is None
+                and is_crystalline_override is None
+                and int(np.sum(is_crystalline)) <= 1
+                and grain_radius_user >= 0.5 * float(np.min(box_dim))
+            )
+            if single_box_grain:
+                rotations = np.broadcast_to(np.eye(3), (num_grains, 3, 3)).copy()
+                # Every grain shares the same seed offset so that the tiles
+                # produced by the (identity-rotated) master block match at
+                # the Voronoi cell boundaries - without this, each grain
+                # has a different random offset and adjacent grains produce
+                # mismatched copies of the same lattice, creating boundary
+                # distortions that ruin the crystalline structure.
+                shared_seed = seeds[0].copy()
+                seeds = np.broadcast_to(shared_seed, seeds.shape).copy()
+            else:
+                rotations = _random_rotation_matrices(num_grains, self.rng)
 
-        positions = np.concatenate(positions_all, axis=0) if positions_all else (
-            np.empty((0, 3), dtype=np.float64)
-        )
-        numbers = np.concatenate(numbers_all, axis=0) if numbers_all else (
-            np.empty(0, dtype=np.int64)
-        )
-        grain_ids = np.concatenate(grain_ids_all, axis=0) if grain_ids_all else (
-            np.empty(0, dtype=np.intp)
-        )
-        shell_species_idx = np.concatenate(shell_species_all, axis=0) if shell_species_all else (
-            np.empty(0, dtype=np.intp)
-        )
+            # ---- 6. Fill each grain ----
+            ref_volume = float(abs(np.linalg.det(ref_cell)))
+            species_density = float(len(ref_numbers) / max(ref_volume, _EPS))
+
+            # Per-species probabilities (for amorphous sampling) preserve the
+            # reference composition on average.
+            unique_species, species_counts = np.unique(ref_numbers, return_counts=True)
+            species_probs = species_counts.astype(float) / float(species_counts.sum())
+
+            # For multi-source builds the exact-count enforcement below
+            # would otherwise trim every regime to sources[0]'s density,
+            # destroying the denser phase (e.g. diamond atoms trimmed down
+            # to graphite density when sources[0] is graphite).  Use a
+            # weight-averaged reference density and a weight-averaged
+            # formula-unit count so each regime's target atom count scales
+            # with its actual phase mix.
+            if multi_source:
+                weighted_density = 0.0
+                weighted_ref_volume = 0.0
+                weighted_formula_count = 0.0
+                for ki, src in enumerate(sources):
+                    _sc = np.asarray(src["atoms"].cell.array, dtype=np.float64)
+                    _svol = float(abs(np.linalg.det(_sc)))
+                    _snum = int(len(src["atoms"].numbers))
+                    _w = float(source_probs[ki])
+                    weighted_density += _w * (_snum / max(_svol, _EPS))
+                    weighted_ref_volume += _w * _svol
+                    weighted_formula_count += _w * _snum
+                species_density = float(weighted_density)
+
+            positions_all: list[np.ndarray] = []
+            numbers_all: list[np.ndarray] = []
+            grain_ids_all: list[np.ndarray] = []
+            shell_species_all: list[np.ndarray] = []
+
+            for i, (seed, cell) in enumerate(zip(seeds, cells)):
+                src_idx = int(grain_source[i])
+                master = masters[src_idx]
+                src_offset = int(sources[src_idx]["species_offset"])
+                if is_crystalline[i]:
+                    rotated = master["positions"] @ rotations[i].T
+                    keep = _points_in_cell(rotated, cell)
+                    pos = rotated[keep]
+                    num = master["numbers"][keep]
+                    # All atoms from this grain get the source's species
+                    # offset (plus 0 for single-species sources).
+                    shell_species = np.full(
+                        len(pos), src_offset, dtype=np.intp
+                    )
+                else:
+                    expected = species_density * cell["volume"]
+                    n_atoms = int(np.floor(expected))
+                    if self.rng.random() < expected - n_atoms:
+                        n_atoms += 1
+                    pos = _sample_points_in_cell(cell, n_atoms, self.rng)
+                    num = self.rng.choice(
+                        unique_species, size=n_atoms, p=species_probs,
+                    ).astype(np.int64)
+                    shell_species = np.full(
+                        n_atoms, src_offset, dtype=np.intp
+                    )
+
+                pos = np.mod(pos + seed, box_dim)
+                positions_all.append(pos)
+                numbers_all.append(num)
+                grain_ids_all.append(np.full(len(pos), i, dtype=np.intp))
+                shell_species_all.append(shell_species)
+
+            positions = np.concatenate(positions_all, axis=0) if positions_all else (
+                np.empty((0, 3), dtype=np.float64)
+            )
+            numbers = np.concatenate(numbers_all, axis=0) if numbers_all else (
+                np.empty(0, dtype=np.int64)
+            )
+            grain_ids = np.concatenate(grain_ids_all, axis=0) if grain_ids_all else (
+                np.empty(0, dtype=np.intp)
+            )
+            shell_species_idx = np.concatenate(shell_species_all, axis=0) if shell_species_all else (
+                np.empty(0, dtype=np.intp)
+            )
 
         # ---- 7a. Remove grain-boundary overlaps ----
         # Rotated neighbouring grains can leave two atoms almost on top
@@ -638,13 +874,25 @@ class _GrainMixin:
         }
 
         if len(positions) > 0 and not skip_overlap_removal:
-            from ase.neighborlist import neighbor_list
+            from scipy.spatial import cKDTree
 
-            probe = Atoms(
-                numbers=numbers, positions=positions,
-                cell=cell_mat, pbc=self.reference_atoms.pbc,
+            # Box is guaranteed orthogonal by the check at the top of
+            # this function, so cKDTree's torus-metric boxsize is safe
+            # here.  query_pairs returns each (i, j<k) once, vs ase's
+            # neighbor_list which returns each pair in both orderings
+            # — the downstream remove-set loop tolerates either.  At
+            # 196 k atoms / 1.56 Å cutoff this drops the call from
+            # ~3.2 s → ~0.1 s.
+            tree = cKDTree(positions, boxsize=box_dim)
+            pair_arr = tree.query_pairs(
+                float(dup_cutoff), output_type="ndarray",
             )
-            ov_i, ov_j, _ = neighbor_list("ijd", probe, dup_cutoff)
+            if len(pair_arr) > 0:
+                ov_i = pair_arr[:, 0]
+                ov_j = pair_arr[:, 1]
+            else:
+                ov_i = np.empty(0, dtype=np.intp)
+                ov_j = np.empty(0, dtype=np.intp)
             # Running species counts so priority updates as we remove.
             z_counts = {int(z): int(np.sum(numbers == z)) for z in unique_species}
             remove: set[int] = set()
@@ -711,35 +959,19 @@ class _GrainMixin:
                 shell_species_idx = shell_species_idx[keep]
             elif current < target and not skip_padding:
                 n_missing = target - current
-                added = np.empty((0, 3), dtype=np.float64)
-                tries = 0
-                # Bigger retry budget for crystalline builds where the
-                # box is already densely packed; at 96% density the
-                # free volume is limited so we need many attempts.
-                max_tries = max(2000, 200 * n_missing)
-                while len(added) < n_missing and tries < max_tries:
-                    trial = self.rng.random(3) * box_dim
-                    ok = True
-                    if len(positions) > 0:
-                        delta = positions - trial
-                        frac = delta @ cell_inv_local
-                        frac -= np.round(frac)
-                        mi = frac @ cell_mat
-                        if float(np.min(np.sum(mi * mi, axis=1))) < pad_min_sep ** 2:
-                            ok = False
-                    if ok and len(added) > 0:
-                        delta = added - trial
-                        frac = delta @ cell_inv_local
-                        frac -= np.round(frac)
-                        mi = frac @ cell_mat
-                        if float(np.min(np.sum(mi * mi, axis=1))) < pad_min_sep ** 2:
-                            ok = False
-                    if ok:
-                        added = np.vstack([added, trial])
-                    tries += 1
+                # Batched cKDTree-based rejection sampling.  Replaces
+                # the original serial trial loop (which spent ~130 s
+                # for amorphous at 100×100×400 with n_missing≈9k and
+                # N_existing≈174k due to its per-trial O(N) distance
+                # scan).
+                added, _ = _sample_padding_atoms(
+                    positions, box_dim, n_missing, pad_min_sep, self.rng,
+                )
                 while len(added) < n_missing:
-                    # Retry budget exhausted: accept looser placement.
-                    added = np.vstack([added, self.rng.random(3) * box_dim])
+                    # Loose-placement fallback if even the batched
+                    # sampler couldn't find enough non-colliding spots
+                    # (very over-dense box; should be rare).
+                    added = np.vstack([added, self.rng.random((1, 3)) * box_dim])
                 positions = np.concatenate([positions, added], axis=0)
                 numbers = np.concatenate(
                     [numbers, np.full(n_missing, z, dtype=np.int64)],
