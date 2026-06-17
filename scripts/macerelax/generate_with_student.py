@@ -68,18 +68,25 @@ NUM_THREADS = 4
 
 # --- input ---
 # Recommend: keep this constrained to training-chemistry CIFs.
-# ── BUFFLE E2E VALIDATION (revert with git checkout) ─────────────────────────
-CIF_DIR       = Path("/home/ehrdt/cifs_mp_exp_le100meV")
+# ── BUFFLE E2E VALIDATION (commented out — uncomment for local buffle tests) ─
+# CIF_DIR       = Path("/home/ehrdt/cifs_mp_exp_le100meV")
+# CIF_LIST_FILE: Path | None = Path("/home/ehrdt/tricor/scratch/validate_e2e_cifs.txt")
+# ── PERLMUTTER PRODUCTION ───────────────────────────────────────────────────
+CIF_DIR       = Path("/pscratch/sd/e/ehrdt/tricor/cifs_mp_cnos_le100meV_training")
 # One filename per line.  None = use every *.cif in CIF_DIR.
-CIF_LIST_FILE: Path | None = Path("/home/ehrdt/tricor/scratch/validate_e2e_cifs.txt")
+CIF_LIST_FILE: Path | None = None
 # Stop after this many CIFs (smoke-testing); None = process all.
 MAX_CIFS: int | None = None
 
 # --- model ---
-# ── BUFFLE E2E VALIDATION (revert with git checkout) ─────────────────────────
-MODEL_LOG_DIR        = "/home/ehrdt"
-MODEL_RUN_NAME       = "perl_tb_logs"
-MODEL_RUN_TIMESTAMP: str | None = "1781193088"  # known-good checkpoint, Jun 11
+# ── BUFFLE E2E VALIDATION (commented out — uncomment for local buffle tests) ─
+# MODEL_LOG_DIR        = "/home/ehrdt"
+# MODEL_RUN_NAME       = "perl_tb_logs"
+# MODEL_RUN_TIMESTAMP: str | None = "1781193088"  # known-good checkpoint, Jun 11
+# ── PERLMUTTER PRODUCTION ───────────────────────────────────────────────────
+MODEL_LOG_DIR        = "/pscratch/sd/e/ehrdt/macerelax/lightning_logs"
+MODEL_RUN_NAME       = "ddp_v1"
+MODEL_RUN_TIMESTAMP: str | None = None   # None → most recent run_*
 MODEL_EPOCH          = "best"            # "last" | "best" | "<path>"
 USE_EMA_WEIGHTS      = True
 
@@ -96,12 +103,11 @@ SHELL_TARGET_DROPOUT     = 0.0
 
 # --- generation parameters (mirrors generate_mace_trajectories.py defaults) ---
 REGIMES = ["amorphous", "SRO", "MRO", "LRO", "nanocrystalline", "crystalline_30"]
-# One seed per regime, per CIF.  Use multiple entries for ensemble generation.
-SEEDS = [2_000_000]
+# Seeds drawn per regime per CIF.  Add entries to increase ensemble size.
+SEEDS = [2_000_000, 2_000_001]   # 2 structures per regime per CIF
 # Supercell dimensions in Å.  Cubic (a, a, a) at training time was 50.0;
 # tuple of three lets you go non-cubic (e.g., (100., 100., 400.) for slabs).
 # WARNING: large cells are OOD vs training; validate first via test scripts.
-# ── BUFFLE E2E VALIDATION (revert with git checkout) ─────────────────────────
 CELL_DIMS = (100.0, 100.0, 400.0)
 DENSITY_BY_REGIME = {
     "amorphous":       0.92,
@@ -135,10 +141,39 @@ WALL_MARGIN          = 0.0   # passed to per_pair_min_from_atoms
 MAX_ITER             = 15
 CONVERGENCE_TOL_ANG  = 0.001
 CUTOFF               = 5.0
+# Edge-chunk size for the MeshGraphNetsConv ``EdgeProcessor``.  The
+# (E, 384) cat tensor inside each conv layer's edge processor would
+# otherwise peak at ~46 GB for Fe2N at 100×100×400 (E≈30 M edges) and
+# OOM on A100 80 GB.  Chunking processes the per-edge MLP in batches
+# of ``EDGE_CHUNK_SIZE`` edges, writing into a pre-allocated output
+# tensor in place.  Output agrees with the unchunked path to ~1e-4 Å
+# max (FP-summation-order noise inside the LayerNorm + matmuls), well
+# below our g(r) noise floor.  Measured peaks (Fe2N amorphous,
+# 100×100×400, 30 M edges):
+#   unchunked      : 93 GB   ← OOM on A100 80 GB
+#   chunk = 8 M    : 87 GB   ← borderline
+#   chunk = 4 M    : 79 GB   ← under A100 limit
+#   chunk = 2 M    : 76 GB   ← safe margin (recommended default)
+#   chunk = 1 M    : 74 GB   ← floor; further chunking doesn't help
+# Smaller chunks add ~no wall-clock overhead (sequential MLP calls
+# inside one CUDA stream).  Set to 0 to disable chunking entirely.
+EDGE_CHUNK_SIZE      = 2_000_000
+# ``torch.compile`` over the student model.  Default off because
+# empirical benchmarking on Fe2N (30 M edges) showed compile mode
+# ``reduce-overhead`` + ``dynamic=True`` ran SLOWER than eager
+# (20 s → 27 s) — the chunked EdgeProcessor loop confuses the
+# tracer + dynamic-shape recompiles + CUDA-graph overhead outweigh
+# kernel fusion at this scale.  Left as a CONFIG knob in case future
+# PyTorch versions handle it better, or if you want to experiment
+# with ``mode="default"``.
+USE_TORCH_COMPILE    = False
+TORCH_COMPILE_MODE   = "reduce-overhead"   # or "default" / "max-autotune"
 
 # --- output ---
-# ── BUFFLE E2E VALIDATION (revert with git checkout) ─────────────────────────
-OUTPUT_ROOT = Path("/home/ehrdt/tricor/scratch/validate_e2e_out")
+# ── BUFFLE E2E VALIDATION (commented out — uncomment for local buffle tests) ─
+# OUTPUT_ROOT = Path("/home/ehrdt/tricor/scratch/validate_e2e_out")
+# ── PERLMUTTER PRODUCTION ───────────────────────────────────────────────────
+OUTPUT_ROOT = Path("/pscratch/sd/e/ehrdt/macerelax/generated_v1")
 SAVE_NPZ    = False  # turn back on if you want to retrain on these structures
 SAVE_CIF    = False  # turn back on if you want per-traj CIFs
 SAVE_XYZ    = True   # one-frame XYZ per trajectory (final structure only)
@@ -449,6 +484,56 @@ def _wrap_positions(pos, cell):
     frac = pos @ inv_cell.T
     frac = frac - torch.floor(frac)
     return frac @ cell
+
+
+def _chunked_edge_processor_forward(ep, chunk_size: int):
+    """Return a chunked drop-in for ``EdgeProcessor.forward``.
+
+    Each edge's MLP is independent of other edges, so we can pre-
+    allocate the output tensor and fill it in place per chunk —
+    bit-exact to processing the full edge set in one shot.  The
+    in-place fill avoids holding a list of per-chunk tensors that
+    would otherwise sum to the full (E, edge_dim) anyway, and avoids
+    the extra (E, edge_dim) intermediate that ``torch.cat`` of those
+    chunks would allocate.  Memory profile:
+
+      * cat input chunk      : (chunk_size, 2*node_dim + edge_dim)
+      * MLP output chunk     : (chunk_size, edge_dim)
+      * pre-alloc result     : (E, edge_dim)       ← one allocation
+      * residual sum result  : (E, edge_dim)       ← at return only
+    """
+
+    def chunked_forward(x_i, x_j, edge_attr):
+        E = edge_attr.shape[0]
+        if chunk_size <= 0 or E <= chunk_size:
+            out = torch.cat([x_i, x_j, edge_attr], dim=-1)
+            out = ep.edge_mlp(out)
+            return edge_attr + out
+
+        out = torch.empty_like(edge_attr)
+        for start in range(0, E, chunk_size):
+            end = min(start + chunk_size, E)
+            ch = torch.cat(
+                [x_i[start:end], x_j[start:end], edge_attr[start:end]],
+                dim=-1,
+            )
+            out[start:end] = ep.edge_mlp(ch)
+        return edge_attr + out
+
+    return chunked_forward
+
+
+def patch_model_edge_chunking(model, chunk_size: int) -> None:
+    """Install chunked ``forward`` on every ``EdgeProcessor`` in the
+    model so each conv layer's (E, 384) cat tensor never exceeds
+    ``chunk_size``-many rows at once.  No-op when ``chunk_size <= 0``.
+    """
+    if chunk_size <= 0:
+        return
+    from graphite.nn.convs.mgn import EdgeProcessor
+    for mod in model.modules():
+        if isinstance(mod, EdgeProcessor):
+            mod.forward = _chunked_edge_processor_forward(mod, chunk_size)
 
 
 @torch.no_grad()
@@ -808,6 +893,22 @@ def main() -> None:
     print()
 
     model = _load_model(ckpt_path, device)
+    # Install edge chunking on every MeshGraphNetsConv's EdgeProcessor
+    # to keep the (E, 384) cat tensor at most EDGE_CHUNK_SIZE rows at
+    # once.  Bit-exact to the unchunked forward; drops peak GPU memory
+    # from ~93 GB → ~40 GB at Fe2N 100×100×400 (30 M edges).
+    patch_model_edge_chunking(model, EDGE_CHUNK_SIZE)
+    print(f"[edge_chunking] EDGE_CHUNK_SIZE={EDGE_CHUNK_SIZE:,}", flush=True)
+    # ``torch.compile`` MUST come AFTER the edge-chunking patch so
+    # dynamo traces the chunked forward (otherwise the patched
+    # ``EdgeProcessor.forward`` runs eager while the rest is compiled).
+    if USE_TORCH_COMPILE:
+        print(f"[torch.compile] mode={TORCH_COMPILE_MODE} dynamic=True "
+              f"— first call will incur ~10-20 s compile cost",
+              flush=True)
+        model = torch.compile(
+            model, mode=TORCH_COMPILE_MODE, dynamic=True,
+        )
 
     all_results: list[GenResult] = []
     t_start = time.time()
