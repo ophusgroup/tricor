@@ -324,6 +324,7 @@ rsync -a tricor-docs/docs/_static/ tricor-docs/docs/_build/html/_static/
 | 5 | Trusted publishing via GitHub Actions (no API token) | one yaml file |
 | 6 | Reference experimental g(r) overlay for liquid/amorphous | docs only |
 | 7 | ML acceleration for 100×100×500 Å cells | see ML section below |
+| 8 | Benchmark ORB-v3 as an alt MLIP backend (vs MACE-MP0) | see `scratch/ORB_V3_INTEGRATION.md` |
 
 ---
 
