@@ -64,9 +64,19 @@ DENSITY_BY_REGIME = {
 
 SMALL_CELL_DIMS = (50.0, 50.0, 50.0)
 LARGE_CELL_DIMS = (100.0, 100.0, 400.0)
-# Fe2N at 50³ has ~12 k atoms × MACE-MPA — typically fits but tight on
-# buffle.  Drop to 40³ as needed via OOM retry below.
-SMALL_CELL_OOM_FLOOR = 35.0
+# Per-system small-cell override.  MACE-MPA's memory scales worse than
+# linearly with atom count + coordination density, so dense / high-Z
+# chemistries OOM A100 80 GB at 50³.  Drop those to a smaller cube so
+# MACE fits.  Empirically calibrated:
+#   Si      50³ → ~6 k atoms,  MACE peak ~7 GB     ✓ comfortable
+#   TiO2    50³ → ~11 k atoms, MACE peak ~14 GB    ✓ comfortable
+#   Fe2N    50³ → ~13 k atoms, MACE peak ~60+ GB   ✗ OOM A100 80 GB
+#   Fe2N    40³ → ~6.7 k atoms, MACE peak ~30 GB   ✓ fits
+SMALL_CELL_DIMS_BY_SYSTEM = {
+    "Si":   (50.0, 50.0, 50.0),
+    "TiO2": (50.0, 50.0, 50.0),
+    "Fe2N": (40.0, 40.0, 40.0),
+}
 RNG_SEED = 2_000_000
 
 BOND_RELAX_N_ITER   = 20
@@ -92,9 +102,28 @@ ADF_R_CUT        = 3.5
 ADF_NBINS        = 180
 ADF_MAX_CENTERS  = 5_000
 
-CACHE_NPZ  = _REPO / "scratch" / "scale_invariance_data.npz"
-OUTPUT_PNG = _REPO / "scratch" / "scale_invariance.png"
-TIMINGS_CSV = _REPO / "scratch" / "scale_invariance_timings.csv"
+# Output paths auto-suffixed by inference dtype so a bf16 run doesn't
+# clobber an existing fp32 cache (and vice-versa).  Resolved lazily in
+# main() once the generate_with_student module has been imported.
+CACHE_NPZ:  Path | None = None
+OUTPUT_PNG: Path | None = None
+TIMINGS_CSV: Path | None = None
+STRUCTURES_DIR: Path | None = None     # XYZ files dropped per (system, regime, cell, endpoint)
+STRUCTURES_ZIP: Path | None = None     # final zip of STRUCTURES_DIR
+
+
+def _resolve_output_paths(G_module) -> None:
+    """Set output paths with a dtype suffix so bf16 / fp32 runs don't clobber."""
+    global CACHE_NPZ, OUTPUT_PNG, TIMINGS_CSV
+    global STRUCTURES_DIR, STRUCTURES_ZIP
+    suffix = "_bf16" if getattr(G_module, "USE_BF16_INFERENCE", False) else "_fp32"
+    CACHE_NPZ      = _REPO / "scratch" / f"scale_invariance_data{suffix}.npz"
+    OUTPUT_PNG     = _REPO / "scratch" / f"scale_invariance{suffix}.png"
+    TIMINGS_CSV    = _REPO / "scratch" / f"scale_invariance_timings{suffix}.csv"
+    STRUCTURES_DIR = _REPO / "scratch" / f"scale_invariance_structures{suffix}"
+    STRUCTURES_ZIP = _REPO / "scratch" / f"scale_invariance_structures{suffix}.zip"
+    print(f"[paths] cache={CACHE_NPZ.name}  png={OUTPUT_PNG.name}  "
+          f"timings={TIMINGS_CSV.name}", flush=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -319,6 +348,24 @@ def process_cell(tc, G, ase_read, model, device, mace_calc,
     })
     print(f"      [student] {t_student:.1f}s", flush=True)
 
+    # ── Save final structures as XYZ for visual inspection ────────────
+    if STRUCTURES_DIR is not None:
+        STRUCTURES_DIR.mkdir(parents=True, exist_ok=True)
+        from ase.atoms import Atoms
+        from ase.io import write as ase_write
+        stem = f"{cif_path.stem}_{regime}_{cell_label}"
+        for label_xyz, pos_xyz in [
+            ("init", init_pos),
+            ("mace", mace_pos),
+            ("student", student_pos),
+        ]:
+            if pos_xyz is None:
+                continue
+            a = Atoms(numbers=species, positions=pos_xyz,
+                      cell=cell_arr, pbc=True)
+            xyz_path = STRUCTURES_DIR / f"{stem}_{label_xyz}.xyz"
+            ase_write(str(xyz_path), a, format="extxyz")
+
     curves = {}
     r, g = compute_pdf(init_pos, box_diag)
     th, ad = compute_adf(init_pos, box_diag)
@@ -431,8 +478,11 @@ def main() -> None:
 
     LOCAL_PRESETS = _build_local_presets(tc)
 
+    _resolve_output_paths(G)
+
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"[scale] device={device}", flush=True)
+    print(f"[scale] device={device}  bf16_inference={G.USE_BF16_INFERENCE}",
+          flush=True)
 
     # Load student.
     model = G._load_model(
@@ -444,6 +494,12 @@ def main() -> None:
         device,
     )
     G.patch_model_edge_chunking(model, G.EDGE_CHUNK_SIZE)
+    # bf16 cast must happen after edge chunking, before inference.  We
+    # replicate the cast manually here because we bypass
+    # generate_with_student.py's main().
+    if G.USE_BF16_INFERENCE:
+        model = model.bfloat16()
+        print("[bf16] model converted to bfloat16", flush=True)
 
     # Load MACE.
     print(f"[scale] loading MACE: {MACE_MODEL}", flush=True)
@@ -464,11 +520,15 @@ def main() -> None:
             print(f"  [{sys_label}/{regime}]", flush=True)
             rho = DENSITY_BY_REGIME[regime]
 
-            # Small cell with MACE.
+            # Small cell with MACE.  Per-system override falls back to
+            # SMALL_CELL_DIMS for chemistries not listed (e.g. Si, TiO2).
+            small_dims = SMALL_CELL_DIMS_BY_SYSTEM.get(
+                sys_label, SMALL_CELL_DIMS,
+            )
             try:
                 small_curves = process_cell(
                     tc, G, ase_read, model, device, mace_calc,
-                    cif_path, regime, rho, SMALL_CELL_DIMS, want_mace=True,
+                    cif_path, regime, rho, small_dims, want_mace=True,
                     timings=timings,
                 )
                 regime_data = {
@@ -513,6 +573,20 @@ def main() -> None:
     save_timings(timings, TIMINGS_CSV)
     print_timing_summary(timings)
     make_grid(all_curves, OUTPUT_PNG)
+
+    # Bundle the XYZ files into one zip for easy download / inspection.
+    if STRUCTURES_DIR is not None and STRUCTURES_DIR.is_dir():
+        import shutil
+        # make_archive wants the path WITHOUT the .zip extension.
+        out_stem = STRUCTURES_ZIP.with_suffix("")
+        zip_path = shutil.make_archive(
+            str(out_stem), "zip", root_dir=str(STRUCTURES_DIR.parent),
+            base_dir=STRUCTURES_DIR.name,
+        )
+        n_xyz = len(list(STRUCTURES_DIR.glob("*.xyz")))
+        size_mb = Path(zip_path).stat().st_size / (1024 * 1024)
+        print(f"[zip] wrote {zip_path}  ({n_xyz} structures, "
+              f"{size_mb:.1f} MB)", flush=True)
 
 
 def save_timings(rows: list[dict], path) -> None:

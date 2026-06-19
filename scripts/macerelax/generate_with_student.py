@@ -168,6 +168,17 @@ EDGE_CHUNK_SIZE      = 2_000_000
 # with ``mode="default"``.
 USE_TORCH_COMPILE    = False
 TORCH_COMPILE_MODE   = "reduce-overhead"   # or "default" / "max-autotune"
+# Convert model + inputs to bfloat16 to exploit A100 Tensor Cores.
+# Theory: A100 has 312 TFLOPS bf16 vs 19.5 TFLOPS fp32 (16× gap on
+# matmuls).  Buffle's Blackwell has only ~2× gap, so bf16 was a loss
+# there — but on A100 the speedup typically outweighs the dtype
+# bookkeeping.  Tradeoff: position updates accumulate ~few mÅ of bf16
+# rounding noise per iter over the 15-iter loop.  Validate via a
+# fp32-vs-bf16 comparison run on one CIF before flipping to True
+# corpus-wide.  Position tensor (``pos``) stays in fp32 throughout so
+# the running update doesn't compound bf16 rounding into the position
+# array itself.
+USE_BF16_INFERENCE   = False
 
 # --- output ---
 # ── BUFFLE E2E VALIDATION (commented out — uncomment for local buffle tests) ─
@@ -562,6 +573,21 @@ def run_iterative_inference(
                                       dtype=torch.float32, device=device),
     }
 
+    # Detect model parameter dtype.  When USE_BF16_INFERENCE flipped the
+    # model to bf16, all float input tensors must match — otherwise the
+    # first Linear layer raises a dtype-mismatch error.  ``pos`` itself
+    # stays in fp32 so the running position update doesn't compound bf16
+    # rounding noise.  Only the model's float inputs (edge_attr, w,
+    # shell features) and its output (``delta``) need conversion.
+    _mdtype = next(model.parameters()).dtype
+    _use_bf16 = (_mdtype == torch.bfloat16)
+    if _use_bf16:
+        # Shell features are static across iterations — cast once.
+        # ``w_t`` is also static — cast once.
+        w_t = w_t.bfloat16()
+        shell["pair_features"] = shell["pair_features"].bfloat16()
+        shell["trip_features"] = shell["trip_features"].bfloat16()
+
     intermediates: list[tuple[int, np.ndarray]] = []
 
     def _record(iter_idx: int, p: torch.Tensor) -> None:
@@ -569,6 +595,11 @@ def run_iterative_inference(
 
     for it in range(max_iter):
         batch = _build_data(pos, cell_t, z, w_t, shell, cutoff)
+        if _use_bf16:
+            # edge_attr was just computed in fp32 inside _build_data
+            # from the fp32 ``pos`` (so the geometric graph stays
+            # precise).  Cast it for the model forward only.
+            batch.edge_attr = batch.edge_attr.bfloat16()
         delta = model(
             batch.z, batch.edge_index, batch.edge_attr,
             batch.w, batch.batch,
@@ -577,6 +608,8 @@ def run_iterative_inference(
             batch.shell_trip_species, batch.shell_trip_features,
             batch.shell_trip_batch,
         )
+        if _use_bf16:
+            delta = delta.float()
         d_norms = delta.norm(dim=-1)
         print(
             f"    iter {it:2d}: |delta| mean={d_norms.mean().item():.4f}  "
@@ -899,6 +932,13 @@ def main() -> None:
     # from ~93 GB → ~40 GB at Fe2N 100×100×400 (30 M edges).
     patch_model_edge_chunking(model, EDGE_CHUNK_SIZE)
     print(f"[edge_chunking] EDGE_CHUNK_SIZE={EDGE_CHUNK_SIZE:,}", flush=True)
+    # bf16 conversion BEFORE torch.compile so dynamo traces bf16 ops.
+    # Casts all model weights to bf16; LayerNorm internally still
+    # computes in fp32 for numerical stability (PyTorch default).
+    if USE_BF16_INFERENCE:
+        model = model.bfloat16()
+        print(f"[bf16] model converted to bfloat16 — "
+              f"A100 Tensor Cores active", flush=True)
     # ``torch.compile`` MUST come AFTER the edge-chunking patch so
     # dynamo traces the chunked forward (otherwise the patched
     # ``EdgeProcessor.forward`` runs eager while the rest is compiled).
