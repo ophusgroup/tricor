@@ -4,6 +4,7 @@ from ._plotting import (
     export_g2_compare_html,
     export_overview_html,
     plot_g2_compare,
+    show_2d,
 )
 from .g3 import G3Distribution
 from .shells import CoordinationShellTarget
@@ -17,6 +18,7 @@ __all__ = [
     "export_g2_compare_html",
     "export_overview_html",
     "plot_g2_compare",
+    "show_2d",
 ]
 
 __version__ = "0.1.0"

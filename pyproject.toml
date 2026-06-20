@@ -61,6 +61,15 @@ Issues = "https://github.com/ophusgroup/tricor/issues"
 test = [
     "pytest>=7.0",
 ]
+# Training-pair generation for the ptychography -> local-g2/g3 ML
+# project (``training`` branch).  abTEM supplies the projected
+# electrostatic potentials that are blurred into pseudo-ptychographic
+# inputs.  abTEM 1.0+ requires Python >=3.11, so this extra does not
+# install on the 3.10 base interpreter -- use a 3.11+ environment
+# (see scratch/, the dedicated .venv-training).
+training = [
+    "abtem>=1.0",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
