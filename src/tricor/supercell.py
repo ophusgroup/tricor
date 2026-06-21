@@ -464,6 +464,7 @@ class Supercell(
         displacement_sigma: float = 0.0,
         atom_species_index: np.ndarray | None = None,
         grain_sources: "list[dict] | None" = None,
+        seeds: np.ndarray | None = None,
         # Build-time grain-orientation refinement (recommended for
         # directional-bond materials like Si — see
         # :meth:`refine_initial_orientations`).  ``True`` runs a
@@ -520,24 +521,26 @@ class Supercell(
         pair_peak_max = float(np.max(pair_peak[pair_peak > _EPS])) if np.any(pair_peak > _EPS) else 2.5
 
         # --- construct atoms ---
-        use_grains = grain_size is not None and float(grain_size) > 0.0
+        use_grains = (grain_size is not None and float(grain_size) > 0.0) or seeds is not None
 
         if use_grains:
             self.atoms = self._build_grain_atoms(
                 shell_target,
-                grain_size=float(grain_size),
+                grain_size=float(grain_size) if grain_size else 0.0,
                 crystalline_fraction=crystalline_fraction,
                 displacement_sigma=displacement_sigma,
                 grain_sources=grain_sources,
+                seeds=seeds,
             )
             # Remember the exact build parameters so
             # ``refine_initial_orientations`` can re-run the full
             # grain-assembly procedure with trial rotations.
             self._grain_build_params = dict(
-                grain_size=float(grain_size),
+                grain_size=float(grain_size) if grain_size else 0.0,
                 crystalline_fraction=float(crystalline_fraction),
                 displacement_sigma=float(displacement_sigma),
                 grain_sources=grain_sources,
+                seeds=seeds,
             )
 
             # Refresh cached arrays after rebuilding atoms

@@ -62,6 +62,8 @@ class PtychoExplorer(anywidget.AnyWidget):
     g3_vmax = traitlets.Float(-1.0).tag(sync=True)  # <=0 -> auto
     r_max = traitlets.Float(10.0).tag(sync=True)
     status = traitlets.Unicode("").tag(sync=True)
+    layout = traitlets.Unicode("side").tag(sync=True)  # "side" | "stacked"
+    transpose = traitlets.Bool(False).tag(sync=True)  # long axis horizontal
 
     def __init__(
         self,
@@ -75,6 +77,7 @@ class PtychoExplorer(anywidget.AnyWidget):
         r_step: float = 0.1,
         phi_num_bins: int = 36,
         scattering_weighted: bool = True,
+        layout: str | None = None,
         **kwargs,
     ):
         """Parameters
@@ -123,6 +126,12 @@ class PtychoExplorer(anywidget.AnyWidget):
 
         lx, ly = stack.extent
         self.extent = [float(lx), float(ly)]
+        # Wide / non-square cells: stack panels under a full-width slice and
+        # put the long axis horizontal.
+        aspect = max(lx, ly) / max(min(lx, ly), 1e-9)
+        stacked = (aspect > 2.0) if layout is None else (layout == "stacked")
+        self.layout = "stacked" if stacked else "side"
+        self.transpose = bool(stacked and ly > lx)
         self.n_slices = int(stack.n_slices)
         self.r_max = float(r_max)
         self.window_side = float(side) if side is not None else 2.0 * float(r_max)

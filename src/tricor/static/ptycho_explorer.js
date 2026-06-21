@@ -57,34 +57,37 @@ function drawSlice(canvas, model, drag) {
   const vmin = percentile(finite, 0.01), vmax = percentile(finite, 0.99);
   const span = vmax - vmin || 1;
 
-  const img = ctx.createImageData(nx, ny);
+  // transpose => long axis (y) horizontal, x vertical (for wide cells).
+  const transpose = model.get("transpose");
+  const iw = transpose ? ny : nx, ih = transpose ? nx : ny;
+  const img = ctx.createImageData(iw, ih);
   for (let i = 0; i < nx; i++) {
     for (let j = 0; j < ny; j++) {
       const v = vals[i * ny + j];
       const [r, g, b] = grey((v - vmin) / span);
-      const k = (j * nx + i) * 4;
+      const k = (transpose ? (i * ny + j) : (j * nx + i)) * 4;
       img.data[k] = r; img.data[k + 1] = g; img.data[k + 2] = b; img.data[k + 3] = 255;
     }
   }
-  // Render the small image scaled up via an offscreen canvas.
   const off = document.createElement("canvas");
-  off.width = nx; off.height = ny;
+  off.width = iw; off.height = ih;
   off.getContext("2d").putImageData(img, 0, 0);
   ctx.imageSmoothingEnabled = true;
   ctx.drawImage(off, 0, 0, W, H);
 
-  // window box (red), mapped from Angstrom -> canvas px
+  // window box (red); horizontal axis is y when transposed, else x.
   const [Lx, Ly] = model.get("extent") || [1, 1];
   const cx = drag.cx != null ? drag.cx : model.get("window_cx");
   const cy = drag.cy != null ? drag.cy : model.get("window_cy");
   const side = model.get("window_side");
-  const x0 = ((cx - side / 2) / Lx) * W, x1 = ((cx + side / 2) / Lx) * W;
-  const y0 = ((cy - side / 2) / Ly) * H, y1 = ((cy + side / 2) / Ly) * H;
+  const lh = transpose ? Ly : Lx, lv = transpose ? Lx : Ly;
+  const ch = transpose ? cy : cx, cv = transpose ? cx : cy;
+  const x0 = ((ch - side / 2) / lh) * W, x1 = ((ch + side / 2) / lh) * W;
+  const y0 = ((cv - side / 2) / lv) * H, y1 = ((cv + side / 2) / lv) * H;
   ctx.strokeStyle = "#e02424";
   ctx.lineWidth = 2;
   ctx.fillStyle = "rgba(224,36,36,0.08)";
-  // Draw the box at all periodic offsets so it wraps across the faces;
-  // the canvas clips the parts that fall outside.
+  // Draw at all periodic offsets so the box wraps; canvas clips the rest.
   for (const ox of [-W, 0, W]) {
     for (const oy of [-H, 0, H]) {
       ctx.strokeRect(x0 + ox, y0 + oy, x1 - x0, y1 - y0);
@@ -218,34 +221,56 @@ function drawG2(canvas, model) {
 // ---- render --------------------------------------------------------------
 function render({ model, el: root }) {
   root.classList.add("ptycho-explorer");
-  const wrap = el("div", "px-wrap", root);
+  const layout = model.get("layout") || "side";
+  const transpose = model.get("transpose");
+  const [Lx, Ly] = model.get("extent") || [1, 1];
 
-  // left column
-  const left = el("div", "px-col px-left", wrap);
-  const sliceCanvas = el("canvas", "px-slice", left);
-  sliceCanvas.width = 300; sliceCanvas.height = 300;
+  let sliceCanvas, sliceSlider, sliceVal, histCanvas, g3Canvas, g2Canvas, vmaxInput;
 
-  const sliceRow = el("div", "px-row", left);
-  el("span", "px-label", sliceRow).textContent = "slice";
-  const sliceSlider = el("input", null, sliceRow);
-  sliceSlider.type = "range"; sliceSlider.min = 0; sliceSlider.step = 1;
-  const sliceVal = el("span", "px-val", sliceRow);
+  function mkSlider(parent) {
+    el("span", "px-label", parent).textContent = "slice";
+    const s = el("input", null, parent);
+    s.type = "range"; s.min = 0; s.step = 1;
+    return s;
+  }
+  function mkVmax(parent) {
+    el("span", "px-label", parent).textContent = "g3 max";
+    const v = el("input", null, parent);
+    v.type = "number"; v.min = 0; v.step = 0.5; v.placeholder = "auto";
+    v.style.width = "60px";
+    return v;
+  }
 
-  const histCanvas = el("canvas", "px-hist", left);
-  histCanvas.width = 300; histCanvas.height = 70;
-
-  // right column
-  const right = el("div", "px-col px-right", wrap);
-  const g3Canvas = el("canvas", "px-g3", right);
-  g3Canvas.width = 360; g3Canvas.height = 210;
-  const g2Canvas = el("canvas", "px-g2", right);
-  g2Canvas.width = 360; g2Canvas.height = 150;
-
-  const ctrlRow = el("div", "px-row", right);
-  el("span", "px-label", ctrlRow).textContent = "g3 max";
-  const vmaxInput = el("input", null, ctrlRow);
-  vmaxInput.type = "number"; vmaxInput.min = 0; vmaxInput.step = 0.5; vmaxInput.placeholder = "auto";
-  vmaxInput.style.width = "60px";
+  if (layout === "stacked") {
+    // Full-width slice on top; g3 over g2 below (shared radial axis).
+    const wrap = el("div", "px-wrap px-stacked", root);
+    const lh = transpose ? Ly : Lx, lv = transpose ? Lx : Ly;
+    sliceCanvas = el("canvas", "px-slice", wrap);
+    sliceCanvas.width = 760;
+    sliceCanvas.height = Math.max(90, Math.round(760 * lv / lh));
+    const row = el("div", "px-row", wrap);
+    sliceSlider = mkSlider(row);
+    sliceVal = el("span", "px-val", row);
+    histCanvas = el("canvas", "px-hist", wrap);
+    histCanvas.width = 760; histCanvas.height = 64;
+    const col = el("div", "px-col", wrap);
+    g3Canvas = el("canvas", "px-g3", col); g3Canvas.width = 520; g3Canvas.height = 240;
+    g2Canvas = el("canvas", "px-g2", col); g2Canvas.width = 520; g2Canvas.height = 150;
+    vmaxInput = mkVmax(el("div", "px-row", wrap));
+  } else {
+    const wrap = el("div", "px-wrap", root);
+    const left = el("div", "px-col px-left", wrap);
+    sliceCanvas = el("canvas", "px-slice", left);
+    sliceCanvas.width = 300; sliceCanvas.height = 300;
+    sliceSlider = mkSlider(el("div", "px-row", left));
+    sliceVal = el("span", "px-val", left.lastChild);
+    histCanvas = el("canvas", "px-hist", left);
+    histCanvas.width = 300; histCanvas.height = 70;
+    const right = el("div", "px-col px-right", wrap);
+    g3Canvas = el("canvas", "px-g3", right); g3Canvas.width = 360; g3Canvas.height = 210;
+    g2Canvas = el("canvas", "px-g2", right); g2Canvas.width = 360; g2Canvas.height = 150;
+    vmaxInput = mkVmax(el("div", "px-row", right));
+  }
 
   const status = el("div", "px-status", root);
 
@@ -268,11 +293,10 @@ function render({ model, el: root }) {
   // --- window drag on the slice canvas ---
   function pointerToAngstrom(ev) {
     const rect = sliceCanvas.getBoundingClientRect();
-    const [Lx, Ly] = model.get("extent") || [1, 1];
-    return [
-      ((ev.clientX - rect.left) / rect.width) * Lx,
-      ((ev.clientY - rect.top) / rect.height) * Ly,
-    ];
+    const fh = (ev.clientX - rect.left) / rect.width;
+    const fv = (ev.clientY - rect.top) / rect.height;
+    // transposed: horizontal is y, vertical is x.
+    return transpose ? [fv * Lx, fh * Ly] : [fh * Lx, fv * Ly];
   }
   function clampCenter(c, L) {
     // Window wraps across periodic faces, so the centre may sit anywhere.

@@ -211,18 +211,6 @@ def _random_histograms(
     return rr, rrr
 
 
-def _far_field_scale(values: np.ndarray, mask: np.ndarray) -> float:
-    """Median of ``values`` over the far field (for the → 1 rescale).
-
-    The median is robust to the heavy counting noise in the highest-r
-    bins, where a finite window can barely hold a pair at that
-    separation.
-    """
-    sel = values[mask]
-    sel = sel[np.isfinite(sel) & (sel > 0)]
-    return float(np.median(sel)) if sel.size else 1.0
-
-
 def _kde(values: np.ndarray, sigma) -> np.ndarray:
     """Gaussian KDE smoothing of a histogram (``mode='constant'``).
 
@@ -253,7 +241,6 @@ def local_correlations(
     atom_scale: np.ndarray | None = None,
     n_random: int | None = None,
     rng_seed: int = 0,
-    far_field_frac: float = 0.55,
     smooth_random: bool = True,
     smooth_sigma_r: float = 0.1,
     smooth_sigma_phi_deg: float = 5.0,
@@ -295,10 +282,6 @@ def local_correlations(
         shape).  ``None`` auto-sizes it to a modest density inside the
         window support, which keeps the one-time ``RRR`` cost bounded;
         larger values give a cleaner (less noisy) cached denominator.
-    far_field_frac
-        Lower edge (as a fraction of ``r_max``) of the band used to
-        rescale each correlation to 1.  The band stops at ``0.9 · r_max``
-        to avoid the noisiest top bins.
     smooth_random
         Lightly smooth the random catalogue histograms (their true value
         is smooth) to reduce Monte-Carlo noise in the denominator.
@@ -339,21 +322,22 @@ def local_correlations(
     # KDE smoothing widths, in bins.
     sig_r = smooth_sigma_r / r_step
     sig_phi = smooth_sigma_phi_deg / (180.0 / phi_num_bins)
-    far = (r_centers > far_field_frac * r_max) & (r_centers < 0.9 * r_max)
 
     # KDE is applied to BOTH the numerator and the (window-matched ideal)
     # denominator, then divided — the kernel fills empty bins so the ratio
-    # is finite everywhere (r = 0, r = r_max, φ = 0/180°) and the far field
-    # is pinned to 1.  Dividing by the Monte-Carlo RRR (not an analytic
-    # sin φ) removes the window's angular anisotropy, so g3 → 1 flat in φ.
+    # is finite everywhere (r = 0, r = r_max, φ = 0/180°).  Dividing by the
+    # Monte-Carlo RRR (not an analytic sin φ) removes the window's angular
+    # anisotropy.  The overall level is set by the total pair / triplet
+    # counts so the result → 1 for a *random* structure while an ordered
+    # one keeps its tall sharp peaks (a far-field rescale would squash a
+    # crystal, whose far field is not 1).
     # --- g2 ---
     g2 = _kde(dd, (sig_r,)) / (_kde(rr, (sig_r,)) + _EPS)
-    g2 = g2 / _far_field_scale(g2, far)
+    g2 = g2 * (float(rr.sum()) / max(float(dd.sum()), _EPS))
 
     # --- g3 ---
     g3 = _kde(ddd, (sig_r, sig_r, sig_phi)) / (_kde(rrr, (sig_r, sig_r, sig_phi)) + _EPS)
-    far3 = np.broadcast_to(far[:, None, None] & far[None, :, None], g3.shape)
-    g3 = g3 / _far_field_scale(g3, far3)
+    g3 = g3 * (float(rrr.sum()) / max(float(ddd.sum()), _EPS))
 
     # --- integrated slice: pin r01 to the NN band, integrate counts and
     # the matched envelope over the band, *then* divide. ---
@@ -367,9 +351,7 @@ def local_correlations(
     ddd_band = ddd[band_mask].sum(axis=0)  # (r02, phi)
     rrr_band = rrr[band_mask].sum(axis=0)
     g3_slice = _kde(ddd_band, (sig_r, sig_phi)) / (_kde(rrr_band, (sig_r, sig_phi)) + _EPS)
-    g3_slice = g3_slice / _far_field_scale(
-        g3_slice, far[:, None] & np.ones((1, phi_num_bins), bool)
-    )
+    g3_slice = g3_slice * (float(rrr_band.sum()) / max(float(ddd_band.sum()), _EPS))
     g3_slice = g3_slice.T  # -> (phi, r02), like tricor's plot slice
 
     return LocalCorrelations(

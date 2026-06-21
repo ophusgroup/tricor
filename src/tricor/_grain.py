@@ -303,6 +303,7 @@ class _GrainMixin:
         max_density_passes: int = 5,
         grain_sources: "list[dict] | None" = None,
         rotations_override: "np.ndarray | None" = None,
+        seeds: "np.ndarray | None" = None,
     ) -> Atoms:
         """Build a supercell with crystalline grains via Voronoi tiling.
 
@@ -375,11 +376,18 @@ class _GrainMixin:
         ref_numbers = np.asarray(sources[0]["atoms"].numbers, dtype=np.int64)
 
         # ---- 1. Seeds ----
-        grain_radius_user = max(float(grain_size) * 0.5, 2.0)
+        # ``seeds`` may be supplied directly (e.g. a spatially graded
+        # density for an order gradient); otherwise place them uniformly
+        # at the density implied by ``grain_size``.
         V_box = float(np.prod(box_dim))
-        V_grain = (4.0 / 3.0) * np.pi * grain_radius_user ** 3
-        num_grains = max(1, int(np.ceil(V_box / V_grain)))
-        seeds = self.rng.random((num_grains, 3)) * box_dim
+        if seeds is not None:
+            seeds = np.asarray(seeds, dtype=np.float64)
+            num_grains = len(seeds)
+        else:
+            grain_radius_user = max(float(grain_size) * 0.5, 2.0)
+            V_grain = (4.0 / 3.0) * np.pi * grain_radius_user ** 3
+            num_grains = max(1, int(np.ceil(V_box / V_grain)))
+            seeds = self.rng.random((num_grains, 3)) * box_dim
 
         # ---- 2. Periodic Voronoi cells ----
         cells = _periodic_voronoi_3d(box_dim, seeds)

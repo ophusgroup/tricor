@@ -52,4 +52,8 @@ def __getattr__(name: str):
         from . import training
 
         return getattr(training, name)
+    if name in ("graded_supercell",):
+        from . import structures
+
+        return getattr(structures, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

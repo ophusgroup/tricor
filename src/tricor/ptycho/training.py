@@ -111,6 +111,8 @@ def sliding_window_pairs(
     side: float | None = None,
     sigma_z: float | None = None,
     xy_step: float = 10.0,
+    x_positions=None,
+    y_positions=None,
     z_positions=None,
     atom_scale: np.ndarray | None = None,
     scattering_weighted: bool = True,
@@ -138,6 +140,11 @@ def sliding_window_pairs(
         In-plane grid step (Å).  A 50 Å cell with ``xy_step=10`` gives a
         5 × 5 grid (the cell is periodic, so the right/top edge is not
         repeated).
+    x_positions, y_positions
+        Explicit in-plane centres (Å) to sample, overriding ``xy_step``
+        for that axis.  E.g. for a cell graded along y, pass
+        ``x_positions=[Lx/2]`` and a fine ``y_positions`` to walk the
+        transition.
     z_positions
         Iterable of ``z0`` depths (Å); defaults to four evenly spaced
         interior cuts.
@@ -193,8 +200,10 @@ def sliding_window_pairs(
         n_random=n_random, rng_seed=rng_seed,
     )
 
-    xs = np.arange(0.0, lx - 1e-6, xy_step)
-    ys = np.arange(0.0, ly - 1e-6, xy_step)
+    xs = (np.asarray(x_positions, dtype=np.float64)
+          if x_positions is not None else np.arange(0.0, lx - 1e-6, xy_step))
+    ys = (np.asarray(y_positions, dtype=np.float64)
+          if y_positions is not None else np.arange(0.0, ly - 1e-6, xy_step))
     tasks = [
         (float(cx), float(cy), float(z0))
         for z0 in np.atleast_1d(z_positions)
