@@ -24,7 +24,7 @@ import numpy as np
 import traitlets
 
 from .correlations import local_correlations
-from .weighting import WindowSpec
+from .weighting import WindowSpec, windowed_image
 
 _STATIC = pathlib.Path(__file__).parent.parent / "static"
 
@@ -51,6 +51,11 @@ class PtychoExplorer(anywidget.AnyWidget):
     window_cx = traitlets.Float(0.0).tag(sync=True)
     window_cy = traitlets.Float(0.0).tag(sync=True)
     window_side = traitlets.Float(20.0).tag(sync=True)
+    window_angle = traitlets.Float(0.0).tag(sync=True)  # input rotation (deg)
+
+    # --- input preview: the rotated, circular-windowed crop the net sees ---
+    input_values = traitlets.List(trait=traitlets.Float()).tag(sync=True)
+    input_shape = traitlets.List(trait=traitlets.Int()).tag(sync=True)  # [nx, ny]
 
     # --- right panels: correlations ---
     r = traitlets.List(trait=traitlets.Float()).tag(sync=True)
@@ -141,9 +146,11 @@ class PtychoExplorer(anywidget.AnyWidget):
 
         self._update_slice()
         self._update_corr()
+        self._update_input()
 
         self.observe(self._on_slice, names="slice_index")
         self.observe(self._on_window, names=["window_cx", "window_cy"])
+        self.observe(self._on_angle, names="window_angle")
 
     # -- payload builders -------------------------------------------------
     def _update_slice(self) -> None:
@@ -185,8 +192,21 @@ class PtychoExplorer(anywidget.AnyWidget):
         self.nn_band = [float(res.nn_band[0]), float(res.nn_band[1])]
         self.status = (
             f"{res.n_window} atoms · z0={self.z0:.1f} Å · "
-            f"window {self.window_side:.0f} Å · σz={self._sigma_z:.0f} Å"
+            f"window {self.window_side:.0f} Å (circular) · "
+            f"σz={self._sigma_z:.0f} Å · rot {self.window_angle:.0f}°"
         )
+
+    def _update_input(self) -> None:
+        """The rotated, circular-windowed crop the network would see."""
+        img = windowed_image(
+            self._stack.array[int(self.slice_index)],
+            self._stack.sampling,
+            (float(self.window_cx), float(self.window_cy)),
+            float(self.window_side),
+            angle_deg=float(self.window_angle),
+        )
+        self.input_shape = [int(img.shape[0]), int(img.shape[1])]
+        self.input_values = img.ravel().tolist()
 
     # -- observers --------------------------------------------------------
     def _on_slice(self, _change) -> None:
@@ -196,6 +216,7 @@ class PtychoExplorer(anywidget.AnyWidget):
         try:
             self._update_slice()
             self._update_corr()
+            self._update_input()
         finally:
             self._suspend = False
 
@@ -205,5 +226,21 @@ class PtychoExplorer(anywidget.AnyWidget):
         self._suspend = True
         try:
             self._update_corr()
+            self._update_input()
+        finally:
+            self._suspend = False
+
+    def _on_angle(self, _change) -> None:
+        # The circular window makes the target rotation-invariant, so only
+        # the input preview changes — g2 / g3 stay put.
+        if self._suspend:
+            return
+        self._suspend = True
+        try:
+            self._update_input()
+            self.status = (
+                f"z0={self.z0:.1f} Å · window {self.window_side:.0f} Å (circular) · "
+                f"σz={self._sigma_z:.0f} Å · rot {self.window_angle:.0f}°"
+            )
         finally:
             self._suspend = False

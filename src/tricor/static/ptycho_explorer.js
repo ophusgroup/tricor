@@ -75,23 +75,26 @@ function drawSlice(canvas, model, drag) {
   ctx.imageSmoothingEnabled = true;
   ctx.drawImage(off, 0, 0, W, H);
 
-  // window box (red); horizontal axis is y when transposed, else x.
+  // window (red circle of radius side/2 — isotropic; horizontal axis is y
+  // when transposed, else x).
   const [Lx, Ly] = model.get("extent") || [1, 1];
   const cx = drag.cx != null ? drag.cx : model.get("window_cx");
   const cy = drag.cy != null ? drag.cy : model.get("window_cy");
   const side = model.get("window_side");
   const lh = transpose ? Ly : Lx, lv = transpose ? Lx : Ly;
   const ch = transpose ? cy : cx, cv = transpose ? cx : cy;
-  const x0 = ((ch - side / 2) / lh) * W, x1 = ((ch + side / 2) / lh) * W;
-  const y0 = ((cv - side / 2) / lv) * H, y1 = ((cv + side / 2) / lv) * H;
+  const cxp = (ch / lh) * W, cyp = (cv / lv) * H;
+  const rx = (side / 2 / lh) * W, ry = (side / 2 / lv) * H;
   ctx.strokeStyle = "#e02424";
   ctx.lineWidth = 2;
   ctx.fillStyle = "rgba(224,36,36,0.08)";
-  // Draw at all periodic offsets so the box wraps; canvas clips the rest.
+  // Draw at all periodic offsets so the circle wraps; canvas clips the rest.
   for (const ox of [-W, 0, W]) {
     for (const oy of [-H, 0, H]) {
-      ctx.strokeRect(x0 + ox, y0 + oy, x1 - x0, y1 - y0);
-      ctx.fillRect(x0 + ox, y0 + oy, x1 - x0, y1 - y0);
+      ctx.beginPath();
+      ctx.ellipse(cxp + ox, cyp + oy, rx, ry, 0, 0, 2 * Math.PI);
+      ctx.fill();
+      ctx.stroke();
     }
   }
 }
@@ -117,6 +120,35 @@ function drawHist(canvas, model) {
   ctx.fillText(`${edges[0].toFixed(2)}`, ml, H - 4);
   ctx.textAlign = "right";
   ctx.fillText(`${edges[edges.length - 1].toFixed(2)} rad`, W - 4, H - 4);
+}
+
+// ---- input preview: the rotated, circular-windowed crop the net sees ------
+function drawInput(canvas, model) {
+  const vals = model.get("input_values") || [];
+  const shape = model.get("input_shape") || [0, 0];
+  const [nx, ny] = shape;
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  if (!vals.length || nx * ny !== vals.length) return;
+  const finite = vals.filter((v) => Number.isFinite(v)).slice().sort((a, b) => a - b);
+  const vmin = percentile(finite, 0.01), vmax = percentile(finite, 0.99);
+  const span = vmax - vmin || 1;
+  const img = ctx.createImageData(nx, ny);
+  for (let i = 0; i < nx; i++) {
+    for (let j = 0; j < ny; j++) {
+      const [r, g, b] = grey((vals[i * ny + j] - vmin) / span);
+      const k = (j * nx + i) * 4;  // x horizontal, y vertical
+      img.data[k] = r; img.data[k + 1] = g; img.data[k + 2] = b; img.data[k + 3] = 255;
+    }
+  }
+  const off = document.createElement("canvas");
+  off.width = nx; off.height = ny;
+  off.getContext("2d").putImageData(img, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(off, 0, 0, W, H);
+  ctx.fillStyle = "#fff"; ctx.font = "10px sans-serif"; ctx.textAlign = "left";
+  ctx.fillText("input (net)", 5, 13);
 }
 
 // ---- right panels: g3 heatmap + g2 line (shared r axis) -------------------
@@ -226,12 +258,25 @@ function render({ model, el: root }) {
   const [Lx, Ly] = model.get("extent") || [1, 1];
 
   let sliceCanvas, sliceSlider, sliceVal, histCanvas, g3Canvas, g2Canvas, vmaxInput;
+  let rotSlider, rotVal, inputCanvas;
 
   function mkSlider(parent) {
     el("span", "px-label", parent).textContent = "slice";
     const s = el("input", null, parent);
     s.type = "range"; s.min = 0; s.step = 1;
     return s;
+  }
+  function mkRotation(parent) {
+    el("span", "px-label", parent).textContent = "rotate";
+    const s = el("input", null, parent);
+    s.type = "range"; s.min = -180; s.max = 180; s.step = 5;
+    s.value = model.get("window_angle") || 0;
+    return s;
+  }
+  function mkInput(parent) {
+    const c = el("canvas", "px-input", parent);
+    c.width = 150; c.height = 150;
+    return c;
   }
   function mkVmax(parent) {
     el("span", "px-label", parent).textContent = "g3 max";
@@ -253,6 +298,9 @@ function render({ model, el: root }) {
     sliceVal = el("span", "px-val", row);
     histCanvas = el("canvas", "px-hist", wrap);
     histCanvas.width = 760; histCanvas.height = 64;
+    const irow = el("div", "px-row", wrap);
+    rotSlider = mkRotation(irow); rotVal = el("span", "px-val", irow);
+    inputCanvas = mkInput(wrap);
     const col = el("div", "px-col", wrap);
     g3Canvas = el("canvas", "px-g3", col); g3Canvas.width = 520; g3Canvas.height = 240;
     g2Canvas = el("canvas", "px-g2", col); g2Canvas.width = 520; g2Canvas.height = 150;
@@ -266,6 +314,9 @@ function render({ model, el: root }) {
     sliceVal = el("span", "px-val", left.lastChild);
     histCanvas = el("canvas", "px-hist", left);
     histCanvas.width = 300; histCanvas.height = 70;
+    const irow = el("div", "px-row", left);
+    rotSlider = mkRotation(irow); rotVal = el("span", "px-val", irow);
+    inputCanvas = mkInput(left);
     const right = el("div", "px-col px-right", wrap);
     g3Canvas = el("canvas", "px-g3", right); g3Canvas.width = 360; g3Canvas.height = 210;
     g2Canvas = el("canvas", "px-g2", right); g2Canvas.width = 360; g2Canvas.height = 150;
@@ -280,11 +331,14 @@ function render({ model, el: root }) {
     sliceSlider.max = (model.get("n_slices") || 1) - 1;
     sliceSlider.value = model.get("slice_index");
     sliceVal.textContent = `${model.get("slice_index")} (z=${model.get("z0").toFixed(1)} Å)`;
+    rotSlider.value = model.get("window_angle");
+    rotVal.textContent = `${(model.get("window_angle") || 0).toFixed(0)}°`;
     status.textContent = model.get("status") || "";
   }
   function redrawAll() {
     drawSlice(sliceCanvas, model, drag);
     drawHist(histCanvas, model);
+    drawInput(inputCanvas, model);
     drawG3(g3Canvas, model);
     drawG2(g2Canvas, model);
     syncControls();
@@ -332,6 +386,11 @@ function render({ model, el: root }) {
     model.set("slice_index", parseInt(sliceSlider.value, 10));
     model.save_changes();
   });
+  rotSlider.addEventListener("input", () => {
+    rotVal.textContent = `${parseFloat(rotSlider.value).toFixed(0)}°`;
+    model.set("window_angle", parseFloat(rotSlider.value));
+    model.save_changes();
+  });
   vmaxInput.addEventListener("change", () => {
     const v = parseFloat(vmaxInput.value);
     model.set("g3_vmax", Number.isFinite(v) && v > 0 ? v : -1.0);
@@ -340,11 +399,13 @@ function render({ model, el: root }) {
 
   // react to Python-side updates
   model.on("change:slice_values", () => { drawSlice(sliceCanvas, model, drag); drawHist(histCanvas, model); });
+  model.on("change:input_values", () => drawInput(inputCanvas, model));
   model.on("change:g3_slice_values", () => drawG3(g3Canvas, model));
   model.on("change:g2", () => drawG2(g2Canvas, model));
   model.on("change:g3_vmax", () => drawG3(g3Canvas, model));
   model.on("change:status", syncControls);
   model.on("change:slice_index", syncControls);
+  model.on("change:window_angle", () => { drawInput(inputCanvas, model); syncControls(); });
 
   redrawAll();
 }

@@ -21,7 +21,7 @@ import os
 import numpy as np
 
 from .correlations import local_correlations
-from .weighting import WindowSpec, hann_1d
+from .weighting import WindowSpec, windowed_image
 
 __all__ = ["TrainingPair", "sliding_window_pairs"]
 
@@ -32,40 +32,13 @@ _WORKER: dict = {}
 class TrainingPair(dict):
     """A single training pair (a dict with attribute access for convenience).
 
-    Keys: ``cx, cy, z0`` (window centre, Å), ``input`` (2D windowed
-    potential slice, rad), ``g2`` (1D), ``g3_slice`` (2D, (phi, r)),
-    ``r`` (radial centres), ``phi_deg`` (angle centres).
+    Keys: ``cx, cy, z0`` (window centre, Å), ``angle`` (input rotation,
+    deg), ``input`` (2D windowed potential slice, rad), ``g2`` (1D),
+    ``g3_slice`` (2D, (phi, r)), ``r`` (radial centres), ``phi_deg``
+    (angle centres).
     """
 
     __getattr__ = dict.__getitem__
-
-
-def _window_image(stack, z0: float, cx: float, cy: float, side: float) -> np.ndarray:
-    """Windowed training input from the depth slice at ``z0`` (PBC-cropped).
-
-    The potential crop is mean-normalised and Hann-windowed, with the
-    background set to 1 outside the window::
-
-        im = potential / mean(potential) * window + (1 - window)
-
-    so the image is ~1 in the taper region and carries the
-    mean-normalised (thickness/scale-invariant) potential inside.
-    """
-    arr = stack.array[stack.slice_index_for_z(z0)]  # (nx, ny)
-    dx, dy = stack.sampling
-    nx_half = int(round((side / 2) / dx))
-    ny_half = int(round((side / 2) / dy))
-    ci = int(round(cx / dx))
-    cj = int(round(cy / dy))
-    ix = np.arange(ci - nx_half, ci + nx_half) % arr.shape[0]
-    iy = np.arange(cj - ny_half, cj + ny_half) % arr.shape[1]
-    crop = arr[np.ix_(ix, iy)]
-    wx = hann_1d((np.arange(-nx_half, nx_half) + 0.5) * dx, side)
-    wy = hann_1d((np.arange(-ny_half, ny_half) + 0.5) * dy, side)
-    window = np.outer(wx, wy)
-    mean = float(np.mean(crop))
-    norm = crop / mean if mean > 1e-12 else crop
-    return norm * window + (1.0 - window)
 
 
 def _init_worker(potential_blurred, atoms, kw, cache_seed) -> None:
@@ -82,6 +55,8 @@ def _init_worker(potential_blurred, atoms, kw, cache_seed) -> None:
 def _compute_pair(task):
     cx, cy, z0 = task
     pb, atoms, kw = _WORKER["pb"], _WORKER["atoms"], _WORKER["kw"]
+    # The circular window makes g2 / g3 rotation-invariant, so compute the
+    # target once and pair it with each rotated input image.
     corr = local_correlations(
         atoms,
         WindowSpec((float(cx), float(cy)), kw["side"], float(z0), kw["sigma_z"]),
@@ -93,11 +68,15 @@ def _compute_pair(task):
         n_random=kw["n_random"],
         rng_seed=kw["rng_seed"],
     )
-    return TrainingPair(
-        cx=float(cx), cy=float(cy), z0=float(z0),
-        input=_window_image(pb, z0, cx, cy, kw["side"]),
-        g2=corr.g2, g3_slice=corr.g3_slice, r=corr.r, phi_deg=corr.phi_deg,
-    )
+    arr = pb.array[pb.slice_index_for_z(z0)]  # (nx, ny)
+    return [
+        TrainingPair(
+            cx=float(cx), cy=float(cy), z0=float(z0), angle=float(ang),
+            input=windowed_image(arr, pb.sampling, (cx, cy), kw["side"], angle_deg=ang),
+            g2=corr.g2, g3_slice=corr.g3_slice, r=corr.r, phi_deg=corr.phi_deg,
+        )
+        for ang in kw["rotations"]
+    ]
 
 
 def sliding_window_pairs(
@@ -114,6 +93,7 @@ def sliding_window_pairs(
     x_positions=None,
     y_positions=None,
     z_positions=None,
+    rotations=None,
     atom_scale: np.ndarray | None = None,
     scattering_weighted: bool = True,
     rng_seed: int = 0,
@@ -148,6 +128,13 @@ def sliding_window_pairs(
     z_positions
         Iterable of ``z0`` depths (Å); defaults to four evenly spaced
         interior cuts.
+    rotations
+        Iterable of input-image rotations (degrees) about each window
+        centre.  The circular window makes g2 / g3 rotation-invariant, so
+        every angle reuses the same (once-computed) target and only the
+        input is re-sampled (periodic bicubic) — free rotation
+        augmentation.  Defaults to ``(0.0,)`` (no augmentation); pass e.g.
+        ``np.arange(0, 360, 45)`` to emit 8 inputs per window.
     atom_scale, scattering_weighted
         Per-atom scattering weighting (computed once if not supplied).
     rng_seed
@@ -171,6 +158,7 @@ def sliding_window_pairs(
         sigma_z = potential_blurred.blur[1] if potential_blurred.blur else 15.0
     if z_positions is None:
         z_positions = np.linspace(0, lz, 6)[1:-1]  # 4 interior cuts
+    rotations = (0.0,) if rotations is None else tuple(float(a) for a in np.atleast_1d(rotations))
     if atom_scale is None and scattering_weighted:
         from .potential import scattering_power
 
@@ -197,7 +185,7 @@ def sliding_window_pairs(
     kw = dict(
         side=float(side), sigma_z=float(sigma_z), r_max=r_max, r_step=r_step,
         phi_num_bins=phi_num_bins, pair_peak=pair_peak, atom_scale=atom_scale,
-        n_random=n_random, rng_seed=rng_seed,
+        n_random=n_random, rng_seed=rng_seed, rotations=rotations,
     )
 
     xs = (np.asarray(x_positions, dtype=np.float64)
@@ -216,9 +204,9 @@ def sliding_window_pairs(
         _init_worker(potential_blurred, atoms, kw, None)  # cache already warm
         pairs = []
         for n, task in enumerate(tasks, 1):
-            pairs.append(_compute_pair(task))
+            pairs.extend(_compute_pair(task))
             if show_progress:
-                print(f"\r  training pairs: {n}/{total}", end="", flush=True)
+                print(f"\r  windows: {n}/{total}  ({len(pairs)} pairs)", end="", flush=True)
         if show_progress:
             print()
         return pairs
@@ -238,10 +226,10 @@ def sliding_window_pairs(
         initializer=_init_worker,
         initargs=(potential_blurred, atoms, kw, cache_seed),
     ) as ex:
-        for n, pair in enumerate(ex.map(_compute_pair, tasks, chunksize=1), 1):
-            pairs.append(pair)
+        for n, pair_group in enumerate(ex.map(_compute_pair, tasks, chunksize=1), 1):
+            pairs.extend(pair_group)
             if show_progress:
-                print(f"\r  training pairs: {n}/{total}  ({workers} workers)", end="", flush=True)
+                print(f"\r  windows: {n}/{total}  ({len(pairs)} pairs, {workers} workers)", end="", flush=True)
     if show_progress:
         print()
     return pairs

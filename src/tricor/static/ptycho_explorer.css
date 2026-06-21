@@ -35,6 +35,11 @@
   border-radius: 4px;
   background: #fff;
 }
+.ptycho-explorer .px-input {
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: #000;
+}
 .ptycho-explorer .px-row {
   display: flex;
   align-items: center;

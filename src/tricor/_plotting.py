@@ -25,6 +25,7 @@ def show_2d(
     *,
     extent=None,
     ax=None,
+    figsize: tuple = (5, 5),
     cmap: str = "gray",
     title: str | None = None,
     xlabel: str | None = None,
@@ -49,6 +50,8 @@ def show_2d(
         ``[x0, x1, y0, y1]`` in data units (e.g. Å), or ``None``.
     ax
         Existing matplotlib Axes to draw into; created if ``None``.
+    figsize
+        Figure size when a new figure is created (ignored if ``ax`` is given).
     cmap, title, xlabel, ylabel, colorbar, origin, aspect
         Standard display options (``aspect="auto"`` for non-isotropic
         axes such as an angle-vs-distance map).
@@ -69,7 +72,7 @@ def show_2d(
         vmin, vmax = (float(v) for v in np.nanpercentile(
             arr, [clip_percentile, 100.0 - clip_percentile]))
     if ax is None:
-        _, ax = plt.subplots(figsize=(5, 5))
+        _, ax = plt.subplots(figsize=figsize)
     im = ax.imshow(arr, extent=extent, origin=origin, cmap=cmap,
                    aspect=aspect, vmin=vmin, vmax=vmax)
     if title:

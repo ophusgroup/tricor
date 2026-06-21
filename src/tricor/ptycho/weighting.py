@@ -1,14 +1,17 @@
 """Window / envelope weighting for local ptychographic g2 / g3 targets.
 
 A *local* correlation function is measured over a soft analysis window: a
-2D Hann taper in the imaging plane ``(x, y)`` and a Gaussian along the
-beam direction ``z``, centred on a chosen slice ``z0``.  Every atom *i*
-carries a scalar weight
+**circular** (radial) Hann taper in the imaging plane ``(x, y)`` and a
+Gaussian along the beam direction ``z``, centred on a chosen slice ``z0``.
+Every atom *i* carries a scalar weight
 
-    w_i = H(x_i - cx) · H(y_i - cy) · G(z_i - z0)
+    w_i = H(r_i) · G(z_i - z0),   r_i = hypot(x_i - cx, y_i - cy)
 
 so atoms near the window edge contribute little and the recovered g2 / g3
 describes the *same* soft region that the blurred potential slice shows.
+The window is **isotropic** (a disk of radius ``side / 2``, zero in the
+four corners), so rotating the input image about the window centre leaves
+g2 / g3 unchanged — rotation is a free augmentation of the *input* only.
 The matching asymptote-to-1 normalisation lives in
 :mod:`tricor.ptycho.correlations`.
 
@@ -28,9 +31,11 @@ import numpy as np
 __all__ = [
     "WindowSpec",
     "hann_1d",
+    "hann_radial",
     "hann_window_xy",
     "gaussian_z",
     "window_weights",
+    "windowed_image",
 ]
 
 
@@ -43,8 +48,9 @@ class WindowSpec:
     center_xy
         In-plane centre ``(cx, cy)`` of the Hann window, in Å.
     side
-        Hann window side length ``L`` (Å).  The window is zero outside the
-        ``L × L`` square and the useful correlation range is ``r <= L / 2``.
+        Hann window side length ``L`` (Å).  The window is a *disk* of
+        radius ``L / 2`` (zero in the corners of the ``L × L`` box) and the
+        useful correlation range is ``r <= L / 2``.
     z0
         Centre of the Gaussian depth weight (Å).
     sigma_z
@@ -82,12 +88,27 @@ def hann_1d(d: np.ndarray, side: float) -> np.ndarray:
     return w
 
 
+def hann_radial(dr: np.ndarray, side: float) -> np.ndarray:
+    """Circular Hann window: 1 at ``dr = 0``, 0 at ``dr >= side / 2``.
+
+    ``dr`` is the in-plane distance from the window centre.  The support is
+    the disk of radius ``side / 2`` — the four corners of the enclosing
+    ``side × side`` box are exactly zero, making the window isotropic.
+    """
+    dr = np.asarray(dr, dtype=np.float64)
+    half = 0.5 * side
+    w = np.zeros_like(dr)
+    inside = dr < half
+    w[inside] = 0.5 * (1.0 + np.cos(np.pi * dr[inside] / half))
+    return w
+
+
 def hann_window_xy(x, y, center_xy: tuple[float, float], side: float) -> np.ndarray:
-    """Separable 2D Hann window evaluated at atom positions ``(x, y)``."""
+    """Circular Hann window evaluated at in-plane positions ``(x, y)``."""
     cx, cy = center_xy
-    return hann_1d(np.asarray(x, dtype=np.float64) - cx, side) * hann_1d(
-        np.asarray(y, dtype=np.float64) - cy, side
-    )
+    dx = np.asarray(x, dtype=np.float64) - cx
+    dy = np.asarray(y, dtype=np.float64) - cy
+    return hann_radial(np.hypot(dx, dy), side)
 
 
 def gaussian_z(z, z0: float, sigma_z: float) -> np.ndarray:
@@ -138,7 +159,7 @@ def window_weights(
         dx -= np.round(dx / box[0]) * box[0]
         dy -= np.round(dy / box[1]) * box[1]
         dz -= np.round(dz / box[2]) * box[2]
-    w = hann_1d(dx, spec.side) * hann_1d(dy, spec.side)
+    w = hann_radial(np.hypot(dx, dy), spec.side)
     w = w * np.exp(-0.5 * (dz / spec.sigma_z) ** 2)
     if atom_scale is not None:
         w = w * np.asarray(atom_scale, dtype=np.float64)
@@ -147,3 +168,47 @@ def window_weights(
     # the data support identical).
     w[np.abs(dz) > spec.z_support] = 0.0
     return w
+
+
+def windowed_image(
+    array: np.ndarray,
+    sampling: tuple[float, float],
+    center: tuple[float, float],
+    side: float,
+    angle_deg: float = 0.0,
+) -> np.ndarray:
+    """Rotated, circular-Hann-windowed crop of a periodic 2D field.
+
+    Sample ``array`` (a periodic field with pixel size ``sampling = (dx,
+    dy)`` Å) on a ``side × side`` grid centred at ``center = (cx, cy)`` Å
+    and rotated ``angle_deg`` (CCW) about that centre, using a smooth,
+    periodic, bicubic (cubic-spline) interpolator.  The crop is
+    mean-normalised, multiplied by the circular Hann window, and the
+    background outside the disk is set to 1::
+
+        im = crop / mean(crop) * window + (1 - window)
+
+    Because the window is a disk, rotating the crop only re-samples the
+    *input*; the matching g2 / g3 target is unchanged — this is the
+    rotation augmentation the dense network is trained against.
+    """
+    from scipy.ndimage import map_coordinates
+
+    arr = np.asarray(array, dtype=np.float64)
+    dx, dy = sampling
+    cx, cy = center
+    nx_half = int(round((0.5 * side) / dx))
+    ny_half = int(round((0.5 * side) / dy))
+    u = (np.arange(-nx_half, nx_half) + 0.5) * dx
+    v = (np.arange(-ny_half, ny_half) + 0.5) * dy
+    uu, vv = np.meshgrid(u, v, indexing="ij")
+    theta = np.deg2rad(angle_deg)
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+    # Source positions (Å) of the rotated local grid, then -> pixel index.
+    su = cx + cos_t * uu - sin_t * vv
+    sv = cy + sin_t * uu + cos_t * vv
+    crop = map_coordinates(arr, [su / dx, sv / dy], order=3, mode="grid-wrap")
+    window = hann_radial(np.hypot(uu, vv), side)
+    mean = float(np.mean(crop))
+    norm = crop / mean if mean > 1e-12 else crop
+    return norm * window + (1.0 - window)

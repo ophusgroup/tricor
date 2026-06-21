@@ -83,7 +83,7 @@ def plot_scattering_power(
     return ax
 
 
-def plot_training_pair(pairs, index: int):
+def plot_training_pair(pairs, index: int, *, figsize: tuple = (13, 4)):
     """Plot one training pair: input window, g2, and g3 slice.
 
     Parameters
@@ -92,6 +92,8 @@ def plot_training_pair(pairs, index: int):
         List from :func:`tricor.ptycho.sliding_window_pairs`.
     index
         Which pair to show.
+    figsize
+        Figure size in inches.
 
     Returns
     -------
@@ -102,13 +104,16 @@ def plot_training_pair(pairs, index: int):
     from .._plotting import show_2d
 
     p = pairs[index]
-    fig, ax = plt.subplots(1, 3, figsize=(13, 4))
+    fig, ax = plt.subplots(1, 3, figsize=figsize)
 
     show_2d(
         p["input"].T,
         ax=ax[0],
         cmap="gray",
-        title=f"input window  (cx={p['cx']:.0f}, cy={p['cy']:.0f}, z0={p['z0']:.0f} Å)",
+        title=(
+            f"input window  (cx={p['cx']:.0f}, cy={p['cy']:.0f}, "
+            f"z0={p['z0']:.0f} Å, rot {p.get('angle', 0.0):.0f}°)"
+        ),
         xlabel="x (px)",
         ylabel="y (px)",
         colorbar=True,

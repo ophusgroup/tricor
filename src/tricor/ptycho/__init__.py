@@ -5,7 +5,8 @@ ptychographic reconstructions:
 
 * **target** — window-weighted, asymptote-to-1 g2 / g3 measured directly
   from the atomic structure (:mod:`tricor.ptycho.correlations`), over a
-  soft Hann (xy) + Gaussian (z) window (:mod:`tricor.ptycho.weighting`).
+  soft circular-Hann (xy) + Gaussian (z) window
+  (:mod:`tricor.ptycho.weighting`).
 * **input** — a blurred, depth-resolved projected potential in radians
   (:mod:`tricor.ptycho.potential`, requires the optional ``abtem``
   dependency — install with ``pip install -e '.[training]'``).
@@ -20,11 +21,20 @@ is imported lazily only when the potential pipeline is used.
 from __future__ import annotations
 
 from .correlations import LocalCorrelations, clear_random_cache, local_correlations
-from .weighting import WindowSpec, gaussian_z, hann_window_xy, window_weights
+from .weighting import (
+    WindowSpec,
+    gaussian_z,
+    hann_radial,
+    hann_window_xy,
+    window_weights,
+    windowed_image,
+)
 
 __all__ = [
     "WindowSpec",
     "window_weights",
+    "windowed_image",
+    "hann_radial",
     "hann_window_xy",
     "gaussian_z",
     "local_correlations",
