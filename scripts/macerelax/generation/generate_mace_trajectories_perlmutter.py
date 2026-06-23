@@ -98,6 +98,9 @@ for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
 os.environ.setdefault("NUMBA_NUM_THREADS", "8")
 
 import csv
+import ctypes
+import ctypes.util
+import gc
 import re
 import sys
 import time
@@ -127,32 +130,49 @@ from wall_calculator import MinDistanceWallCalculator, per_pair_min_from_atoms
 # --- CIF source ---
 # Either point at the full library (and rely on CIF_LIST_FILE to restrict),
 # or point at the already-subsetted training symlink dir.
-CIF_DIR       = Path("/wigeon/users/ehrdt/prod/cifs_mp_cnos_le100meV_training")
+CIF_DIR       = Path("/pscratch/sd/e/ehrdt/cifs_mp_exp_le100meV")
 CIF_LIST_FILE = None   # None = use every *.cif in CIF_DIR
 
 # --- Output ---
 # Set per-run.  On Perlmutter this will be a path under $SCRATCH or $CFS.
-DATASET_ROOT  = Path("/home/ehrdt/tricor/mace/data/big_v1")
+DATASET_ROOT  = Path("/pscratch/sd/e/ehrdt/tricor/big_exp")
 
 # --- Per-CIF generation ---
-N_TRAJ_PER_CIF = 12             # 2 trajectories per regime × 6 regimes (post-
+N_TRAJ_PER_CIF = 6             # 2 trajectories per regime × 6 regimes (post-
                                   # liquid-drop, see REGIME_STRATA below).
                                   # Was 20 (matching relaxml-big) before the
                                   # n=60 step + drop-liquid economy decision.
-BASE_SEED      = 1_000_000
+BASE_SEED      = 2_000_000
 SEED_STEP      = 1000            # gap between consecutive CIFs' seed blocks;
                                   # must exceed N_TRAJ_PER_CIF so they don't
                                   # overlap.
 SOURCE_TAG     = "mace_big_v1"   # written into every NPZ's `source` field
 
 # --- Optional: stop after this many CIFs (smoke testing) ---
-MAX_CIFS = 30                  # None = run them all
+MAX_CIFS = None                  # None = run them all
 
 # --- Multi-GPU spawning ---
 # Round-robin partition over CIF indices.  Set GPU_IDS = [<id>] for single
 # GPU; GPU_IDS = [] disables pinning entirely (and the workers run in the
 # parent process — handy for debugging).
-GPU_IDS = [1]
+GPU_IDS = [1,2]
+
+# --- Host-memory hygiene + worker recycling (host-RAM OOM mitigation) ---
+# A long-lived worker accrues host RSS across CIFs — glibc retains freed pages
+# from numba-parallel measure_g3 + per-CIF numpy temporaries (arena
+# fragmentation), eventually tripping the SLURM cgroup OOM-killer.  That kill
+# is an uncatchable SIGKILL, so the CUDA-OOM cell-shrink loop never sees it.
+# Two mitigations, both leak-source-agnostic:
+#   (a) After each real CIF, gc.collect() + malloc_trim(0) returns freed pages
+#       to the OS.  Pair with `export MALLOC_ARENA_MAX=2` in the sbatch.
+#   (b) Recycle each GPU worker after WORKER_RECYCLE_EVERY real CIFs — a hard
+#       RSS ceiling no matter what residual leak remains.  Safe because the
+#       per-CIF manifest resume (_is_cif_already_done) lets a respawned worker
+#       fast-forward over finished CIFs and continue where it left off.
+HOST_MEM_TRIM_EVERY  = 1      # gc+malloc_trim every N processed CIFs (0=never)
+HOST_MEM_LOG         = True   # print per-CIF RSS / peak RSS to the worker log
+WORKER_RECYCLE_EVERY = 400    # respawn worker after N real CIFs (0 = disabled)
+WORKER_RECYCLE_EXIT_CODE = 23 # worker→master "respawn me" signal (not an error)
 
 # --- Packing (regime knobs) ---
 CELL_SIZE = 50.0                 # target supercell edge length (Å).  Held
@@ -623,6 +643,78 @@ def write_manifest(rows: list[dict], out_path: Path) -> None:
         writer.writerows(rows)
 
 
+def _append_manifest(rows: list[dict], out_path: Path) -> None:
+    """Append rows to the partition roll-up, creating it (with header) if
+    absent.  Used instead of overwrite so the roll-up survives worker
+    recycling — each lifetime appends only the CIFs it freshly processed.
+    Per-CIF manifests stay authoritative; regenerate the full roll-up from
+    them if you need rows from earlier jobs."""
+    if not rows:
+        return
+    new_file = not out_path.is_file()
+    fieldnames = list(rows[0].keys())
+    with out_path.open("a", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        if new_file:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+# ── Host-memory hygiene (host-RAM leak mitigation) ──────────────────────────
+
+_LIBC: "ctypes.CDLL | bool | None" = None
+
+
+def _libc() -> "ctypes.CDLL | None":
+    """Cached handle to libc for malloc_trim; False once if unavailable."""
+    global _LIBC
+    if _LIBC is None:
+        try:
+            _LIBC = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
+        except OSError:
+            _LIBC = False
+    return _LIBC or None
+
+
+def _host_rss_mb() -> tuple[float, float]:
+    """(current RSS, peak RSS) in MB from /proc/self/status (VmRSS / VmHWM)."""
+    rss = hwm = 0.0
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    rss = float(line.split()[1]) / 1024.0
+                elif line.startswith("VmHWM:"):
+                    hwm = float(line.split()[1]) / 1024.0
+    except OSError:
+        pass
+    return rss, hwm
+
+
+def _trim_host_memory() -> None:
+    """Force a Python GC pass and hand freed glibc-arena pages back to the OS.
+    malloc_trim is what actually drops RSS that gc alone leaves resident."""
+    gc.collect()
+    libc = _libc()
+    if libc is not None:
+        try:
+            libc.malloc_trim(0)
+        except (AttributeError, OSError):
+            pass
+
+
+def _cif_is_done(cif_path: Path) -> bool:
+    """Cheap resume check used by the worker loop to fast-forward over CIFs
+    already complete on disk (so they don't count toward the recycle budget
+    or get re-appended to the roll-up)."""
+    try:
+        compound, mp_id = parse_cif_name(cif_path)
+    except ValueError:
+        return False
+    return _is_cif_already_done(_per_cif_out_dir(compound, mp_id),
+                                N_TRAJ_PER_CIF)
+
+
 # ── Sidecar CSV loggers (append-only, header lazy-written) ──────────────────
 
 
@@ -988,18 +1080,10 @@ def _spawn_workers(cif_paths: list[Path], cif_indices: list[int]) -> int:
     if int(os.environ.get("SLURM_JOB_NUM_NODES", "1")) > 1:
         node_label = f"node{os.environ.get('SLURM_NODEID', '0')}_"
 
-    procs: list[tuple[int, subprocess.Popen, Path]] = []
-    print(f"Spawning {n_workers} worker(s) across GPUs {GPU_IDS}  "
-          f"(this node: {len(cif_indices)} CIFs)")
-    for partition_idx, gpu in enumerate(GPU_IDS):
-        # Round-robin the node's slice across its GPUs.  Indices are CIF
-        # indices in the global cif_paths list — preserved so per-CIF
-        # seeds stay deterministic across the cluster.
-        my_indices = [cif_indices[i] for i in range(len(cif_indices))
-                      if i % n_workers == partition_idx]
-        if not my_indices:
-            print(f"  GPU {gpu}: no CIFs in partition, skipping")
-            continue
+    def _launch(gpu: int, my_indices: list[int], log_path: Path):
+        """Spawn one worker subprocess for a GPU's CIF slice; return (proc, fh).
+        Log is opened in append mode so recycle respawns share one continuous
+        per-GPU log instead of clobbering earlier lifetimes."""
         env = {
             **os.environ,
             "CUDA_VISIBLE_DEVICES": str(gpu),
@@ -1012,27 +1096,65 @@ def _spawn_workers(cif_paths: list[Path], cif_indices: list[int]) -> int:
             # Equivalent to running `python -u`.
             "PYTHONUNBUFFERED": "1",
         }
-        log_path = log_dir / f"{node_label}gpu{gpu}.log"
-        log_fh = log_path.open("w")
+        fh = log_path.open("a")
         # Belt-and-suspenders: `-u` on the command line too, in case
         # PYTHONUNBUFFERED gets stripped by some intermediate launcher.
         cmd = [sys.executable, "-u", str(Path(__file__).resolve())]
-        proc = subprocess.Popen(cmd, env=env, stdout=log_fh,
+        proc = subprocess.Popen(cmd, env=env, stdout=fh,
                                  stderr=subprocess.STDOUT)
+        return proc, fh
+
+    print(f"Spawning {n_workers} worker(s) across GPUs {GPU_IDS}  "
+          f"(this node: {len(cif_indices)} CIFs)")
+    # gpu -> {proc, fh, indices, log_path, lives}.  Recycled workers
+    # (exit WORKER_RECYCLE_EXIT_CODE) are respawned in place with the same
+    # CIF slice; per-CIF resume fast-forwards them past finished CIFs.
+    active: dict[int, dict] = {}
+    for partition_idx, gpu in enumerate(GPU_IDS):
+        # Round-robin the node's slice across its GPUs.  Indices are CIF
+        # indices in the global cif_paths list — preserved so per-CIF
+        # seeds stay deterministic across the cluster.
+        my_indices = [cif_indices[i] for i in range(len(cif_indices))
+                      if i % n_workers == partition_idx]
+        if not my_indices:
+            print(f"  GPU {gpu}: no CIFs in partition, skipping")
+            continue
+        log_path = log_dir / f"{node_label}gpu{gpu}.log"
+        proc, fh = _launch(gpu, my_indices, log_path)
         print(f"  GPU {gpu}  PID {proc.pid}  "
               f"n_cifs={len(my_indices)}  trajectories~={len(my_indices)*N_TRAJ_PER_CIF}  "
               f"log={log_path}")
-        procs.append((gpu, proc, log_path))
+        active[gpu] = {"proc": proc, "fh": fh, "indices": my_indices,
+                       "log_path": log_path, "lives": 1}
 
-    print(f"\nWaiting for {len(procs)} worker(s) to finish... "
+    print(f"\nWaiting for {len(active)} worker(s) to finish... "
           f"(tail logs in another shell to watch progress)")
+    if WORKER_RECYCLE_EVERY:
+        print(f"  [recycle] workers respawn every {WORKER_RECYCLE_EVERY} CIFs "
+              f"to cap host RAM (exit {WORKER_RECYCLE_EXIT_CODE} = respawn, "
+              f"not a failure)")
     fail = 0
-    for gpu, proc, log_path in procs:
-        rc = proc.wait()
-        status = "OK" if rc == 0 else f"FAIL (exit {rc})"
-        print(f"  GPU {gpu}: {status}  log={log_path}")
-        if rc != 0:
-            fail += 1
+    while active:
+        for gpu, st in list(active.items()):
+            rc = st["proc"].poll()
+            if rc is None:
+                continue
+            st["fh"].close()
+            if rc == WORKER_RECYCLE_EXIT_CODE:
+                st["lives"] += 1
+                print(f"  GPU {gpu}: recycled after lifetime "
+                      f"{st['lives'] - 1} — respawning to reclaim host RAM")
+                proc, fh = _launch(gpu, st["indices"], st["log_path"])
+                st["proc"], st["fh"] = proc, fh
+            elif rc == 0:
+                print(f"  GPU {gpu}: OK  log={st['log_path']}")
+                del active[gpu]
+            else:
+                print(f"  GPU {gpu}: FAIL (exit {rc})  log={st['log_path']}")
+                fail += 1
+                del active[gpu]
+        if active:
+            time.sleep(2)
 
     manifests = sorted(DATASET_ROOT.glob("manifest_all_p*.csv"))
     if manifests:
@@ -1137,9 +1259,20 @@ def main() -> None:
     t_start = time.perf_counter()
     all_rows: list[dict] = []
     n_done = n_skipped = n_failed = 0
-    for cif_idx, cif_path in enumerate(cif_paths):
-        if cif_idx not in indices_to_run:
+    processed_this_life = 0
+    recycle_pending = False
+    my_indices = [i for i in range(n_cifs) if i in indices_to_run]
+    for cif_idx in my_indices:
+        cif_path = cif_paths[cif_idx]
+
+        # Cheap resume fast-forward: a CIF already complete on disk costs only
+        # a manifest read.  It must NOT count toward the recycle budget and
+        # must NOT be re-appended to the partition roll-up (would duplicate).
+        if _cif_is_done(cif_path):
+            print(f"[{cif_idx+1}/{n_cifs}] SKIP done: {cif_path.stem}")
+            n_skipped += 1
             continue
+
         try:
             rows = run_cif(cif_path, cif_idx, n_cifs, calc,
                             failure_log=failure_log,
@@ -1161,14 +1294,40 @@ def main() -> None:
         if rows:
             n_done += 1
             all_rows.extend(rows)
-        elif cif_idx in indices_to_run:
-            # No rows but didn't crash → either fully skipped or all skipped.
+        else:
+            # No rows but didn't crash → all trajectories for this CIF failed.
             n_skipped += 1
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    write_manifest(all_rows, manifest_path)
+        # ── Host-memory hygiene (the real OOM mitigation) ──────────────────
+        processed_this_life += 1
+        if HOST_MEM_TRIM_EVERY and processed_this_life % HOST_MEM_TRIM_EVERY == 0:
+            _trim_host_memory()
+        if HOST_MEM_LOG:
+            rss, hwm = _host_rss_mb()
+            print(f"  [host-mem] after CIF {cif_idx+1}: "
+                  f"RSS={rss:,.0f} MB  peak={hwm:,.0f} MB  "
+                  f"(life={processed_this_life})", flush=True)
+
+        # ── Worker recycling: hard RSS ceiling regardless of residual leak ──
+        if WORKER_RECYCLE_EVERY and processed_this_life >= WORKER_RECYCLE_EVERY:
+            recycle_pending = True
+            break
+
+    # Append (not overwrite) so the roll-up survives recycling.
+    _append_manifest(all_rows, manifest_path)
+
+    if recycle_pending:
+        rss, hwm = _host_rss_mb()
+        print(f"\n[recycle] {processed_this_life} CIFs processed this "
+              f"lifetime (RSS={rss:,.0f} MB  peak={hwm:,.0f} MB).  Exiting "
+              f"{WORKER_RECYCLE_EXIT_CODE} so the master respawns a fresh "
+              f"worker and reclaims host RAM.", flush=True)
+        sys.stdout.flush()
+        raise SystemExit(WORKER_RECYCLE_EXIT_CODE)
+
     elapsed = time.perf_counter() - t_start
     print(f"\nDone.  cifs_run={n_done}  skipped={n_skipped}  "
           f"failed_uncaught={n_failed}  rows_written={len(all_rows)}")

@@ -38,13 +38,14 @@ def _bond_relax_sweep_torch(
 ) -> np.ndarray:
     """GPU-accelerated drop-in replacement for ``_bond_relax_sweep``.
 
-    Hybrid: keeps per-iter pair finding on CPU (``cKDTree`` is already
-    cell-list O(N log N), and rebuilding a GPU cell-list each iter
-    would cost more than the transfer), but moves the per-pair force
-    computation + ``index_add_`` scatter to GPU.  Drops bond_relax
-    wall-clock from ~17 s → ~3-4 s for TiO2 / Fe2N at 100×100×400
-    (~358 k - 391 k atoms), with bigger relative gain for denser pair
-    sets (amorphous regime).
+    Fully on-device: per-pair force computation + ``index_add_``
+    scatter AND the periodic radius graph build all run on GPU via
+    ``periodic_radius_graph_cell_list`` (O(N) cell-list, no CPU sync).
+    Pair-list caching with an inflated cutoff lets one graph build
+    cover ``rebuild_every`` iterations.  Drops bond_relax wall-clock
+    from ~17 s → ~2-3 s for TiO2 / Fe2N at 100×100×400 (~358 k - 391 k
+    atoms), with bigger relative gain for denser pair sets (amorphous
+    regime).
 
     Structural fidelity: positions agree with the CPU path to ~1e-4 Å
     — sub-atomic-radius differences from FP-order changes in GPU
@@ -53,7 +54,6 @@ def _bond_relax_sweep_torch(
     relaxation path).
     """
     import torch
-    from scipy.spatial import cKDTree
 
     box_np = np.ascontiguousarray(box, dtype=np.float64)
     dev = torch.device(device)
@@ -105,24 +105,45 @@ def _bond_relax_sweep_torch(
     # multi-pair contributions.
     inflated_cut = max_cut + 2.2 * ms * rebuild_every
 
+    # GPU periodic-radius-graph builder — replaces the previous
+    # ``pos.cpu() → cKDTree(boxsize=box).query_pairs() → pairs.cuda()``
+    # round-trip with an O(N) cell-list traversal that never leaves
+    # the device.  ``periodic_radius_graph_cell_list`` raises on
+    # non-orthogonal cells or boxes smaller than 3 × the cutoff;
+    # ``periodic_radius_graph_chunked`` is the universal fallback.
+    from .flowmatch.flow_utils import (
+        periodic_radius_graph_cell_list,
+        periodic_radius_graph_chunked,
+    )
+    cell_mat_t = torch.diag(box_t)
+
     i_idx = None
     j_idx = None
     iters_since_build = rebuild_every  # force build on first iter
 
     for _ in range(int(n_iter)):
         if iters_since_build >= rebuild_every:
-            # ── CPU side: wrap + cKDTree at the inflated cutoff.
-            pos_np_now = pos_t.detach().cpu().numpy()
-            wrap_np = pos_np_now - np.floor(pos_np_now / box_np) * box_np
-            tree = cKDTree(wrap_np, boxsize=box_np)
-            pairs_np = tree.query_pairs(inflated_cut, output_type="ndarray")
-            if len(pairs_np) == 0:
+            # ── GPU side: periodic radius graph at the inflated cutoff.
+            try:
+                edge_index, _ = periodic_radius_graph_cell_list(
+                    pos_t, float(inflated_cut), cell_mat_t,
+                )
+            except (ValueError, RuntimeError):
+                edge_index, _ = periodic_radius_graph_chunked(
+                    pos_t, float(inflated_cut), cell_mat_t,
+                )
+            if edge_index.shape[1] == 0:
                 break
-            pairs_t = torch.as_tensor(
-                pairs_np, device=dev, dtype=torch.long,
-            )
-            i_idx = pairs_t[:, 0]
-            j_idx = pairs_t[:, 1]
+            # The graph builder returns directed edges (both (i,j)
+            # and (j,i)).  Filter to undirected i < j to match the
+            # scipy cKDTree.query_pairs convention this block used
+            # to produce; the downstream force computation expects
+            # exactly that ordering.
+            src = edge_index[0]
+            dst = edge_index[1]
+            mask = src < dst
+            i_idx = src[mask]
+            j_idx = dst[mask]
             iters_since_build = 0
 
         # ── GPU side: filter cached pairs to those within the REAL

@@ -58,6 +58,15 @@ cd "$SLURM_SUBMIT_DIR"
 # bare-python launches.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+# Host-RAM leak mitigation.  numba-parallel measure_g3 + per-CIF numpy
+# temporaries fragment glibc's per-thread arenas; without a cap, freed pages
+# are retained and RSS creeps up across thousands of CIFs until the cgroup
+# OOM-killer (uncatchable SIGKILL) fires.  Capping arenas to 2 + a low trim
+# threshold keeps RSS flat; the worker also calls malloc_trim(0) per CIF.
+# These MUST be exported before the process starts (libc reads them at init).
+export MALLOC_ARENA_MAX=2
+export MALLOC_TRIM_THRESHOLD_=65536
+
 # Ensure the logs/ subdir exists for slurm-*.out files.
 mkdir -p logs
 

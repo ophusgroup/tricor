@@ -239,13 +239,17 @@ for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
              "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
     os.environ.setdefault(_var, _n)
 
+import atexit
 import csv
 import json
 import re
+import signal
+import subprocess
 import sys
 import time
 import traceback
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields as dc_fields
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import numpy as np
@@ -274,6 +278,355 @@ _GEN_DIR = Path(__file__).resolve().parent / "generation"
 if str(_GEN_DIR) not in sys.path:
     sys.path.insert(0, str(_GEN_DIR))
 from wall_calculator import per_pair_min_from_atoms
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Run-manifest + provenance helpers
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Every generation run writes a single ``_runs/{run_id}.json`` capturing the
+# full CONFIG snapshot, git state, model checkpoint info, and SLURM env.  Each
+# trajectory carries the same ``run_id`` so per-traj rows in ``manifest.csv``
+# / NPZ / XYZ can be joined back to "exactly which parameters produced this
+# structure?" without opening the file.
+#
+# Layout under OUTPUT_ROOT:
+#
+#   _runs/{run_id}.json              ← config + git + slurm + stats
+#   _runs/{run_id}.rank{N}.csv       ← per-rank summary; rank 0 reads all at end
+#   <compound>_<mp-id>_generated/
+#       manifest.csv                 ← per-CIF, appended as trajectories finish
+#       *.npz / *.xyz                ← each carries run_id
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _git_sha_short() -> str:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(_REPO_ROOT), stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        return out or "nogit"
+    except Exception:
+        return "nogit"
+
+
+def _git_is_dirty() -> bool:
+    try:
+        out = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            cwd=str(_REPO_ROOT), stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        return bool(out)
+    except Exception:
+        return False
+
+
+def derive_run_id() -> str:
+    """Stable identifier shared by every rank of the same launch.
+
+    Uses SLURM_JOB_ID under SLURM (identical across ranks).  Falls back to
+    a UTC hour timestamp + PID for local runs (single-rank only — multi-rank
+    local launches without SLURM will disagree on PID, which is fine for
+    dev/test).  Always suffixed by the short git SHA so a run started from
+    a different commit is distinguishable from one started here.
+    """
+    slurm = os.environ.get("SLURM_JOB_ID")
+    if slurm:
+        prefix = f"slurm{slurm}"
+    else:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        prefix = f"{ts}_pid{os.getpid()}"
+    return f"{prefix}_{_git_sha_short()}"
+
+
+def collect_config_snapshot() -> dict:
+    """Capture every module-level UPPER_CASE constant in a JSON-safe dict."""
+    g = globals()
+    snap: dict = {}
+    for name, value in g.items():
+        if not name or not name[0].isupper() or name.startswith("_"):
+            continue
+        if isinstance(value, Path):
+            snap[name] = str(value)
+        elif isinstance(value, (str, int, float, bool, type(None))):
+            snap[name] = value
+        elif isinstance(value, (list, tuple)):
+            snap[name] = list(value)
+        elif isinstance(value, dict):
+            snap[name] = {str(k): v for k, v in value.items()}
+        # anything else (modules, callables) silently skipped
+    return snap
+
+
+def write_run_manifest_start(run_id: str, ckpt_path: Path) -> Path:
+    """Write the initial ``_runs/{run_id}.json`` with status=running.
+
+    Rank-0 only — every rank computes the same ``run_id``, but only rank 0
+    materializes the manifest to avoid four ranks racing on the same file.
+    """
+    manifest_path = OUTPUT_ROOT / "_runs" / f"{run_id}.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        st = ckpt_path.stat()
+        ckpt_size = int(st.st_size)
+        ckpt_mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()
+    except OSError:
+        ckpt_size = -1
+        ckpt_mtime = ""
+    payload = {
+        "run_id":          run_id,
+        "schema_version":  1,
+        "status":          "running",
+        "started_at_utc":  datetime.now(timezone.utc).isoformat(),
+        "ended_at_utc":    None,
+        "git": {
+            "sha":   _git_sha_short(),
+            "dirty": _git_is_dirty(),
+        },
+        "slurm": {
+            "job_id":    os.environ.get("SLURM_JOB_ID"),
+            "nnodes":    int(os.environ.get("SLURM_NNODES", 1)),
+            "ntasks":    int(os.environ.get("SLURM_NTASKS", 1)),
+            "node_list": os.environ.get("SLURM_NODELIST", ""),
+        },
+        "world_size":      _WORLD_SIZE,
+        "model": {
+            "log_dir":              MODEL_LOG_DIR,
+            "run_name":             MODEL_RUN_NAME,
+            "run_timestamp":        MODEL_RUN_TIMESTAMP,
+            "epoch":                MODEL_EPOCH,
+            "checkpoint_path":      str(ckpt_path),
+            "checkpoint_size_bytes": ckpt_size,
+            "checkpoint_mtime_utc":  ckpt_mtime,
+            "use_ema_weights":      USE_EMA_WEIGHTS,
+        },
+        "config":          collect_config_snapshot(),
+        "stats":           {},
+    }
+    manifest_path.write_text(json.dumps(payload, indent=2, default=str))
+    return manifest_path
+
+
+def update_run_manifest_end(manifest_path: Path, *, status: str,
+                            stats: dict) -> None:
+    """Patch the manifest at end of run with final stats + status."""
+    try:
+        payload = json.loads(manifest_path.read_text())
+    except Exception:
+        return
+    payload["status"] = status
+    payload["ended_at_utc"] = datetime.now(timezone.utc).isoformat()
+    payload.setdefault("stats", {}).update(stats)
+    manifest_path.write_text(json.dumps(payload, indent=2, default=str))
+
+
+def _install_interrupt_handlers(manifest_path: Path) -> None:
+    """Install atexit + SIGTERM/SIGINT handlers that flip status if running.
+
+    Covers the *graceful* death cases: Ctrl+C (SIGINT), SLURM time-limit
+    warning (SIGTERM ~ 30 s before SIGKILL), Python uncaught exception
+    bubbling out of main().  SIGKILL / OOM-killer / node crash cannot be
+    intercepted by any handler — those get cleaned up by
+    ``reconcile_stale_running_manifests`` on the next launch.
+    """
+    def _flush_on_exit() -> None:
+        try:
+            if not manifest_path.is_file():
+                return
+            payload = json.loads(manifest_path.read_text())
+            if payload.get("status") != "running":
+                return  # already completed/interrupted/etc — don't clobber
+            payload["status"] = "interrupted"
+            payload["ended_at_utc"] = datetime.now(timezone.utc).isoformat()
+            payload.setdefault("stats", {})["interrupted_on_exit"] = True
+            manifest_path.write_text(json.dumps(payload, indent=2, default=str))
+        except Exception:
+            pass
+
+    atexit.register(_flush_on_exit)
+
+    def _signal_handler(signum, _frame):
+        _flush_on_exit()
+        # Restore the default handler and re-raise so the process actually
+        # dies the way the user requested (otherwise we'd silently swallow
+        # the signal).
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _signal_handler)
+        except (ValueError, OSError):
+            # Can't install — e.g., not running on the main thread.  The
+            # atexit hook still covers normal-exit paths.
+            pass
+
+
+def _slurm_job_alive(job_id: str | None) -> Optional[bool]:
+    """Return True / False / None — None means we genuinely can't tell.
+
+    True  : squeue reports the job as queued/running.
+    False : sacct shows the job has ended (FAILED / CANCELLED / TIMEOUT / …).
+    None  : SLURM not available, neither tool returns info, or query failed.
+    """
+    if not job_id:
+        return None
+    try:
+        out = subprocess.check_output(
+            ["squeue", "-j", str(job_id), "-h", "-o", "%T"],
+            stderr=subprocess.DEVNULL, timeout=10,
+        ).decode().strip()
+    except (subprocess.CalledProcessError, FileNotFoundError,
+            subprocess.TimeoutExpired):
+        return None
+    if out:
+        return True
+    # squeue empty — confirm via sacct that the job actually existed and
+    # terminated (vs simply never being known to slurm).
+    try:
+        out = subprocess.check_output(
+            ["sacct", "-j", str(job_id), "-X", "-n", "-o", "State"],
+            stderr=subprocess.DEVNULL, timeout=10,
+        ).decode().strip()
+    except (subprocess.CalledProcessError, FileNotFoundError,
+            subprocess.TimeoutExpired):
+        return None
+    if not out:
+        return None
+    return False
+
+
+def reconcile_stale_running_manifests(*, max_age_hours: float = 48.0) -> dict:
+    """Scan ``_runs/*.json`` and flip visibly-dead 'running' entries.
+
+    Detection rules (per-manifest):
+      * SLURM job ID present  → query squeue/sacct.  If alive: leave alone.
+        If clearly terminated: mark ``stale_running``.  If unknown: fall
+        through to the age check.
+      * No SLURM job ID (or SLURM unqueryable)  → use ``started_at_utc``.
+        Older than ``max_age_hours`` → mark ``stale_running``.
+
+    The conservative path is "leave alone" — false positives would clobber
+    a real running job's manifest, which is much worse than leaving a stale
+    entry around for one more run cycle.
+
+    Returns ``{scanned, marked, left}`` for the caller's log line.
+    """
+    runs_dir = OUTPUT_ROOT / "_runs"
+    if not runs_dir.is_dir():
+        return {"scanned": 0, "marked": 0, "left": 0}
+
+    now = datetime.now(timezone.utc)
+    max_age = timedelta(hours=max_age_hours)
+    scanned = 0
+    marked = 0
+    left = 0
+
+    for path in sorted(runs_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text())
+        except Exception:
+            continue
+        if payload.get("status") != "running":
+            continue
+        scanned += 1
+        job_id = (payload.get("slurm") or {}).get("job_id")
+
+        is_stale = False
+        reason = ""
+
+        alive = _slurm_job_alive(job_id)
+        if alive is True:
+            left += 1
+            continue
+        if alive is False:
+            is_stale = True
+            reason = "slurm_job_terminated"
+
+        if not is_stale:
+            # Fall back to age threshold when SLURM doesn't know about it
+            # (or there's no SLURM job id at all — local dev runs).
+            started_str = payload.get("started_at_utc") or ""
+            try:
+                started = datetime.fromisoformat(started_str)
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=timezone.utc)
+            except Exception:
+                started = None
+            if started is not None and (now - started) > max_age:
+                is_stale = True
+                reason = f"older_than_{max_age_hours:.0f}h_no_slurm_info"
+
+        if not is_stale:
+            left += 1
+            continue
+
+        payload["status"] = "stale_running"
+        payload["ended_at_utc"] = now.isoformat()
+        payload.setdefault("stats", {})["stale_detected_at_next_run_start"] = True
+        payload["stats"]["stale_reason"] = reason
+        try:
+            path.write_text(json.dumps(payload, indent=2, default=str))
+            marked += 1
+        except Exception:
+            pass
+
+    return {"scanned": scanned, "marked": marked, "left": left}
+
+
+def _gen_result_fieldnames() -> list[str]:
+    """Stable column order for any manifest derived from GenResult."""
+    return [f.name for f in dc_fields(GenResult)]
+
+
+def append_per_cif_manifest_row(out_dir: Path, row: "GenResult") -> None:
+    """Append one trajectory row to ``out_dir/manifest.csv``.
+
+    Called from inside ``generate_for_cif`` as each trajectory finishes
+    (success / OOM / error), NOT once per CIF.  This guarantees a row
+    exists on disk by the time the next trajectory starts — so a mid-CIF
+    crash (OOM-killer, SLURM time-out, node failure) doesn't orphan the
+    trajectories that DID complete:
+
+        bulk-at-end (old)            row-per-traj (new)
+        ──────────────────           ──────────────────
+        trajs 0-5  ✓                 trajs 0-5  ✓ + rows on disk
+        traj  6    OOM-killed        traj  6    OOM-killed
+        manifest never written       manifest already has rows 0-5
+
+    Resume-safe: creates the header on first call, appends otherwise.
+    Safe under multi-rank launches because each rank's CIF slice is
+    disjoint — no two ranks ever append to the same file.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "manifest.csv"
+    fieldnames = _gen_result_fieldnames()
+    existed = path.is_file()
+    with path.open("a", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=fieldnames)
+        if not existed:
+            w.writeheader()
+        w.writerow(asdict(row))
+
+
+def write_per_rank_summary(run_id: str, results: list["GenResult"]) -> Path:
+    """Write the rank's own contribution to ``_runs/{run_id}.rank{N}.csv``.
+
+    Replaces the previous race-prone shared ``summary.csv`` write.  The
+    flat-table builder (``build_dataset_table.py``) joins all per-rank
+    summaries plus the run JSON to produce the corpus-wide table.
+    """
+    path = OUTPUT_ROOT / "_runs" / f"{run_id}.rank{_GLOBAL_RANK}.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = _gen_result_fieldnames()
+    with path.open("w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=fieldnames)
+        w.writeheader()
+        for r in results:
+            w.writerow(asdict(r))
+    return path
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -392,14 +745,30 @@ def parse_cif_name(cif_path: Path) -> tuple[str, str]:
 
 
 def build_supercell(cif_path: Path, regime: str, rho: float, seed: int):
-    """Pack a tricor supercell at the requested regime/density."""
-    ref = ase_read(str(cif_path), format="cif")
-    shell = tc.CoordinationShellTarget.from_atoms(ref, phi_num_bins=90)
+    """Pack a tricor supercell at the requested regime/density.
 
+    Sub-stage timing is printed so an anomalous `pack=` time can be localized
+    to read / shell_target / measure_g3 / generate without guessing.  The
+    reference-derived steps (from_atoms, measure_g3) depend only on the CIF —
+    if they dominate, they should be cached per-CIF (see _build_cif_cache in
+    generate_mace_trajectories.py) rather than recomputed per trajectory.
+    """
     from tricor import G3Distribution
+
+    _t = time.perf_counter()
+    ref = ase_read(str(cif_path), format="cif")
+    t_read = time.perf_counter() - _t
+
+    _t = time.perf_counter()
+    shell = tc.CoordinationShellTarget.from_atoms(ref, phi_num_bins=90)
+    t_shell = time.perf_counter() - _t
+
+    _t = time.perf_counter()
     dist = G3Distribution(ref, label=str(cif_path.stem))
     dist.measure_g3(r_max=10.0, r_step=0.1, phi_num_bins=90, show_progress=False)
+    t_g3 = time.perf_counter() - _t
 
+    _t = time.perf_counter()
     cell = tc.Supercell(
         dist,
         cell_dim_angstroms=tuple(CELL_DIMS),
@@ -412,6 +781,11 @@ def build_supercell(cif_path: Path, regime: str, rho: float, seed: int):
     summary = cell.generate(
         shell, **preset, refine_orientations=False, show_progress=False,
     )
+    t_gen = time.perf_counter() - _t
+
+    print(f"    [pack-breakdown] ref_atoms={len(ref)}  "
+          f"read={t_read:.1f}s  shell={t_shell:.1f}s  g3={t_g3:.1f}s  "
+          f"generate={t_gen:.1f}s", flush=True)
     return cell, shell, ref, summary
 
 
@@ -555,7 +929,10 @@ def run_iterative_inference(
 ):
     """Iteratively apply the student model until convergence or max_iter.
 
-    Returns (final_positions, n_iter_run, intermediates).
+    Returns (final_positions, n_iter_run, intermediates, max_step_final_A).
+
+    ``max_step_final_A`` is the largest per-atom displacement on the last
+    completed iteration — convergence is ``max_step_final_A < tol``.
     """
     pos = torch.tensor(initial_positions, dtype=torch.float32, device=device)
     cell_t = torch.tensor(cell, dtype=torch.float32, device=device)
@@ -589,6 +966,7 @@ def run_iterative_inference(
         shell["trip_features"] = shell["trip_features"].bfloat16()
 
     intermediates: list[tuple[int, np.ndarray]] = []
+    last_max_step: float = float("inf")
 
     def _record(iter_idx: int, p: torch.Tensor) -> None:
         intermediates.append((iter_idx, p.detach().cpu().numpy().copy()))
@@ -617,16 +995,17 @@ def run_iterative_inference(
         )
         pos_new = _wrap_positions(pos + delta, cell_t)
         max_step = (pos_new - pos).norm(dim=-1).max().item()
+        last_max_step = float(max_step)
         pos = pos_new
         if collect_every > 0 and ((it + 1) % collect_every == 0):
             _record(it + 1, pos)
         if max_step < tol:
             if collect_every > 0 and (not intermediates or intermediates[-1][0] != it + 1):
                 _record(it + 1, pos)
-            return pos.cpu().numpy(), it + 1, intermediates
+            return pos.cpu().numpy(), it + 1, intermediates, last_max_step
     if collect_every > 0 and (not intermediates or intermediates[-1][0] != max_iter):
         _record(max_iter, pos)
-    return pos.cpu().numpy(), max_iter, intermediates
+    return pos.cpu().numpy(), max_iter, intermediates, last_max_step
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -644,7 +1023,28 @@ class GenResult:
     n_iter:        int
     runtime_sec:   float
     out_npz:       str
-    error:         str = ""
+    # ── provenance / linkage ──────────────────────────────────────────────
+    run_id:            str   = ""
+    cif_idx:           int   = -1
+    rel_density_target: float = -1.0
+    actual_density_at_per_A3: float = -1.0
+    # ── inference behaviour ───────────────────────────────────────────────
+    converged:         bool  = False
+    n_iter_max:        int   = -1
+    max_step_final_A:  float = -1.0
+    peak_gpu_gb:       float = -1.0
+    # ── per-stage timings (seconds) ───────────────────────────────────────
+    build_time_s:      float = -1.0
+    cleanup_time_s:    float = -1.0
+    setup_time_s:      float = -1.0
+    inference_time_s:  float = -1.0
+    save_time_s:       float = -1.0
+    # ── cell shape — handy for downstream filtering without re-reading NPZ ─
+    cell_a_A:          float = 0.0
+    cell_b_A:          float = 0.0
+    cell_c_A:          float = 0.0
+    # ── error string (empty on success) ───────────────────────────────────
+    error:             str   = ""
 
 
 def save_outputs(out_dir: Path, traj: GenResult, initial: np.ndarray,
@@ -678,6 +1078,9 @@ def save_outputs(out_dir: Path, traj: GenResult, initial: np.ndarray,
             num_grains=np.int32(summary.get("n_grains") or 0),
             crystalline_fraction=np.float32(summary.get("crystalline_fraction") or 0.0),
             source=np.asarray("student_generated_v1"),
+            run_id=np.asarray(traj.run_id),
+            cif_idx=np.int64(traj.cif_idx),
+            schema_version=np.int32(1),
         )
         traj.out_npz = str(npz_path)
 
@@ -704,6 +1107,9 @@ def save_outputs(out_dir: Path, traj: GenResult, initial: np.ndarray,
             atoms.info["frame_label"] = "final"
             atoms.info["regime"] = regime
             atoms.info["n_iter"] = int(traj.n_iter)
+            atoms.info["run_id"] = traj.run_id
+            atoms.info["rng_seed"] = int(traj.rng_seed)
+            atoms.info["cif_idx"] = int(traj.cif_idx)
             ase_write(str(out_dir / f"{base}.xyz"), atoms, format="extxyz")
         else:
             # Multi-frame trajectory: initial + intermediates + final.
@@ -721,6 +1127,9 @@ def save_outputs(out_dir: Path, traj: GenResult, initial: np.ndarray,
                 )
                 atoms.info["frame_label"] = label
                 atoms.info["regime"] = regime
+                atoms.info["run_id"] = traj.run_id
+                atoms.info["rng_seed"] = int(traj.rng_seed)
+                atoms.info["cif_idx"] = int(traj.cif_idx)
                 if it_idx is not None:
                     atoms.info["iter"] = int(it_idx)
                 frames.append(atoms)
@@ -731,8 +1140,13 @@ def save_outputs(out_dir: Path, traj: GenResult, initial: np.ndarray,
 # Per-CIF orchestration
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_for_cif(model, cif_path: Path, device) -> list[GenResult]:
-    """Generate one trajectory per (regime, seed) for this CIF."""
+def generate_for_cif(model, cif_path: Path, device,
+                     *, run_id: str, cif_idx: int) -> list[GenResult]:
+    """Generate one trajectory per (regime, seed) for this CIF.
+
+    ``run_id`` + ``cif_idx`` are stamped on every produced trajectory so the
+    flat dataset table can join back to ``_runs/{run_id}.json``.
+    """
     mp_id, compound = parse_cif_name(cif_path)
     sys_label = f"{compound}_{mp_id}" if mp_id else compound
     out_dir = OUTPUT_ROOT / f"{sys_label}_generated"
@@ -772,6 +1186,13 @@ def generate_for_cif(model, cif_path: Path, device) -> list[GenResult]:
 
             t0 = time.time()
             print(f"  [{sys_label}/{regime}/seed{seed}] running...", flush=True)
+            # Reset peak-memory tracking so peak_gpu_gb reflects only this
+            # trajectory, not the cumulative high-water-mark of the run.
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.reset_peak_memory_stats(device)
+                except Exception:
+                    pass
             try:
                 # Stage timers — these are added to the success print so each
                 # CIF tells us exactly where its wall-clock went.  Useful for
@@ -799,12 +1220,25 @@ def generate_for_cif(model, cif_path: Path, device) -> list[GenResult]:
                 _ts = time.time()
                 # Skip intermediate-frame collection if we won't write them.
                 collect = XYZ_ITER_STRIDE if (SAVE_XYZ and not XYZ_FINAL_ONLY) else 0
-                final_pos, n_iter, intermediates = run_iterative_inference(
+                final_pos, n_iter, intermediates, last_max_step = run_iterative_inference(
                     model, initial_pos, cell_arr, species_numbers,
                     weight_vector, shell_arrays, device,
                     collect_every=collect,
                 )
                 t_model = time.time() - _ts
+
+                n_atoms = int(len(species_numbers))
+                cell_volume = float(abs(np.linalg.det(cell_arr)))
+                actual_density = (n_atoms / cell_volume) if cell_volume > 0 else -1.0
+                peak_gb = -1.0
+                if torch.cuda.is_available():
+                    try:
+                        peak_gb = float(
+                            torch.cuda.max_memory_allocated(device) / 1e9
+                        )
+                    except Exception:
+                        peak_gb = -1.0
+                cell_diag = np.diag(cell_arr)
 
                 traj = GenResult(
                     cif_filename=cif_path.name,
@@ -812,10 +1246,25 @@ def generate_for_cif(model, cif_path: Path, device) -> list[GenResult]:
                     mp_id=mp_id,
                     regime=regime,
                     rng_seed=seed,
-                    n_atoms=int(len(species_numbers)),
+                    n_atoms=n_atoms,
                     n_iter=int(n_iter),
                     runtime_sec=float(time.time() - t0),
                     out_npz="",
+                    run_id=run_id,
+                    cif_idx=int(cif_idx),
+                    rel_density_target=float(rho),
+                    actual_density_at_per_A3=float(actual_density),
+                    converged=bool(last_max_step < CONVERGENCE_TOL_ANG),
+                    n_iter_max=int(MAX_ITER),
+                    max_step_final_A=float(last_max_step),
+                    peak_gpu_gb=peak_gb,
+                    build_time_s=float(t_pack),
+                    cleanup_time_s=float(t_cleanup),
+                    setup_time_s=float(t_setup),
+                    inference_time_s=float(t_model),
+                    cell_a_A=float(cell_diag[0]),
+                    cell_b_A=float(cell_diag[1]),
+                    cell_c_A=float(cell_diag[2]),
                 )
                 _ts = time.time()
                 save_outputs(
@@ -824,7 +1273,13 @@ def generate_for_cif(model, cif_path: Path, device) -> list[GenResult]:
                     regime, rho, summary,
                 )
                 t_save = time.time() - _ts
+                traj.save_time_s = float(t_save)
+                # runtime_sec was captured before save; refresh to include it.
+                traj.runtime_sec = float(time.time() - t0)
                 results.append(traj)
+                # Persist the row IMMEDIATELY so a crash before the next
+                # trajectory finishes doesn't orphan this one.
+                append_per_cif_manifest_row(out_dir, traj)
                 print(f"    ✓ atoms={traj.n_atoms}  iters={n_iter}/{MAX_ITER}  "
                       f"pack={t_pack:.1f}s  cleanup={t_cleanup:.1f}s  "
                       f"setup={t_setup:.1f}s  model={t_model:.1f}s  "
@@ -838,19 +1293,31 @@ def generate_for_cif(model, cif_path: Path, device) -> list[GenResult]:
                 err = f"OutOfMemoryError"
                 print(f"    ✗ OOM (skip — see PYTORCH_CUDA_ALLOC_CONF for tuning)",
                       flush=True)
-                results.append(GenResult(
+                fail_row = GenResult(
                     cif_filename=cif_path.name, compound=compound, mp_id=mp_id,
                     regime=regime, rng_seed=seed, n_atoms=-1, n_iter=0,
-                    runtime_sec=time.time() - t0, out_npz="", error=err,
-                ))
+                    runtime_sec=time.time() - t0, out_npz="",
+                    run_id=run_id, cif_idx=int(cif_idx),
+                    rel_density_target=float(rho),
+                    n_iter_max=int(MAX_ITER),
+                    error=err,
+                )
+                results.append(fail_row)
+                append_per_cif_manifest_row(out_dir, fail_row)
             except Exception as exc:
                 err = f"{type(exc).__name__}: {exc}"
                 traceback.print_exc(limit=3, file=sys.stdout)
-                results.append(GenResult(
+                fail_row = GenResult(
                     cif_filename=cif_path.name, compound=compound, mp_id=mp_id,
                     regime=regime, rng_seed=seed, n_atoms=-1, n_iter=0,
-                    runtime_sec=time.time() - t0, out_npz="", error=err,
-                ))
+                    runtime_sec=time.time() - t0, out_npz="",
+                    run_id=run_id, cif_idx=int(cif_idx),
+                    rel_density_target=float(rho),
+                    n_iter_max=int(MAX_ITER),
+                    error=err,
+                )
+                results.append(fail_row)
+                append_per_cif_manifest_row(out_dir, fail_row)
                 print(f"    ✗ {err}")
 
     return results
@@ -882,6 +1349,14 @@ def main() -> None:
     # and duplicate output from N workers.
     if _GLOBAL_RANK == 0:
         OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+        # Reconcile any stale 'running' manifests left behind by previous
+        # runs that died ungracefully (SIGKILL / OOM-killer / node crash).
+        # SLURM-aware: a still-running concurrent job is left alone.
+        report = reconcile_stale_running_manifests()
+        if report["scanned"] > 0:
+            print(f"[stale_check] scanned={report['scanned']} "
+                  f"marked_stale={report['marked']} "
+                  f"left_running={report['left']}")
 
     # Pin this process's CUDA device under multi-GPU launches.
     if _MULTI_GPU and torch.cuda.is_available():
@@ -895,6 +1370,21 @@ def main() -> None:
     run_dir = _resolve_run_dir(MODEL_LOG_DIR, MODEL_RUN_NAME, MODEL_RUN_TIMESTAMP)
     ckpt_path = _resolve_checkpoint(run_dir, MODEL_EPOCH)
 
+    # Every rank derives the same run_id from SLURM_JOB_ID + git SHA; only
+    # rank 0 materializes the manifest file.  Each trajectory stamps run_id
+    # so the flat dataset table can join back to the CONFIG snapshot.
+    run_id = derive_run_id()
+    run_manifest_path = OUTPUT_ROOT / "_runs" / f"{run_id}.json"
+    if _GLOBAL_RANK == 0:
+        write_run_manifest_start(run_id, ckpt_path)
+        # Install interrupt + atexit handlers AFTER the manifest exists so
+        # there's something for them to flip.  These catch graceful kills
+        # (Ctrl+C, SLURM SIGTERM warning) — SIGKILL is handled by
+        # reconcile_stale_running_manifests() on the next run.
+        _install_interrupt_handlers(run_manifest_path)
+        print(f"[run_id] {run_id}")
+        print(f"[run_manifest] {run_manifest_path}")
+
     if _GLOBAL_RANK == 0:
         print(f"[model] run_dir = {run_dir}")
         print(f"[model] ckpt    = {ckpt_path}  (EMA={USE_EMA_WEIGHTS})")
@@ -905,7 +1395,8 @@ def main() -> None:
                   f"(round-robin CIF partitioning)")
         else:
             print(f"[parallel] single-process")
-    print(f"[rank {_GLOBAL_RANK}/{_WORLD_SIZE}] device={device}", flush=True)
+    print(f"[rank {_GLOBAL_RANK}/{_WORLD_SIZE}] device={device}  "
+          f"run_id={run_id}", flush=True)
 
     cif_paths_all = list_cifs()
     if not cif_paths_all:
@@ -913,7 +1404,12 @@ def main() -> None:
 
     # Round-robin partition across workers — each rank handles cif_idx % N == rank.
     # Better than chunk-partition for uneven workloads (some CIFs are bigger).
-    cif_paths = cif_paths_all[_GLOBAL_RANK::_WORLD_SIZE]
+    # Carry the global cif_idx alongside the path so the per-traj row can
+    # record it (this is the same index used by seed = BASE_SEED + cif_idx
+    # * SEED_STEP + traj_idx in the cleanup tooling, so it has to be the
+    # CORPUS-WIDE index, not the per-rank slice index).
+    cif_pairs_all = list(enumerate(cif_paths_all))
+    cif_pairs = cif_pairs_all[_GLOBAL_RANK::_WORLD_SIZE]
 
     n_per_cif = len(REGIMES) * len(SEEDS)
     if _GLOBAL_RANK == 0:
@@ -921,8 +1417,8 @@ def main() -> None:
               f"× {len(SEEDS)} seeds = {len(cif_paths_all) * n_per_cif} trajectories")
         print(f"[output] root   = {OUTPUT_ROOT}")
     print(f"[rank {_GLOBAL_RANK}/{_WORLD_SIZE}] my slice: "
-          f"{len(cif_paths)} CIFs × {n_per_cif} = "
-          f"{len(cif_paths) * n_per_cif} trajectories", flush=True)
+          f"{len(cif_pairs)} CIFs × {n_per_cif} = "
+          f"{len(cif_pairs) * n_per_cif} trajectories", flush=True)
     print()
 
     model = _load_model(ckpt_path, device)
@@ -952,40 +1448,58 @@ def main() -> None:
 
     all_results: list[GenResult] = []
     t_start = time.time()
-    for i, cif_path in enumerate(cif_paths, 1):
-        print(f"[{i}/{len(cif_paths)}] {cif_path.name}")
-        rs = generate_for_cif(model, cif_path, device)
+    for i, (cif_idx, cif_path) in enumerate(cif_pairs, 1):
+        print(f"[{i}/{len(cif_pairs)}] (cif_idx={cif_idx}) {cif_path.name}")
+        rs = generate_for_cif(
+            model, cif_path, device, run_id=run_id, cif_idx=cif_idx,
+        )
         all_results.extend(rs)
         elapsed = time.time() - t_start
-        n_done = i * n_per_cif   # nominal target
         rate = i / max(elapsed, 1e-9) * 60.0
-        eta_sec = (len(cif_paths) - i) * (elapsed / max(i, 1))
+        eta_sec = (len(cif_pairs) - i) * (elapsed / max(i, 1))
         print(f"  cumulative: {len(all_results)} trajs done  "
               f"rate={rate:.1f} CIF/min  ETA={int(eta_sec/60)} min")
         print()
 
-    # ── Summary CSV ───────────────────────────────────────────────────────
-    summary_csv = OUTPUT_ROOT / "summary.csv"
+    # ── Per-rank summary CSV (replaces the previously racy shared write) ──
+    # Each rank writes its own _runs/{run_id}.rank{N}.csv.  The flat-table
+    # builder script joins all rank summaries + the run JSON into the
+    # corpus-wide table.  No barrier needed — each rank is self-contained.
     if all_results:
-        with open(summary_csv, "w", newline="") as f:
-            fields = list(asdict(all_results[0]).keys())
-            writer = csv.DictWriter(f, fieldnames=fields)
-            writer.writeheader()
-            for r in all_results:
-                writer.writerow(asdict(r))
-        print(f"[summary] wrote {summary_csv}")
+        rank_csv = write_per_rank_summary(run_id, all_results)
+        print(f"[summary] rank {_GLOBAL_RANK} wrote {rank_csv}")
 
     # ── Final breakdown ──────────────────────────────────────────────────
     n_ok = sum(1 for r in all_results if not r.error)
     n_fail = len(all_results) - n_ok
+    wall_clock_min = (time.time() - t_start) / 60.0
     print()
     print("=" * 60)
     print(f"  Total trajectories : {len(all_results)}")
     print(f"  Succeeded          : {n_ok}")
     print(f"  Failed             : {n_fail}")
-    print(f"  Total wall-clock   : {(time.time() - t_start) / 60:.1f} min")
+    print(f"  Total wall-clock   : {wall_clock_min:.1f} min")
     print(f"  Output root        : {OUTPUT_ROOT}")
     print("=" * 60)
+
+    # ── Update run manifest at end (rank 0 only) ─────────────────────────
+    # Stats here are rank-0-local; full corpus-wide stats are computed
+    # later by build_dataset_table.py once all per-rank summaries are
+    # available.  We still snapshot rank-0's view so a running-then-
+    # killed run still produces something useful.
+    if _GLOBAL_RANK == 0:
+        update_run_manifest_end(
+            run_manifest_path,
+            status="completed",
+            stats={
+                "rank0_n_trajectories": len(all_results),
+                "rank0_n_succeeded":    n_ok,
+                "rank0_n_failed":       n_fail,
+                "rank0_wall_clock_min": float(wall_clock_min),
+                "world_size":           _WORLD_SIZE,
+                "n_cifs_in_corpus":     len(cif_paths_all),
+            },
+        )
 
 
 if __name__ == "__main__":
