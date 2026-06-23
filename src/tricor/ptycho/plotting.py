@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-__all__ = ["plot_scattering_power", "plot_training_pair"]
+__all__ = ["plot_scattering_power", "plot_training_pair", "plot_hrtem_pair"]
 
 # First atomic number of each period (H, Li, Na, K, Rb, Cs, Fr).
 _PERIOD_STARTS = (1, 3, 11, 19, 37, 55, 87)
@@ -125,6 +125,71 @@ def plot_training_pair(pairs, index: int, *, figsize: tuple = (13, 4)):
         p["g3_slice"],
         extent=[0, p["r"][-1], 0, 180],
         ax=ax[2],
+        cmap="RdBu_r",
+        aspect="auto",
+        vmin=0,
+        vmax=2,
+        title="g3 slice (r01 ~ NN)",
+        xlabel="r02 (Å)",
+        ylabel="angle (deg)",
+    )
+    fig.tight_layout()
+    return ax
+
+
+def plot_hrtem_pair(pairs, index: int, *, figsize: tuple = (15, 4)):
+    """Plot one HRTEM training pair: input, diffractogram, g2, g3 slice.
+
+    Parameters
+    ----------
+    pairs
+        List from :func:`tricor.ptycho.sliding_window_pairs_hrtem`.
+    index
+        Which pair to show.
+    figsize
+        Figure size in inches.
+
+    Returns
+    -------
+    numpy.ndarray of matplotlib Axes (length 4).
+    """
+    import numpy as np
+
+    import matplotlib.pyplot as plt
+
+    from .._plotting import show_2d
+
+    p = pairs[index]
+    fig, ax = plt.subplots(1, 4, figsize=figsize)
+
+    show_2d(
+        p["input"].T,
+        ax=ax[0],
+        cmap="gray",
+        title=(
+            f"HRTEM input  (t={p['thickness']:.0f} Å, Δf={p['defocus']:+.0f} Å, "
+            f"rot {p.get('angle', 0.0):.0f}°)"
+        ),
+        xlabel="x (px)",
+        ylabel="y (px)",
+        colorbar=True,
+    )
+    # Diffractogram: recomputed if not stored on the pair.
+    if "fft" in p:
+        fft = p["fft"]
+    else:
+        from .hrtem import hrtem_input
+
+        fft = hrtem_input(p["input"])["fft"]
+    show_2d(fft.T, ax=ax[1], cmap="gray", title="diffractogram |FFT|",
+            xlabel="kx", ylabel="ky", colorbar=True)
+    ax[2].plot(p["r"], p["g2"])
+    ax[2].axhline(1, ls="--", c="gray")
+    ax[2].set(xlabel="r (Å)", ylabel="weighted g2", title="g2 (block [0, t])")
+    show_2d(
+        p["g3_slice"],
+        extent=[0, p["r"][-1], 0, 180],
+        ax=ax[3],
         cmap="RdBu_r",
         aspect="auto",
         vmin=0,

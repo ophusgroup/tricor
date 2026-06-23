@@ -54,7 +54,11 @@ def __getattr__(name: str):
         from . import widget
 
         return getattr(widget, name)
-    if name in ("plot_scattering_power", "plot_training_pair"):
+    if name in ("HRTEMExplorer",):
+        from . import hrtem_widget
+
+        return getattr(hrtem_widget, name)
+    if name in ("plot_scattering_power", "plot_training_pair", "plot_hrtem_pair"):
         from . import plotting
 
         return getattr(plotting, name)
@@ -66,4 +70,15 @@ def __getattr__(name: str):
         from . import structures
 
         return getattr(structures, name)
+    if name in (
+        "ExitWaveStack", "exit_wave_stack", "ctf_image", "hrtem_image",
+        "default_defocus", "radial_average", "hrtem_input", "hrtem_window_image",
+    ):
+        from . import hrtem
+
+        return getattr(hrtem, name)
+    if name in ("sliding_window_pairs_hrtem",):
+        from . import hrtem_training
+
+        return getattr(hrtem_training, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

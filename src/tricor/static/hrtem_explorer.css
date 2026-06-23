@@ -1,0 +1,67 @@
+.hrtem-explorer {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #222;
+}
+.hrtem-explorer .px-wrap {
+  display: flex;
+  gap: 18px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+.hrtem-explorer .px-col {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.hrtem-explorer .px-frame {
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  cursor: crosshair;
+  background: #000;
+  max-width: 100%;
+  height: auto;
+}
+.hrtem-explorer .px-input {
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: #000;
+}
+.hrtem-explorer .px-hist {
+  border: 1px solid #e2e2e2;
+  border-radius: 4px;
+  background: #fff;
+  cursor: ew-resize;
+}
+.hrtem-explorer .px-g3,
+.hrtem-explorer .px-g2 {
+  border: 1px solid #e2e2e2;
+  border-radius: 4px;
+  background: #fff;
+}
+.hrtem-explorer .px-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.hrtem-explorer .px-row input[type="range"] {
+  flex: 1;
+  min-width: 110px;
+}
+.hrtem-explorer .px-label {
+  font-size: 12px;
+  color: #555;
+  width: 52px;
+  flex: none;
+}
+.hrtem-explorer .px-val {
+  font-size: 12px;
+  color: #333;
+  font-variant-numeric: tabular-nums;
+  min-width: 78px;
+}
+.hrtem-explorer .px-status {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #666;
+  font-variant-numeric: tabular-nums;
+}

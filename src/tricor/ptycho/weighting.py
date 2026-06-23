@@ -59,6 +59,14 @@ class WindowSpec:
     z_support_sigmas
         Half-extent of the z support, in units of ``sigma_z``.  Atoms
         beyond ``z0 ± z_support_sigmas · sigma_z`` are dropped.
+    z_mode
+        ``"gaussian"`` (default) weights depth by ``G(z - z0)``; ``"block"``
+        uses a hard top-hat over ``[z_lo, z_hi)`` (uniform in depth).  The
+        block matches an HRTEM exit wave at thickness ``t``, which
+        integrates every atom the beam has crossed — the block ``[0, t]``.
+        Use the :meth:`block` constructor.
+    z_lo, z_hi
+        Block bounds (Å), used only when ``z_mode == "block"``.
     """
 
     center_xy: tuple[float, float]
@@ -66,16 +74,49 @@ class WindowSpec:
     z0: float
     sigma_z: float
     z_support_sigmas: float = 3.0
+    z_mode: str = "gaussian"
+    z_lo: float = 0.0
+    z_hi: float = 0.0
+
+    @classmethod
+    def block(cls, center_xy, side, z_lo, z_hi) -> "WindowSpec":
+        """Window with a hard depth *block* ``[z_lo, z_hi)`` (uniform in z).
+
+        The in-plane taper is the same circular Hann; the depth weight is a
+        top-hat.  For HRTEM at thickness ``t`` use ``z_lo = 0, z_hi = t`` so
+        the g2 / g3 target covers exactly the atoms the beam propagated
+        through (abTEM enters at ``z = 0`` and propagates toward ``+z``).
+        """
+        return cls(
+            center_xy=center_xy, side=float(side),
+            z0=0.5 * (float(z_lo) + float(z_hi)),
+            sigma_z=max(float(z_hi) - float(z_lo), 1e-6),
+            z_mode="block", z_lo=float(z_lo), z_hi=float(z_hi),
+        )
+
+    @property
+    def z_center(self) -> float:
+        """Depth centre of the window (Å)."""
+        return 0.5 * (self.z_lo + self.z_hi) if self.z_mode == "block" else self.z0
 
     @property
     def z_support(self) -> float:
-        """Half-height of the z support window (Å)."""
+        """Half-height of the z support window (Å) — both modes."""
+        if self.z_mode == "block":
+            return 0.5 * (self.z_hi - self.z_lo)
         return self.z_support_sigmas * self.sigma_z
 
     @property
     def r_window(self) -> float:
         """Largest correlation radius the window can describe (Å)."""
         return 0.5 * self.side
+
+    def centered(self) -> "WindowSpec":
+        """The same window shape centred at the origin (for the catalogue)."""
+        if self.z_mode == "block":
+            zh = self.z_support
+            return WindowSpec.block((0.0, 0.0), self.side, -zh, zh)
+        return WindowSpec((0.0, 0.0), self.side, 0.0, self.sigma_z, self.z_support_sigmas)
 
 
 def hann_1d(d: np.ndarray, side: float) -> np.ndarray:
@@ -153,20 +194,31 @@ def window_weights(
     cx, cy = spec.center_xy
     dx = positions[:, 0] - cx
     dy = positions[:, 1] - cy
-    dz = positions[:, 2] - spec.z0
     if box is not None:
         box = np.asarray(box, dtype=np.float64)
         dx -= np.round(dx / box[0]) * box[0]
         dy -= np.round(dy / box[1]) * box[1]
-        dz -= np.round(dz / box[2]) * box[2]
     w = hann_radial(np.hypot(dx, dy), spec.side)
-    w = w * np.exp(-0.5 * (dz / spec.sigma_z) ** 2)
+
+    if spec.z_mode == "block":
+        # Absolute depth membership [z_lo, z_hi) — no z wrap (the beam
+        # crosses the block once).  Wrap atoms into the cell first so that
+        # ASE-wrapped coordinates are counted correctly.
+        z = positions[:, 2]
+        if box is not None:
+            z = np.mod(z, box[2])
+        w = w * ((z >= spec.z_lo) & (z < spec.z_hi)).astype(np.float64)
+    else:
+        dz = positions[:, 2] - spec.z0
+        if box is not None:
+            dz -= np.round(dz / box[2]) * box[2]
+        w = w * np.exp(-0.5 * (dz / spec.sigma_z) ** 2)
+        # Hard-clip the long Gaussian tail to the declared support so the
+        # window has finite extent (keeps the random-catalogue support and
+        # the data support identical).
+        w[np.abs(dz) > spec.z_support] = 0.0
     if atom_scale is not None:
         w = w * np.asarray(atom_scale, dtype=np.float64)
-    # Hard-clip the long Gaussian tail to the declared support so the
-    # window has finite extent (keeps the random-catalogue support and
-    # the data support identical).
-    w[np.abs(dz) > spec.z_support] = 0.0
     return w
 
 

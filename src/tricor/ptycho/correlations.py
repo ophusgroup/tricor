@@ -181,6 +181,8 @@ def _random_histograms(
     """
     key = (
         round(spec.side, 4),
+        spec.z_mode,
+        round(spec.z_support, 4),
         round(spec.sigma_z, 4),
         round(spec.z_support_sigmas, 4),
         num_r,
@@ -200,8 +202,7 @@ def _random_histograms(
     rp[:, 0] = rng.uniform(-half, half, n_random)
     rp[:, 1] = rng.uniform(-half, half, n_random)
     rp[:, 2] = rng.uniform(-zr, zr, n_random)
-    local_spec = WindowSpec((0.0, 0.0), spec.side, 0.0, spec.sigma_z, spec.z_support_sigmas)
-    rw = window_weights(rp, local_spec)
+    rw = window_weights(rp, spec.centered())
     keep = rw > rw.max() * 1e-4
     rp, rw = rp[keep], rw[keep]
 
