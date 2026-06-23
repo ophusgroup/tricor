@@ -44,6 +44,8 @@ class HRTEMExplorer(anywidget.AnyWidget):
     slice_values = traitlets.List(trait=traitlets.Float()).tag(sync=True)
     slice_shape = traitlets.List(trait=traitlets.Int()).tag(sync=True)  # [nx, ny]
     extent = traitlets.List(trait=traitlets.Float()).tag(sync=True)  # [Lx, Ly] (Å)
+    layout = traitlets.Unicode("side").tag(sync=True)  # "side" | "stacked"
+    transpose = traitlets.Bool(False).tag(sync=True)  # long axis horizontal
 
     # --- thickness / defocus ---
     thicknesses = traitlets.List(trait=traitlets.Float()).tag(sync=True)
@@ -93,6 +95,7 @@ class HRTEMExplorer(anywidget.AnyWidget):
         phi_num_bins: int = 36,
         scattering_weighted: bool = True,
         defocus_offset: float = 0.0,
+        layout: str | None = None,
         **kwargs,
     ):
         """Parameters
@@ -133,6 +136,12 @@ class HRTEMExplorer(anywidget.AnyWidget):
 
         lx, ly = stack.extent
         self.extent = [float(lx), float(ly)]
+        # Wide / non-square cells: stack panels under a full-width frame with
+        # the long axis horizontal.
+        aspect = max(lx, ly) / max(min(lx, ly), 1e-9)
+        stacked = (aspect > 2.0) if layout is None else (layout == "stacked")
+        self.layout = "stacked" if stacked else "side"
+        self.transpose = bool(stacked and ly > lx)
         self.thicknesses = [float(t) for t in stack.thicknesses]
         self.r_max = float(r_max)
         self.window_side = float(side) if side is not None else 2.0 * float(r_max)

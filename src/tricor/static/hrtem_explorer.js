@@ -78,20 +78,42 @@ function drawGrey(canvas, vals, nx, ny, label, clim) {
   }
 }
 
-// HRTEM frame (fixed clim) + draggable circular window.
+// HRTEM frame (fixed clim) + draggable circular window.  Wide cells are
+// transposed so the long axis is horizontal.
 function drawFrame(canvas, model, drag, clim) {
   const vals = model.get("slice_values") || [];
   const [nx, ny] = model.get("slice_shape") || [0, 0];
-  drawGrey(canvas, vals, nx, ny, null, clim);
-  if (!vals.length || nx * ny !== vals.length) return;
   const ctx = canvas.getContext("2d");
   const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  if (!vals.length || nx * ny !== vals.length) return;
+  let vmin, vmax;
+  if (clim) { [vmin, vmax] = clim; }
+  else { const f = vals.filter((v) => Number.isFinite(v)).slice().sort((a, b) => a - b); vmin = percentile(f, 0.01); vmax = percentile(f, 0.99); }
+  const span = vmax - vmin || 1;
+  const transpose = model.get("transpose");
+  const iw = transpose ? ny : nx, ih = transpose ? nx : ny;
+  const img = ctx.createImageData(iw, ih);
+  for (let i = 0; i < nx; i++) {
+    for (let j = 0; j < ny; j++) {
+      const [r, g, b] = grey((vals[i * ny + j] - vmin) / span);
+      const k = (transpose ? (i * ny + j) : (j * nx + i)) * 4;
+      img.data[k] = r; img.data[k + 1] = g; img.data[k + 2] = b; img.data[k + 3] = 255;
+    }
+  }
+  const off = document.createElement("canvas");
+  off.width = iw; off.height = ih;
+  off.getContext("2d").putImageData(img, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(off, 0, 0, W, H);
+  // window circle (horizontal axis is y when transposed, else x)
   const [Lx, Ly] = model.get("extent") || [1, 1];
   const cx = drag.cx != null ? drag.cx : model.get("window_cx");
   const cy = drag.cy != null ? drag.cy : model.get("window_cy");
   const side = model.get("window_side");
-  const cxp = (cx / Lx) * W, cyp = (cy / Ly) * H;
-  const rx = (side / 2 / Lx) * W, ry = (side / 2 / Ly) * H;
+  const lh = transpose ? Ly : Lx, lv = transpose ? Lx : Ly;
+  const ch = transpose ? cy : cx, cv = transpose ? cx : cy;
+  const cxp = (ch / lh) * W, cyp = (cv / lv) * H, rx = (side / 2 / lh) * W, ry = (side / 2 / lv) * H;
   ctx.strokeStyle = "#e02424"; ctx.lineWidth = 2; ctx.fillStyle = "rgba(224,36,36,0.08)";
   for (const ox of [-W, 0, W]) {
     for (const oy of [-H, 0, H]) {
@@ -247,28 +269,54 @@ function render({ model, el: root }) {
     return [s, v];
   }
 
-  const wrap = el("div", "px-wrap", root);
-  const left = el("div", "px-col", wrap);
-  const frameCanvas = el("canvas", "px-frame", left);
-  frameCanvas.width = 340; frameCanvas.height = Math.round(340 * Ly / Lx);
-  const histCanvas = el("canvas", "px-hist", left);
-  histCanvas.width = 340; histCanvas.height = 50;
-  const [thickSlider, thickVal] = mkRange(el("div", "px-row", left), "thick",
-    0, (model.get("thicknesses") || [0]).length - 1, 1, model.get("thickness_index"));
-  const [dfSlider, dfVal] = mkRange(el("div", "px-row", left), "defocus", -120, 120, 5, model.get("defocus_offset"));
-  const [rotSlider, rotVal] = mkRange(el("div", "px-row", left), "rotate", -180, 180, 5, model.get("window_angle"));
+  const layout = model.get("layout") || "side";
+  const transpose = model.get("transpose");
+  let frameCanvas, histCanvas, inputCanvas, fftCanvas, g3Canvas, g2Canvas, vmaxInput;
+  let thickSlider, thickVal, dfSlider, dfVal, rotSlider, rotVal;
+  const nThick = (model.get("thicknesses") || [0]).length;
 
-  const mid = el("div", "px-col", wrap);
-  const inputCanvas = el("canvas", "px-input", mid); inputCanvas.width = 168; inputCanvas.height = 168;
-  const fftCanvas = el("canvas", "px-input", mid); fftCanvas.width = 168; fftCanvas.height = 168;
+  function mkVmax(parent) {
+    el("span", "px-label", parent).textContent = "g3 max";
+    const v = el("input", null, parent);
+    v.type = "number"; v.min = 0; v.step = 0.5; v.placeholder = "auto"; v.style.width = "60px";
+    return v;
+  }
 
-  const right = el("div", "px-col", wrap);
-  const g3Canvas = el("canvas", "px-g3", right); g3Canvas.width = 360; g3Canvas.height = 210;
-  const g2Canvas = el("canvas", "px-g2", right); g2Canvas.width = 360; g2Canvas.height = 150;
-  el("span", "px-label", el("div", "px-row", right)).textContent = "g3 max";
-  const vmaxInput = el("input", null, right.lastChild);
-  vmaxInput.type = "number"; vmaxInput.min = 0; vmaxInput.step = 0.5; vmaxInput.placeholder = "auto";
-  vmaxInput.style.width = "60px";
+  if (layout === "stacked") {
+    // Full-width frame (long axis horizontal) on top; previews + g2/g3 below.
+    const wrap = el("div", "px-wrap px-stacked", root);
+    const lh = transpose ? Ly : Lx, lv = transpose ? Lx : Ly;
+    frameCanvas = el("canvas", "px-frame", wrap);
+    frameCanvas.width = 760; frameCanvas.height = Math.max(80, Math.round(760 * lv / lh));
+    histCanvas = el("canvas", "px-hist", wrap); histCanvas.width = 760; histCanvas.height = 50;
+    [thickSlider, thickVal] = mkRange(el("div", "px-row", wrap), "thick", 0, nThick - 1, 1, model.get("thickness_index"));
+    [dfSlider, dfVal] = mkRange(el("div", "px-row", wrap), "defocus", -120, 120, 5, model.get("defocus_offset"));
+    [rotSlider, rotVal] = mkRange(el("div", "px-row", wrap), "rotate", -180, 180, 5, model.get("window_angle"));
+    const below = el("div", "px-wrap", wrap);
+    const mid = el("div", "px-col", below);
+    inputCanvas = el("canvas", "px-input", mid); inputCanvas.width = 168; inputCanvas.height = 168;
+    fftCanvas = el("canvas", "px-input", mid); fftCanvas.width = 168; fftCanvas.height = 168;
+    const right = el("div", "px-col", below);
+    g3Canvas = el("canvas", "px-g3", right); g3Canvas.width = 520; g3Canvas.height = 240;
+    g2Canvas = el("canvas", "px-g2", right); g2Canvas.width = 520; g2Canvas.height = 150;
+    vmaxInput = mkVmax(el("div", "px-row", right));
+  } else {
+    const wrap = el("div", "px-wrap", root);
+    const left = el("div", "px-col", wrap);
+    frameCanvas = el("canvas", "px-frame", left);
+    frameCanvas.width = 340; frameCanvas.height = Math.round(340 * Ly / Lx);
+    histCanvas = el("canvas", "px-hist", left); histCanvas.width = 340; histCanvas.height = 50;
+    [thickSlider, thickVal] = mkRange(el("div", "px-row", left), "thick", 0, nThick - 1, 1, model.get("thickness_index"));
+    [dfSlider, dfVal] = mkRange(el("div", "px-row", left), "defocus", -120, 120, 5, model.get("defocus_offset"));
+    [rotSlider, rotVal] = mkRange(el("div", "px-row", left), "rotate", -180, 180, 5, model.get("window_angle"));
+    const mid = el("div", "px-col", wrap);
+    inputCanvas = el("canvas", "px-input", mid); inputCanvas.width = 168; inputCanvas.height = 168;
+    fftCanvas = el("canvas", "px-input", mid); fftCanvas.width = 168; fftCanvas.height = 168;
+    const right = el("div", "px-col", wrap);
+    g3Canvas = el("canvas", "px-g3", right); g3Canvas.width = 360; g3Canvas.height = 210;
+    g2Canvas = el("canvas", "px-g2", right); g2Canvas.width = 360; g2Canvas.height = 150;
+    vmaxInput = mkVmax(el("div", "px-row", right));
+  }
 
   const status = el("div", "px-status", root);
   const drag = { cx: null, cy: null, active: false };
@@ -294,7 +342,9 @@ function render({ model, el: root }) {
   // --- window drag on the frame ---
   function pointerToAngstrom(ev) {
     const rect = frameCanvas.getBoundingClientRect();
-    return [((ev.clientX - rect.left) / rect.width) * Lx, ((ev.clientY - rect.top) / rect.height) * Ly];
+    const fh = (ev.clientX - rect.left) / rect.width, fv = (ev.clientY - rect.top) / rect.height;
+    // transposed: horizontal is y, vertical is x.
+    return transpose ? [fv * Lx, fh * Ly] : [fh * Lx, fv * Ly];
   }
   const clamp = (c, L) => ((c % L) + L) % L;
   frameCanvas.addEventListener("pointerdown", (ev) => {

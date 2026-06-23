@@ -13,6 +13,10 @@
   flex-direction: column;
   gap: 6px;
 }
+.hrtem-explorer .px-stacked {
+  flex-direction: column;
+  align-items: flex-start;
+}
 .hrtem-explorer .px-frame {
   border: 1px solid #ccc;
   border-radius: 4px;
