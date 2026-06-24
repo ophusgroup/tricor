@@ -38,6 +38,7 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=1.24",
+    "scipy>=1.10",
     "matplotlib>=3.7",
     "ase>=3.22",
     "anywidget>=0.9",
@@ -60,6 +61,18 @@ Issues = "https://github.com/ophusgroup/tricor/issues"
 [project.optional-dependencies]
 test = [
     "pytest>=7.0",
+]
+# Training-pair generation for the ptychography -> local-g2/g3 ML
+# project (``training`` branch).  abTEM supplies the projected
+# electrostatic potentials that are blurred into pseudo-ptychographic
+# inputs.  abTEM 1.0+ requires Python >=3.11, so this extra does not
+# install on the 3.10 base interpreter -- use a 3.11+ environment.
+# jupyterlab + ipywidgets are included so the training notebooks run
+# (and the anywidget front-end matches the kernel) straight from this env.
+training = [
+    "abtem>=1.0",
+    "jupyterlab>=4",
+    "ipywidgets>=8",
 ]
 
 [tool.pytest.ini_options]

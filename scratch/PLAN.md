@@ -90,3 +90,7 @@ Pipeline is generic — extend to Si, C (sp²/sp³), Cu, SrTiO₃.  Need:
 ### 6. Smarter conditioning
 
 The `grain_size` scalar conditioning is barely used by the current model (the Voronoi-tile pattern already encodes the regime).  For a generation-from-noise variant (no Voronoi seed) this is the main signal — would need to expand `cond_input_dim` to a richer per-cell vector (full target g(r) summary?).
+
+### 7. Benchmark ORB-v3 as a MACE-MP0 alternative
+
+Relevant to the speed story behind this whole project (ML vs FIRE vs MACE).  ORB-v3 (Orbital Materials) is ~accuracy-equivalent to MACE-MPA-0 but markedly faster on GPU, and drops into tricor's ASE-calculator interface with minimal change.  Investigated 2026-06-19, **deferred**.  Full feasibility notes — construction sites to change, ORB API, GPU-vs-CPU and conservative-vs-direct caveats, recommended first benchmark — in `scratch/ORB_V3_INTEGRATION.md`.

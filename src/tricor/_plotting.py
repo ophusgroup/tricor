@@ -20,6 +20,72 @@ _G2_HTML_TEMPLATE = (_STATIC_DIR / "g2_viewer.html").read_text()
 _OVERVIEW_HTML_TEMPLATE = (_STATIC_DIR / "overview_viewer.html").read_text()
 
 
+def show_2d(
+    array,
+    *,
+    extent=None,
+    ax=None,
+    figsize: tuple = (5, 5),
+    cmap: str = "gray",
+    title: str | None = None,
+    xlabel: str | None = None,
+    ylabel: str | None = None,
+    colorbar: bool = True,
+    origin: str = "lower",
+    aspect: str = "equal",
+    clip_percentile: float | None = None,
+    vmin: float | None = None,
+    vmax: float | None = None,
+):
+    """Display a 2D array as an image with sensible defaults.
+
+    A thin convenience around ``imshow`` for inspecting potential slices,
+    g-function slices, masks, etc.
+
+    Parameters
+    ----------
+    array
+        2D array to display.
+    extent
+        ``[x0, x1, y0, y1]`` in data units (e.g. Å), or ``None``.
+    ax
+        Existing matplotlib Axes to draw into; created if ``None``.
+    figsize
+        Figure size when a new figure is created (ignored if ``ax`` is given).
+    cmap, title, xlabel, ylabel, colorbar, origin, aspect
+        Standard display options (``aspect="auto"`` for non-isotropic
+        axes such as an angle-vs-distance map).
+    clip_percentile
+        If given, clip the colour scale to the ``[p, 100-p]`` percentiles
+        for contrast (ignored if ``vmin``/``vmax`` are set).
+    vmin, vmax
+        Explicit colour limits.
+
+    Returns
+    -------
+    matplotlib.axes.Axes
+    """
+    import matplotlib.pyplot as plt
+
+    arr = np.asarray(array, dtype=float)
+    if clip_percentile is not None and vmin is None and vmax is None:
+        vmin, vmax = (float(v) for v in np.nanpercentile(
+            arr, [clip_percentile, 100.0 - clip_percentile]))
+    if ax is None:
+        _, ax = plt.subplots(figsize=figsize)
+    im = ax.imshow(arr, extent=extent, origin=origin, cmap=cmap,
+                   aspect=aspect, vmin=vmin, vmax=vmax)
+    if title:
+        ax.set_title(title)
+    if xlabel:
+        ax.set_xlabel(xlabel)
+    if ylabel:
+        ax.set_ylabel(ylabel)
+    if colorbar:
+        ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    return ax
+
+
 def _detect_tetrahedra(
     atoms,
     *,
@@ -1275,7 +1341,7 @@ def export_overview_html(
                 )
                 for gcfg in groups_cfg
             ]
-            # Clear the legacy single-group fields: viewer will read
+            # Clear the single-group fields: the viewer reads
             # polyhedra_groups in preference.
             if groups_payload:
                 tet_vertices_flat = []

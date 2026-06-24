@@ -454,8 +454,8 @@ class _GrainMixin:
         displacement_sigma: float = 0.0,
         max_density_passes: int = 5,
         grain_sources: "list[dict] | None" = None,
-        seeds_override: "np.ndarray | None" = None,
-        is_crystalline_override: "np.ndarray | None" = None,
+        rotations_override: "np.ndarray | None" = None,
+        seeds: "np.ndarray | None" = None,
     ) -> Atoms:
         """Build a supercell with crystalline grains via Voronoi tiling.
 
@@ -530,17 +530,15 @@ class _GrainMixin:
         # ---- 1. Seeds ----
         grain_radius_user = max(float(grain_size) * 0.5, 2.0)
         V_box = float(np.prod(box_dim))
-        if seeds_override is not None:
-            # Caller supplies the grain seeds directly (e.g. the graded
-            # variable-density builder in Supercell.generate_graded).
-            # ``num_grains`` follows from the seed count; ``grain_size``
-            # is then only a cosmetic summary value + the master-block
-            # radius floor below (the real master radius is set by the
-            # Voronoi vertices, so per-grain size is honoured regardless).
-            seeds = np.mod(np.asarray(seeds_override, dtype=np.float64), box_dim)
+        # Whether the caller supplied seeds (upstream's graded order-gradient
+        # builder); captured before ``seeds`` is reassigned below so the
+        # fast-path gate can exclude the supplied-seed case.
+        seeds_supplied = seeds is not None
+        if seeds is not None:
+            seeds = np.asarray(seeds, dtype=np.float64)
             num_grains = len(seeds)
             if num_grains == 0:
-                raise ValueError("seeds_override must contain at least one seed.")
+                raise ValueError("seeds must contain at least one seed.")
         else:
             V_grain = (4.0 / 3.0) * np.pi * grain_radius_user ** 3
             num_grains = max(1, int(np.ceil(V_box / V_grain)))
@@ -565,12 +563,17 @@ class _GrainMixin:
         # Defaults to True so production code uses the fast path
         # transparently.
         use_fast = getattr(type(self), "_USE_FAST_GRAIN_PATH", True)
+        # Below FAST_MIN_GRAINS the fast path's statistical master-block
+        # radius can under-fill the largest grain (negligible/sub-atomic at
+        # production cell sizes, but a real void for few-grain / small cells
+        # -- see project_fast_packing_allsizes_todo).  Use exact Voronoi below.
+        FAST_MIN_GRAINS = 200
         can_fast = (
             use_fast
-            and seeds_override is None
-            and is_crystalline_override is None
+            and not seeds_supplied
             and not multi_source
             and float(crystalline_fraction) >= 0.9999
+            and num_grains >= FAST_MIN_GRAINS
         )
 
         if can_fast:
@@ -669,34 +672,18 @@ class _GrainMixin:
                 grain_source = np.zeros(num_grains_total, dtype=np.intp)
 
             # ---- 4. Decide which grains are crystalline ----
-            if is_crystalline_override is not None:
-                # Per-grain crystalline/amorphous decision supplied by the
-                # caller (the graded builder draws it from a position-dependent
-                # probability so order varies smoothly along the long axis).
-                is_crystalline = np.asarray(is_crystalline_override, dtype=bool)
-                if is_crystalline.shape[0] != num_grains:
-                    raise ValueError(
-                        f"is_crystalline_override length ({is_crystalline.shape[0]}) "
-                        f"must match the number of grains ({num_grains})."
-                    )
-                crystalline_fraction = (
-                    float(np.mean(is_crystalline)) if num_grains else 0.0
-                )
-            else:
-                crystalline_fraction = float(np.clip(crystalline_fraction, 0.0, 1.0))
-                num_crystalline = int(np.round(crystalline_fraction * num_grains))
-                is_crystalline = np.zeros(num_grains, dtype=bool)
-                if num_crystalline > 0:
-                    chosen = self.rng.permutation(num_grains)[:num_crystalline]
-                    is_crystalline[chosen] = True
+            crystalline_fraction = float(np.clip(crystalline_fraction, 0.0, 1.0))
+            num_crystalline = int(np.round(crystalline_fraction * num_grains))
+            is_crystalline = np.zeros(num_grains, dtype=bool)
+            if num_crystalline > 0:
+                chosen = self.rng.permutation(num_grains)[:num_crystalline]
+                is_crystalline[chosen] = True
 
             # ---- 5. Rotations: random SO(3) except for the single-grain
             # ---- spans-the-whole-box case, where identity keeps the
             # ---- rotated lattice commensurate with PBC wrap-around.
             single_box_grain = (
-                seeds_override is None
-                and is_crystalline_override is None
-                and int(np.sum(is_crystalline)) <= 1
+                int(np.sum(is_crystalline)) <= 1
                 and grain_radius_user >= 0.5 * float(np.min(box_dim))
             )
             if single_box_grain:
@@ -709,6 +696,12 @@ class _GrainMixin:
                 # distortions that ruin the crystalline structure.
                 shared_seed = seeds[0].copy()
                 seeds = np.broadcast_to(shared_seed, seeds.shape).copy()
+            elif rotations_override is not None:
+                # Caller supplies the per-grain rotation set (orientation
+                # refinement re-runs this builder with a fixed RNG seed and
+                # trial rotations).  Skip the random draw so the RNG stream
+                # stays aligned across calls.
+                rotations = np.asarray(rotations_override, dtype=np.float64).copy()
             else:
                 rotations = _random_rotation_matrices(num_grains, self.rng)
 

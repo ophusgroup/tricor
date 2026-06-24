@@ -129,11 +129,33 @@ cell.generate(shell_target, **tc.Supercell.PRESETS["MRO"])
 | amorphous | 6 | 1.2 | 0.6 | 1.5 | 0.9 | 0.5 | 0.08 |
 | SRO | 10 | 2.2 | 1.0 | 2.0 | 0.95 | 0.6 | 0.04 |
 | MRO | 13 | 1.9 | 0.9 | 2.5 | 0.95 | 0.7 | 0.04 |
-| MRO_more | 18 | 2.0 | 1.0 | default | 0.95 | 0.9 | 0.04 |
-| nanocrystalline_10 | 15 | 2.8 | 1.3 | default | default | default | 0.02 |
-| nanocrystalline_20 | 20 | 3.0 | 1.5 | default | default | default | 0.02 |
+| LRO | 18 | 2.0 | 1.0 | default | 0.95 | 0.9 | 0.04 |
+| nanocrystalline | 20 | 3.0 | 1.5 | default | default | default | 0.02 |
 
 All presets use `relative_density=0.96`. Abbreviations: `rep_wt` = `repulsion_weight`, `hc_scale` = `hard_core_scale`, `nbp_scale` = `nonbond_push_scale`.
+
+## Refining generated structures
+
+`generate()` produces the initial supercell; a relaxation step turns it
+into a physically realistic structure. Three worked pipelines are
+documented, in order of accuracy:
+
+- **[MACE-MP0 refinement](https://tricor.readthedocs.io/en/latest/examples_mace/index.html)**
+  *(recommended)* — relax with a universal machine-learning potential
+  for near-DFT accuracy; minutes per ~5000-atom cell on a laptop CPU.
+- **[Fast FIRE refinement](https://tricor.readthedocs.io/en/latest/examples_refined/index.html)**
+  — the built-in spring-network FIRE quench (`refine_orientations=True`
+  for the SO(3) grain alignment + the FIRE pass). Fastest, and the only
+  option that stays practical at 100³ Å and larger, but less accurate
+  than MACE. With the optional `mace-torch` dependency installed, the
+  springs can be calibrated against MACE in one call:
+
+  ```python
+  shell = tc.CoordinationShellTarget.from_atoms(atoms)
+  shell = shell.calibrate_to_mace()   # optional — improves accuracy
+  cell.generate(shell, ...)           # picks up Morse bonds, per-pair
+                                      # stiffness, and the MACE hard core
+  ```
 
 ### Optional: target g3 for comparison
 

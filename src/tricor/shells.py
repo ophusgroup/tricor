@@ -143,6 +143,37 @@ class CoordinationShellTarget:
     max_pair_outer: float
     max_pair_outer_by_center: np.ndarray
     summary: dict[str, object]
+    # MACE-calibration outputs.  ``None`` until
+    # :meth:`calibrate_to_mace` runs; all (S, S) arrays use NaN for
+    # non-bonded pairs, ``angle_k`` aligns with ``angle_mode_deg``.
+    pair_k_bond: "np.ndarray | None" = None       # eV/Å², harmonic
+    pair_morse_D: "np.ndarray | None" = None      # eV
+    pair_morse_a: "np.ndarray | None" = None      # 1/Å
+    pair_morse_r: "np.ndarray | None" = None      # Å, fitted minimum
+    pair_hard_min_mace: "np.ndarray | None" = None  # Å, 1 eV rise point
+    angle_k: "np.ndarray | None" = None           # eV/rad², per triplet
+    mace_calibration: "dict | None" = None
+
+    def calibrate_to_mace(self, **kwargs) -> "CoordinationShellTarget":
+        """Calibrate spring stiffnesses against the MACE-MP0 potential.
+
+        Runs small finite-difference and scan calculations on this
+        target's reference crystal (``self.atoms``) with the published
+        MACE foundation model, and returns a copy of the target with
+        the per-pair harmonic stiffness ``pair_k_bond``, Morse
+        parameters ``pair_morse_D`` / ``pair_morse_a`` /
+        ``pair_morse_r`` (when ``anharmonic=True``, the default), the
+        MACE-derived hard-core estimate ``pair_hard_min_mace``, and
+        the per-triplet bend stiffness ``angle_k`` populated.
+        Provenance and fit residuals are stored in
+        ``mace_calibration``.
+
+        Requires the optional ``mace-torch`` dependency.  See
+        :func:`tricor._mace_calibrate.calibrate_to_mace` for the
+        keyword arguments.
+        """
+        from ._mace_calibrate import calibrate_to_mace as _calibrate
+        return _calibrate(self, **kwargs)
 
     @classmethod
     def from_atoms(
@@ -200,9 +231,9 @@ class CoordinationShellTarget:
             silences the second-shell ``Si-Si`` / ``O-O`` springs in
             ``SiO2``, the ``Sr-Sr`` / ``Ti-Ti`` / ``O-O`` / ``Sr-Ti``
             springs in ``SrTiO3``, etc.  Set to ``False`` to keep every
-            extracted pair (pre-2026 behaviour); callers can also
-            override the filter by chaining
-            :meth:`with_bonded_species_pairs` after extraction.
+            extracted pair; callers can also override the filter by
+            chaining :meth:`with_bonded_species_pairs` after
+            extraction.
         label : str, optional
             Free-text identifier carried along on the returned target
             (used in plot legends and HTML viewer titles).  Default
@@ -389,8 +420,8 @@ class CoordinationShellTarget:
         #            Sr-Ti > min(Sr) > min(Ti)   → artefact (zeroed)
         #   Cu/Si:   only one species, sole pair → real
         #
-        # Set ``auto_filter_lattice_artifacts=False`` to disable and
-        # recover the pre-fix behaviour (every pair_mask entry kept).
+        # Set ``auto_filter_lattice_artifacts=False`` to disable
+        # (every pair_mask entry kept).
         # Callers can always override afterwards via
         # :meth:`with_bonded_species_pairs` /
         # :meth:`with_cross_species_bonds_only`.
