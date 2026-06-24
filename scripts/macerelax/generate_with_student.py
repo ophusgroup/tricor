@@ -66,6 +66,15 @@ from pathlib import Path
 GPU_ID      = 0
 NUM_THREADS = 4
 
+# ── NERSC CNOS PRODUCTION preset (from the macerelax/NERSC line, merged 2026-06-24) ──
+# Run-specific values used for the A100 CNOS production run. To use, set these
+# in the matching sections below (they differ from the PERLMUTTER defaults):
+#   CIF_DIR        = Path("/pscratch/sd/e/ehrdt/all_cnos_cifs")
+#   CIF_LIST_FILE  = Path("/global/u2/e/ehrdt/tricor/scratch/incomplete_cifs.txt")
+#   MAX_ITER             = 12     # exactly the k=5, N=60 training horizon (no OOD iters 13-15)
+#   USE_BF16_INFERENCE   = True   # A100 bf16 ≈ 16× fp32 — worth it here (was a loss on buffle/Blackwell)
+#   OUTPUT_ROOT    = Path("/pscratch/sd/e/ehrdt/macerelax/generated_cnos_v1")
+
 # --- input ---
 # Recommend: keep this constrained to training-chemistry CIFs.
 # ── BUFFLE E2E VALIDATION (commented out — uncomment for local buffle tests) ─
