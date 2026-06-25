@@ -28,3 +28,6 @@ scripts/relaxml/shelltgt_phys_v2/lightning_logs
 
 # Archived previous work (abandoned relaxml path) — kept locally, never committed.
 _archive/
+
+# Internal verification harnesses (local abs paths + vendored upstream/mlpdf code).
+tests/verification/
