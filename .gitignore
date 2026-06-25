@@ -20,3 +20,11 @@ scripts/relaxml/lightning_logs
 data/
 scripts/relaxml/shelltgt_phys/lightning_logs
 scripts/relaxml/shelltgt_phys_v2/lightning_logs
+
+# Internal-only docs: kept locally, never committed to the codebase.
+# Only the root README.md is tracked.
+*.md
+!/README.md
+
+# Archived previous work (abandoned relaxml path) — kept locally, never committed.
+_archive/
