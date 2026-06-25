@@ -31,3 +31,10 @@ _archive/
 
 # Internal verification harnesses (local abs paths + vendored upstream/mlpdf code).
 tests/verification/
+
+# Internal experiment/output dirs + stray outputs — kept locally, not committed.
+/eval_results/
+/mace/
+/cost_traces/
+/*.png
+RELAXML_SESSION.txt
