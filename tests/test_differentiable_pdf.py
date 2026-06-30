@@ -109,7 +109,20 @@ class TestDifferentiablePDFADF:
         """Verify that gradients propagate through ADF computation."""
         from tricor.differentiable_pdf import DifferentiablePDFADF
 
+        # Break crystal symmetry before checking gradient flow.  A perfect
+        # diamond lattice is a high-symmetry stationary point: every bond
+        # angle is exactly tetrahedral, so the gradient of any rotation/
+        # translation-invariant scalar of the ADF vanishes *by symmetry*
+        # (verified: grad is exactly 0 at the perfect crystal, but ~1e3 once
+        # perturbed, and finite-differencing confirms adf depends on
+        # positions — the ADF itself is differentiable).  Perturbing the
+        # atoms moves us off that stationary point so a real non-zero
+        # gradient can flow.
         positions, species, cell = make_si_diamond((2, 2, 2))
+        torch.manual_seed(0)
+        positions = (
+            positions.detach() + 0.05 * torch.randn_like(positions.detach())
+        ).requires_grad_(True)
 
         calc = DifferentiablePDFADF(
             r_max=3.0, r_step=0.1, phi_num_bins=45,
@@ -117,10 +130,10 @@ class TestDifferentiablePDFADF:
         ).double()
         g2, adf = calc.compute(positions, species, cell)
 
-        # Use (adf**2).sum() rather than adf.sum() — in a perfect crystal,
-        # adf.sum() is approximately invariant to small displacements (the
-        # Gaussian kernels shift but their total integral is conserved).
-        # Squaring breaks this invariance and ensures non-zero gradients.
+        # Use (adf**2).sum() rather than adf.sum(): adf.sum() is additionally
+        # ~invariant to small displacements (the Gaussian kernels shift but
+        # their total integral is conserved), so squaring gives a cleaner
+        # non-zero signal.
         loss = (adf ** 2).sum()
         loss.backward()
 
