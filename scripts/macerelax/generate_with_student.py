@@ -269,7 +269,7 @@ from torch_geometric.data import Batch
 from ase.io import read as ase_read, write as ase_write
 
 import tricor as tc
-from tricor.flowmatch.flow_utils import (
+from tricor.macerelax.flow_utils import (
     periodic_radius_graph_cell_list,
     periodic_radius_graph_chunked,
 )
@@ -279,7 +279,7 @@ from tricor.macerelax.data import (
     _weight_vector_from_row,
 )
 from tricor.shells import CoordinationShellTarget
-from tricor.relaxml.shell_target import extract_shell_target_arrays
+from tricor.macerelax.shell_target import extract_shell_target_arrays
 
 # wall_calculator's per_pair_min_from_atoms gives us the wall_global_min for
 # the weight_vector — same routine the production generation uses.

@@ -30,7 +30,7 @@ from scipy.spatial.transform import Rotation
 from torch_geometric.data import Data, Dataset
 from torch_geometric.loader import DataLoader
 
-from tricor.flowmatch.flow_utils import (
+from tricor.macerelax.flow_utils import (
     periodic_radius_graph_cell_list,
     periodic_radius_graph_chunked,
 )

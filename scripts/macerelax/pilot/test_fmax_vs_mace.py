@@ -176,7 +176,7 @@ from ase.io import read as ase_read, write as ase_write
 from ase.optimize import FIRE
 
 import tricor as tc
-from tricor.flowmatch.flow_utils import (
+from tricor.macerelax.flow_utils import (
     periodic_radius_graph_cell_list,
     periodic_radius_graph_chunked,
 )
@@ -187,7 +187,7 @@ from tricor.macerelax.data import (
     _min_image_displacement,
 )
 from tricor.shells import CoordinationShellTarget
-from tricor.relaxml.shell_target import extract_shell_target_arrays
+from tricor.macerelax.shell_target import extract_shell_target_arrays
 from mace.calculators import mace_mp
 
 _GEN_DIR = Path(__file__).resolve().parent.parent / "generation"

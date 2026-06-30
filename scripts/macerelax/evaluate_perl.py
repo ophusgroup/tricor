@@ -111,7 +111,7 @@ import torch
 torch.set_num_threads(NUM_THREADS)
 from torch_geometric.data import Batch
 
-from tricor.flowmatch.flow_utils import (
+from tricor.macerelax.flow_utils import (
     periodic_radius_graph_cell_list,
     periodic_radius_graph_chunked,
 )

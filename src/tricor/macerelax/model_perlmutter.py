@@ -38,7 +38,7 @@ from graphite.nn.models.mgn import Decoder
 from torch_geometric.utils import scatter
 
 from .data import NUM_WEIGHT_FEATURES
-from tricor.relaxml.shell_target import NUM_PAIR_FEATURES, NUM_TRIPLET_FEATURES
+from tricor.macerelax.shell_target import NUM_PAIR_FEATURES, NUM_TRIPLET_FEATURES
 
 
 # Periodic table covers Z = 1..118; sized to 120 gives a small safety margin.

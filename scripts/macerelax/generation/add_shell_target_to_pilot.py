@@ -38,7 +38,7 @@ from pathlib import Path
 import numpy as np
 from ase.io import read as ase_read
 
-from tricor.relaxml.shell_target import extract_shell_target_arrays
+from tricor.macerelax.shell_target import extract_shell_target_arrays
 from tricor.shells import CoordinationShellTarget
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -30,7 +30,7 @@ from .data import NUM_WEIGHT_FEATURES
 # shell_target helpers stay in the relaxml package — composition-intrinsic,
 # works identically for MACE-source trajectories once the NPZs have the
 # shell_target arrays appended by scripts/macerelax/generation/add_shell_target_to_pilot.py.
-from tricor.relaxml.shell_target import NUM_PAIR_FEATURES, NUM_TRIPLET_FEATURES
+from tricor.macerelax.shell_target import NUM_PAIR_FEATURES, NUM_TRIPLET_FEATURES
 
 
 # Periodic table covers Z = 1..118; sized to 120 gives a small safety margin.
