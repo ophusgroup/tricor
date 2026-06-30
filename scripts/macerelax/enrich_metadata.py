@@ -45,7 +45,7 @@ from __future__ import annotations
 from pathlib import Path
 
 # Where the trajectories live and where plots / CSV land.
-OUTPUT_ROOT       = Path("/pscratch/sd/e/ehrdt/macerelax/generated_v1")
+OUTPUT_ROOT       = Path("/pscratch/sd/e/ehrdt/macerelax/generated_cnos_v1")
 PLOTS_ROOT        = OUTPUT_ROOT / "plots"
 ENRICHMENT_CSV    = OUTPUT_ROOT / "enrichment.csv"
 

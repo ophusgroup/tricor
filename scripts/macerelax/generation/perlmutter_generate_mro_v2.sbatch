@@ -27,7 +27,7 @@
 #SBATCH --account=m5241
 #SBATCH --constraint=gpu&hbm80g
 #SBATCH --qos=regular
-#SBATCH --time=01:00:00
+#SBATCH --time=02:00:00
 #SBATCH --nodes=4
 #SBATCH --mem=0
 #SBATCH --ntasks-per-node=1

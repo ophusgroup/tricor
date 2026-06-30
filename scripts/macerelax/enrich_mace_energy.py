@@ -45,7 +45,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-OUTPUT_ROOT          = Path("/pscratch/sd/e/ehrdt/macerelax/generated_v1")
+OUTPUT_ROOT          = Path("/pscratch/sd/e/ehrdt/macerelax/generated_cnos_v1")
 MACE_ENRICHMENT_CSV  = OUTPUT_ROOT / "mace_enrichment.csv"
 
 # Which file types to enrich (NPZ preferred when both exist).
