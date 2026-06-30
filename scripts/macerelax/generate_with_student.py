@@ -98,6 +98,13 @@ MODEL_RUN_NAME       = "ddp_v1"
 MODEL_RUN_TIMESTAMP: str | None = None   # None → most recent run_*
 MODEL_EPOCH          = "best"            # "last" | "best" | "<path>"
 USE_EMA_WEIGHTS      = True
+# Fail loudly if the checkpoint's weights don't line up with the model
+# architecture built from the constants below.  Because load_state_dict
+# runs with strict=False, a mismatch (e.g. the MODEL ARCHITECTURE knobs
+# drifting from train_perl_ddp.py) would otherwise be silently tolerated
+# and generate garbage from partially-random weights.  Set False only if
+# you have a KNOWN-benign missing/unexpected key set.
+STRICT_CHECKPOINT_LOAD = True
 
 # ─── MODEL ARCHITECTURE — must match train_perl_ddp.py at training time ─────
 MAX_Z                    = 120
@@ -734,6 +741,16 @@ def _load_model(ckpt_path: Path, device: torch.device) -> torch.nn.Module:
             print(f"  first missing : {missing[:3]}")
         if unexpected:
             print(f"  first unexpected: {unexpected[:3]}")
+        if STRICT_CHECKPOINT_LOAD:
+            raise RuntimeError(
+                f"Checkpoint {ckpt_path.name} does not match the model "
+                f"architecture: {len(missing)} missing / {len(unexpected)} "
+                f"unexpected weight keys.  The MODEL ARCHITECTURE CONFIG "
+                f"likely drifted from the run that produced this checkpoint "
+                f"(running anyway would generate garbage from partially-"
+                f"random weights).  Reconcile the arch constants, or set "
+                f"STRICT_CHECKPOINT_LOAD=False if this mismatch is known-benign."
+            )
     epoch = int(payload.get("epoch", -1))
     best_val = float(payload.get("best_val", float("nan")))
     print(f"[ckpt] loaded {ckpt_path.name}: epoch={epoch}  "
