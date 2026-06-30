@@ -12,16 +12,16 @@ Scalars (per trajectory):
   * ``composition_json``       — {element_symbol: fraction}
   * ``mean_coord_by_species_json`` — {element_symbol: mean coord at COORD_CUTOFF_A}
 
-PNGs (per trajectory):
+PNGs (per trajectory — each gated by its ``RENDER_*`` CONFIG flag):
 
-  * ``OUTPUT_ROOT/plots/{compound}_{mp_id}/{regime}/seed{seed}/gr.png``
-  * ``OUTPUT_ROOT/plots/{compound}_{mp_id}/{regime}/seed{seed}/adf.png``
-  * ``OUTPUT_ROOT/plots/{compound}_{mp_id}/{regime}/seed{seed}/g3.png``
+  * ``OUTPUT_ROOT/plots/{compound}_{mp_id}/{regime}/seed{seed}/gr.png``    (RENDER_GR)
+  * ``OUTPUT_ROOT/plots/{compound}_{mp_id}/{regime}/seed{seed}/adf.png``   (RENDER_ADF, off by default)
+  * ``OUTPUT_ROOT/plots/{compound}_{mp_id}/{regime}/seed{seed}/g3.png``    (RENDER_G3)
 
-g(r) and ADF are computed from the same ``G3Distribution`` measurement (one
-fast numba pass per structure).  g3 PNG uses projection (ii) — per-triplet
-shell-integrated ``(r₂, φ)`` heatmaps with r₁ fixed in the first-neighbor
-shell.
+g(r) and g3 share one ``G3Distribution`` numba pass per structure.  g3 PNG
+uses projection (ii) — per-triplet shell-integrated ``(r₂, φ)`` heatmaps
+with r₁ fixed in the first-neighbor shell.  ADF (when enabled) is a 1D
+marginalization of g3 over (r₁, r₂) within the same shell.
 
 This script handles ONLY the cheap (no-MACE) side.  The MACE multi-crop
 energy pass lives in a separate script (Task #15).
@@ -68,10 +68,17 @@ G3_SAMPLE_FRACTION = 0.01
 G3_SAMPLE_RNG_SEED = 7
 G3_BACKEND        = "auto"   # "auto" | "numba" | "python"
 
-# First-neighbor shell used by ADF (marginalize over r₁, r₂ within shell)
-# and by the g3 projection (fix r₁ within shell, plot (r₂, φ) heatmap).
+# First-neighbor shell used by the g3 projection (fix r₁ within shell, plot
+# (r₂, φ) heatmap).  Also used by the ADF when RENDER_ADF=True.
 SHELL_R_MIN_A     = 1.4
 SHELL_R_MAX_A     = 3.2
+
+# Which plots to render.  g(r) and g3 are the headline plots; ADF is a
+# marginalization of g3 that turned out to be redundant in practice — the
+# g3 (r₂, φ) heatmap already shows the angle structure.  Disabled by default.
+RENDER_GR         = True
+RENDER_ADF        = False
+RENDER_G3         = True
 
 # Plot quality.
 PNG_DPI           = 96
@@ -552,13 +559,22 @@ def enrich_one(traj_path: Path, root: Path) -> EnrichmentRow:
         gr_p, adf_p, g3_p = _plot_paths_for(
             row.compound, row.mp_id, row.regime, row.rng_seed,
         )
-        plots_done = gr_p.is_file() and adf_p.is_file() and g3_p.is_file()
-        if not plots_done:
+        # A plot is "done" if either it's already on disk or it's been
+        # disabled by the CONFIG flag.  This lets a re-run with RENDER_ADF=False
+        # short-circuit cleanly when the gr/g3 PNGs already exist.
+        plot_targets = [
+            (RENDER_GR,  gr_p),
+            (RENDER_ADF, adf_p),
+            (RENDER_G3,  g3_p),
+        ]
+        needs_render = any(enabled and not p.is_file()
+                           for enabled, p in plot_targets)
+        if needs_render:
             label = f"{row.compound}_{row.mp_id}_{row.regime}_seed{row.rng_seed}"
             dist = measure_distribution(atoms, label)
-            plot_gr(dist, gr_p)
-            plot_adf(dist, adf_p)
-            plot_g3(dist, g3_p)
+            if RENDER_GR  and not gr_p.is_file():  plot_gr(dist, gr_p)
+            if RENDER_ADF and not adf_p.is_file(): plot_adf(dist, adf_p)
+            if RENDER_G3  and not g3_p.is_file():  plot_g3(dist, g3_p)
             row.g3_origin_sample_size     = int(
                 getattr(dist, "_origin_sample_size", -1) or -1
             )
@@ -566,9 +582,11 @@ def enrich_one(traj_path: Path, root: Path) -> EnrichmentRow:
                 getattr(dist, "_origin_sample_fraction", -1.0) or -1.0
             )
 
-        row.gr_png  = str(gr_p.relative_to(root))
-        row.adf_png = str(adf_p.relative_to(root))
-        row.g3_png  = str(g3_p.relative_to(root))
+        # Only record the path if the plot was actually produced (or already
+        # existed).  Disabled plots get an empty string in the CSV.
+        row.gr_png  = str(gr_p.relative_to(root))  if gr_p.is_file()  else ""
+        row.adf_png = str(adf_p.relative_to(root)) if adf_p.is_file() else ""
+        row.g3_png  = str(g3_p.relative_to(root))  if g3_p.is_file()  else ""
 
         row.enriched_at_utc = datetime.now(timezone.utc).isoformat()
     except Exception as exc:
