@@ -210,12 +210,12 @@ class UncondFlowMatchDataModule(pl.LightningDataModule):
         return DataLoader(
             self.train_set, shuffle=True,
             batch_size=self.batch_size, num_workers=self.num_workers,
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
         )
 
     def val_dataloader(self):
         return DataLoader(
             self.val_set, shuffle=False,
             batch_size=self.batch_size, num_workers=self.num_workers,
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
         )

@@ -214,7 +214,7 @@ class StructureDataModule(pl.LightningDataModule):
             shuffle=True,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
         )
 
     def val_dataloader(self):
@@ -223,5 +223,5 @@ class StructureDataModule(pl.LightningDataModule):
             shuffle=False,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
         )

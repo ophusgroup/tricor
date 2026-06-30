@@ -1440,10 +1440,17 @@ def main() -> None:
     # bf16 conversion BEFORE torch.compile so dynamo traces bf16 ops.
     # Casts all model weights to bf16; LayerNorm internally still
     # computes in fp32 for numerical stability (PyTorch default).
-    if USE_BF16_INFERENCE:
+    if USE_BF16_INFERENCE and device.type == "cuda":
         model = model.bfloat16()
         print(f"[bf16] model converted to bfloat16 — "
               f"A100 Tensor Cores active", flush=True)
+    elif USE_BF16_INFERENCE:
+        # bf16 only buys speed on GPU Tensor Cores; on CPU it offers no
+        # speedup and risks slow/unsupported kernels.  Stay in fp32 so a
+        # CPU-only run still works.  ``_use_bf16`` downstream keys off the
+        # model's actual dtype, so leaving it fp32 keeps the run consistent.
+        print(f"[bf16] device={device.type}: skipping bf16 cast "
+              f"(GPU-only optimization), running fp32", flush=True)
     # ``torch.compile`` MUST come AFTER the edge-chunking patch so
     # dynamo traces the chunked forward (otherwise the patched
     # ``EdgeProcessor.forward`` runs eager while the rest is compiled).

@@ -206,7 +206,9 @@ HARDCORE_PUSH_FRACTION  = 0.5
 
 # --- MACE+wall relaxation ---
 MACE_MODEL          = "medium-mpa-0"
-MACE_DEVICE         = "cuda"
+MACE_DEVICE         = "cuda"       # "cuda", "cpu", or "auto"; "cuda"/"auto"
+                                    # fall back to CPU when no GPU is visible
+                                    # (resolved at the mace_mp call below)
 MACE_DEFAULT_DTYPE  = "float32"    # MACE 0.3.16 only dispatches "float32"
                                     # and "float64" through its default_dtype
                                     # knob (mace/tools/torch_tools.py:80).
@@ -1059,7 +1061,13 @@ def main() -> None:
           f"({len(calibration_cache)} entries loaded)\n")
 
     print("Initializing MACE-MPA medium (cold start ~30s on first run)...")
-    calc = mace_mp(model=MACE_MODEL, device=MACE_DEVICE,
+    _mace_device = ("cpu" if (MACE_DEVICE in ("cuda", "auto")
+                              and not torch.cuda.is_available())
+                    else MACE_DEVICE)
+    if _mace_device != MACE_DEVICE:
+        print(f"  No CUDA device visible — falling back to CPU "
+              f"(MACE_DEVICE={MACE_DEVICE!r}).", flush=True)
+    calc = mace_mp(model=MACE_MODEL, device=_mace_device,
                     default_dtype=MACE_DEFAULT_DTYPE)
     print(f"MACE ready.  torch.cuda.is_available()={torch.cuda.is_available()}\n")
 

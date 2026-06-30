@@ -61,7 +61,7 @@ def main():
 
     # Load model
     print(f"Loading checkpoint: {CHECKPOINT}")
-    lit = LitFlowMatch.load_from_checkpoint(CHECKPOINT)
+    lit = LitFlowMatch.load_from_checkpoint(CHECKPOINT, map_location=device)
     lit.ema_model.to(device)
     lit.ema_model.eval()
 
@@ -84,8 +84,8 @@ def main():
         g2_target = (g2_target / len(ref)).float().unsqueeze(0).to(device)
         adf_target = (adf_target / len(ref)).float().unsqueeze(0).to(device)
     elif TARGET_G2_FILE is not None and TARGET_ADF_FILE is not None:
-        g2_target = torch.load(TARGET_G2_FILE).unsqueeze(0).to(device)
-        adf_target = torch.load(TARGET_ADF_FILE).unsqueeze(0).to(device)
+        g2_target = torch.load(TARGET_G2_FILE, map_location=device).unsqueeze(0).to(device)
+        adf_target = torch.load(TARGET_ADF_FILE, map_location=device).unsqueeze(0).to(device)
     else:
         raise ValueError("Set either TARGET_STRUCTURE or both TARGET_G2_FILE and TARGET_ADF_FILE")
 

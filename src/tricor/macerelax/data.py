@@ -435,7 +435,9 @@ class RelaxMLDataModule(pl.LightningDataModule):
         kwargs = dict(
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-            pin_memory=True,
+            # pinned (page-locked) host memory only speeds up the
+            # host→GPU copy; it is wasted (and warns) on a CPU-only run.
+            pin_memory=torch.cuda.is_available(),
         )
         if self.num_workers > 0:
             kwargs["persistent_workers"] = True

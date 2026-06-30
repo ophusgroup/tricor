@@ -75,7 +75,7 @@ def main():
 
     # Load model
     print(f"Loading checkpoint: {CHECKPOINT}")
-    score_net = LitScoreNet.load_from_checkpoint(CHECKPOINT)
+    score_net = LitScoreNet.load_from_checkpoint(CHECKPOINT, map_location=device)
     score_net.ema_model.to(device)
     score_net.ema_model.eval()
 
@@ -95,8 +95,8 @@ def main():
         ref_atoms = ase.io.read(TARGET_STRUCTURE)
         target_g2, target_adf = compute_targets_from_structure(ref_atoms, calc)
     elif TARGET_G2_FILE is not None and TARGET_ADF_FILE is not None:
-        target_g2 = torch.load(TARGET_G2_FILE)
-        target_adf = torch.load(TARGET_ADF_FILE)
+        target_g2 = torch.load(TARGET_G2_FILE, map_location=device)
+        target_adf = torch.load(TARGET_ADF_FILE, map_location=device)
     else:
         raise ValueError("Set either TARGET_STRUCTURE or both TARGET_G2_FILE and TARGET_ADF_FILE")
 
