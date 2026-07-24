@@ -1,0 +1,3 @@
+Au box 13^3=8788 n=12 remove 63 Thold=500.0
+/Users/cophus/repos/tricor/.venv/lib/python3.12/site-packages/ase/md/langevin.py:110: FutureWarning: The implementation of `fixcm=True` in `Langevin` does not strictly sample the correct NVT distributions. The deviations are typically small for large systems but can be more pronounced for small systems. Use `fixcm=False` together with `ase.constraints.FixCom`. `fixcm` is deprecated since ASE 3.28.0 and will be removed in a future release.
+  warnings.warn(msg, FutureWarning)

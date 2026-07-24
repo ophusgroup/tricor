@@ -1,0 +1,2 @@
+Cu a=3.61 box 22^3 = 42592 atoms | plate n=20: remove 165 (expect ~210)
+wrote scratch/sft_Cu20.xyz (42427 atoms)
