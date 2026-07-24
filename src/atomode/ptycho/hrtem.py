@@ -12,7 +12,7 @@ Verified abTEM 1.0.9 conventions (see tests / project notes)
 * The beam **enters at z = 0** and propagates toward ``+z``; the exit wave
   at thickness ``t`` has integrated exactly the atoms in the block
   ``z ∈ [0, t]``.  The matching g2 / g3 target therefore uses a hard depth
-  block (:meth:`tricor.ptycho.WindowSpec.block`), *not* a Gaussian slab.
+  block (:meth:`atomode.ptycho.WindowSpec.block`), *not* a Gaussian slab.
 * ``Potential(exit_planes=...)`` returns the wave at several thicknesses in
   one pass; an explicit tuple must end on the final slice, so the tuple is
   validated and the requested planes are selected back by thickness.
@@ -112,7 +112,7 @@ def exit_wave_stack(
     Parameters
     ----------
     atoms
-        ASE ``Atoms`` (orthorhombic, periodic) — a thick tricor supercell,
+        ASE ``Atoms`` (orthorhombic, periodic) — a thick atomode supercell,
         e.g. 50 × 50 × 200 Å.
     thicknesses
         Explicit export thicknesses (Å).  If ``None``, every ``every`` Å

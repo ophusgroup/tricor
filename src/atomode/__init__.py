@@ -1,4 +1,4 @@
-"""Public package interface for tricor."""
+"""Public package interface for atomode."""
 
 from ._plotting import (
     export_g2_compare_html,

@@ -1,4 +1,4 @@
-"""Shared test fixtures for tricor.
+"""Shared test fixtures for atomode.
 
 The fixtures here build small ASE reference crystals for the materials
 the test suite exercises.  Keeping them out of individual test modules

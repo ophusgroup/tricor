@@ -984,7 +984,7 @@ def export_g2_compare_html(
     }
 
     html = _G2_HTML_TEMPLATE.replace(
-        "__TRICOR_DATA_PLACEHOLDER__",
+        "__ATOMODE_DATA_PLACEHOLDER__",
         json.dumps(data),
     )
     if output_path is None:
@@ -1050,7 +1050,7 @@ def plot_g2_compare(
     import html as _html
     escaped = _html.escape(html, quote=True)
     return HTML(
-        f'<div class="tricor-g2-compare-wrapper" style="width:100%">'
+        f'<div class="atomode-g2-compare-wrapper" style="width:100%">'
         f'<iframe srcdoc="{escaped}" '
         f'style="width:100%; height:{int(height)}px; '
         f'border:1px solid rgba(0,0,0,0.1); border-radius:6px;"></iframe>'
@@ -1166,7 +1166,7 @@ def export_overview_html(
 
     Examples
     --------
-    >>> import tricor as tc
+    >>> import atomode as tc
     >>> cells = [(cell_amorphous, "amorphous"),
     ...          (cell_mro, "MRO"),
     ...          (cell_nc, "NC")]
@@ -1398,7 +1398,7 @@ def export_overview_html(
     }
 
     html = _OVERVIEW_HTML_TEMPLATE.replace(
-        "__TRICOR_DATA_PLACEHOLDER__",
+        "__ATOMODE_DATA_PLACEHOLDER__",
         json.dumps(data),
     )
     output_path = str(output_path)
@@ -2191,7 +2191,7 @@ class _PlottingMixin:
         data["polyhedra_multi_mode"] = bool(polyhedra_groups)
 
         html = _TRAJECTORY_HTML_TEMPLATE.replace(
-            "__TRICOR_DATA_PLACEHOLDER__",
+            "__ATOMODE_DATA_PLACEHOLDER__",
             json.dumps(data),
         )
 
@@ -2355,7 +2355,7 @@ class _PlottingMixin:
         }
 
         html = _G3_HTML_TEMPLATE.replace(
-            "__TRICOR_DATA_PLACEHOLDER__",
+            "__ATOMODE_DATA_PLACEHOLDER__",
             json.dumps(data),
         )
         output_path = str(output_path)
@@ -2510,7 +2510,7 @@ class _PlottingMixin:
         }
 
         html = _G2_HTML_TEMPLATE.replace(
-            "__TRICOR_DATA_PLACEHOLDER__",
+            "__ATOMODE_DATA_PLACEHOLDER__",
             json.dumps(data),
         )
         if output_path is None:
@@ -2557,7 +2557,7 @@ class _PlottingMixin:
         # warning - IFrame requires a URL or file path and can't embed
         # our self-contained HTML directly, so srcdoc is what we want.
         return HTML(
-            f'<div class="tricor-g2-wrapper" style="width:100%">'
+            f'<div class="atomode-g2-wrapper" style="width:100%">'
             f'<iframe srcdoc="{escaped}" '
             f'style="width:100%; height:{int(height)}px; '
             f'border:1px solid rgba(0,0,0,0.1); border-radius:6px;"></iframe>'

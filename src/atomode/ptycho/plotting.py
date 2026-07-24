@@ -20,7 +20,7 @@ def plot_scattering_power(
     """Plot per-element scattering power vs atomic number.
 
     Scattering power is the integrated projected potential of a single
-    atom (:func:`tricor.ptycho.potential.scattering_power`) — the weight
+    atom (:func:`atomode.ptycho.potential.scattering_power`) — the weight
     each species carries in the (blurred) ptychographic potential.  The
     periodic-table rows are shaded as coloured background bands.
 
@@ -89,7 +89,7 @@ def plot_training_pair(pairs, index: int, *, figsize: tuple = (13, 4)):
     Parameters
     ----------
     pairs
-        List from :func:`tricor.ptycho.sliding_window_pairs`.
+        List from :func:`atomode.ptycho.sliding_window_pairs`.
     index
         Which pair to show.
     figsize
@@ -143,7 +143,7 @@ def plot_hrtem_pair(pairs, index: int, *, figsize: tuple = (15, 4)):
     Parameters
     ----------
     pairs
-        List from :func:`tricor.ptycho.sliding_window_pairs_hrtem`.
+        List from :func:`atomode.ptycho.sliding_window_pairs_hrtem`.
     index
         Which pair to show.
     figsize

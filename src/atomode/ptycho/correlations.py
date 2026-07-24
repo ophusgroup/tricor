@@ -1,7 +1,7 @@
 """Local, window-weighted g2 / g3 correlation functions.
 
 These are the *targets* for the ptychography → local-structure ML task.
-Given an atomic structure and a soft :class:`~tricor.ptycho.weighting.WindowSpec`,
+Given an atomic structure and a soft :class:`~atomode.ptycho.weighting.WindowSpec`,
 they return correlation functions that
 
 * weight every atom by the window envelope ``w_i`` (edge atoms barely
@@ -17,14 +17,14 @@ weight, the weighted pair / triplet histogram is exactly the window's
 auto-correlation envelope.  Dividing the data histogram ``DD`` by the
 random-catalogue histogram ``RR`` removes that envelope (and all edge
 effects), leaving a flat function for random data; a final far-field
-rescale pins it to 1.  This mirrors tricor's own far-field amplitude
-normalisation in :mod:`tricor.g3`, generalised to a spatially varying
+rescale pins it to 1.  This mirrors atomode's own far-field amplitude
+normalisation in :mod:`atomode.g3`, generalised to a spatially varying
 weight.
 
 The ideal-gas g3 denominator factorises exactly into
 ``RR(r01)·RR(r02)·sin φ`` (independent random neighbours), so only the
 cheap pair envelope ``RR`` is built by Monte-Carlo — analytic in angle,
-matching tricor's reduced-g3 convention.  ``RR`` depends only on the
+matching atomode's reduced-g3 convention.  ``RR`` depends only on the
 window *shape* (``side``, ``sigma_z``) and the binning — not on its
 position or the structure — so it is cached and reused across every
 window and every cell (the key to cheap sliding-window training-pair
@@ -68,7 +68,7 @@ class LocalCorrelations:
     g3_slice
         ``(num_phi, num_r)`` integrated-g3 target: ``r01`` pinned to the
         nearest-neighbour band, integrated → a (angle, distance) map,
-        → 1 at large r.  Oriented like tricor's plot slice (phi rows).
+        → 1 at large r.  Oriented like atomode's plot slice (phi rows).
     nn_band
         ``(r_lo, r_hi)`` of the r01 integration band (Å).
     n_window
@@ -253,9 +253,9 @@ def local_correlations(
     atoms
         ASE ``Atoms`` in an orthorhombic, periodic cell.
     window
-        The :class:`~tricor.ptycho.weighting.WindowSpec`.
+        The :class:`~atomode.ptycho.weighting.WindowSpec`.
     r_max, r_step, phi_num_bins
-        Binning, matching tricor's g3 conventions.  ``r_max`` should not
+        Binning, matching atomode's g3 conventions.  ``r_max`` should not
         exceed ``window.side / 2``.  For a *local* window the angular
         statistics are sparse, so ``phi_num_bins`` defaults to 36 (5°);
         18 (10°) and 90 (2°) are also reasonable.  ``r_step`` of 0.1 Å is
@@ -274,7 +274,7 @@ def local_correlations(
     atom_scale
         Optional ``(N,)`` per-atom weight folded into the data histograms
         — typically the per-species scattering power from
-        :func:`tricor.ptycho.potential.scattering_power`, so the target
+        :func:`atomode.ptycho.potential.scattering_power`, so the target
         is the scattering-weighted g2 / g3 the potential encodes.  The
         random envelope stays geometric; the far-field rescale absorbs the
         overall scattering constant, so the result still → 1.
@@ -353,7 +353,7 @@ def local_correlations(
     rrr_band = rrr[band_mask].sum(axis=0)
     g3_slice = _kde(ddd_band, (sig_r, sig_phi)) / (_kde(rrr_band, (sig_r, sig_phi)) + _EPS)
     g3_slice = g3_slice * (float(rrr_band.sum()) / max(float(ddd_band.sum()), _EPS))
-    g3_slice = g3_slice.T  # -> (phi, r02), like tricor's plot slice
+    g3_slice = g3_slice.T  # -> (phi, r02), like atomode's plot slice
 
     return LocalCorrelations(
         r=r_centers,

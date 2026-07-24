@@ -13,7 +13,7 @@ The window is **isotropic** (a disk of radius ``side / 2``, zero in the
 four corners), so rotating the input image about the window centre leaves
 g2 / g3 unchanged — rotation is a free augmentation of the *input* only.
 The matching asymptote-to-1 normalisation lives in
-:mod:`tricor.ptycho.correlations`.
+:mod:`atomode.ptycho.correlations`.
 
 Windows are assumed to lie fully inside the (orthorhombic, periodic)
 cell — the draggable widget and the sliding-window sampler both keep the
@@ -180,7 +180,7 @@ def window_weights(
     atom_scale
         Optional ``(N,)`` per-atom multiplier — e.g. the per-species
         scattering power from
-        :func:`tricor.ptycho.potential.scattering_power`, so the weighted
+        :func:`atomode.ptycho.potential.scattering_power`, so the weighted
         g2 / g3 matches the scattering-weighted potential.  ``None``
         gives an unweighted (count) window.
 

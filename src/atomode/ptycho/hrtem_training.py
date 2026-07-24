@@ -95,7 +95,7 @@ def sliding_window_pairs_hrtem(
     Parameters
     ----------
     stack
-        An :class:`~tricor.ptycho.hrtem.ExitWaveStack` (one multislice pass).
+        An :class:`~atomode.ptycho.hrtem.ExitWaveStack` (one multislice pass).
     atoms
         The structure the stack was propagated through.
     pair_peak

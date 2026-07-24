@@ -1,7 +1,7 @@
 """Voronoi grain construction mixin for Supercell.
 
 This module ports the 3D Voronoi tiling algorithm from
-``tests/tiling3d.py`` into tricor's grain construction.  The key
+``tests/tiling3d.py`` into atomode's grain construction.  The key
 properties of the algorithm:
 
 - **Exact geometric Voronoi** via ``scipy.spatial.Voronoi`` on a 3 x 3 x 3
@@ -257,7 +257,7 @@ def _push_close_pairs_apart(
         return positions
     positions = np.asarray(positions, dtype=np.float64).copy()
     cell_mat = np.asarray(cell_mat, dtype=np.float64)
-    # cKDTree's PBC support needs an orthorhombic boxsize.  All tricor
+    # cKDTree's PBC support needs an orthorhombic boxsize.  All atomode
     # supercells are orthorhombic by construction, so the diagonal of
     # cell_mat is the box.  Fall back to non-PBC if any pbc=False (rare).
     box = np.diag(cell_mat).astype(np.float64)

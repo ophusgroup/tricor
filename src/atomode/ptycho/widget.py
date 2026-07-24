@@ -88,7 +88,7 @@ class PtychoExplorer(anywidget.AnyWidget):
         """Parameters
         ----------
         stack
-            A (blurred) :class:`~tricor.ptycho.potential.PotentialStack`.
+            A (blurred) :class:`~atomode.ptycho.potential.PotentialStack`.
         atoms
             The same ASE structure the stack was built from.
         pair_peak

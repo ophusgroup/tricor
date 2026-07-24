@@ -17,19 +17,19 @@ import time
 import numpy as np
 import pytest
 
-import tricor as tc
-from tricor.shells import CoordinationShellTarget
+import atomode as tc
+from atomode.shells import CoordinationShellTarget
 
 
 HAS_NUMBA = False
 try:
-    from tricor._g3_numba import HAS_NUMBA  # type: ignore
+    from atomode._g3_numba import HAS_NUMBA  # type: ignore
 except ImportError:
     pass
 
 
 pytestmark = pytest.mark.skipif(
-    not HAS_NUMBA, reason="numba not installed; install via tricor[fast]"
+    not HAS_NUMBA, reason="numba not installed; install via atomode[fast]"
 )
 
 
@@ -143,7 +143,7 @@ def test_default_backend_is_auto():
     available.  Verify by introspecting the signature."""
     import inspect
 
-    from tricor.g3 import G3Distribution
+    from atomode.g3 import G3Distribution
 
     sig = inspect.signature(G3Distribution.measure_g3)
     assert sig.parameters["backend"].default == "auto"

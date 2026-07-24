@@ -202,7 +202,7 @@ def run_g3_numba(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run the numba-parallel accumulation and return new output arrays."""
     if not HAS_NUMBA:  # pragma: no cover
-        raise RuntimeError("numba is not available; install tricor[fast].")
+        raise RuntimeError("numba is not available; install atomode[fast].")
 
     tile_packed, tile_starts = pack_tile_by_species(
         tile_xyz, tile_species, species,

@@ -18,7 +18,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from tricor.shells import CoordinationShellTarget
+from atomode.shells import CoordinationShellTarget
 
 
 def test_single_species_unchanged_si(atoms_si):

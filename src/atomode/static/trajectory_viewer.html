@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
-<title>tricor trajectory viewer</title>
+<title>atomode trajectory viewer</title>
 <style>
   html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; color: #333; }
   #container { display: grid; grid-template-rows: auto 1fr auto; height: 100vh; background: #f7f8f5; }
@@ -85,7 +85,7 @@
   </div>
 </div>
 <script>
-const DATA = __TRICOR_DATA_PLACEHOLDER__;
+const DATA = __ATOMODE_DATA_PLACEHOLDER__;
 
 document.getElementById("title").textContent = DATA.title || "";
 document.getElementById("container").style.background = DATA.background_color;

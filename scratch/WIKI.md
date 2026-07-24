@@ -1,10 +1,10 @@
-# tricor — Working Knowledge
+# atomode — Working Knowledge
 
 A compressed handover document. Captures the conceptual model, the
 gotchas, the fixes shipped, and the numbers worth knowing. Read this
-before touching anything in `src/tricor/` or `tricor-docs/scripts/`.
+before touching anything in `src/atomode/` or `atomode-docs/scripts/`.
 
-## What tricor does
+## What atomode does
 
 Builds **periodic atomic supercells** with controllable disorder,
 from a single reference crystal (CIF / ASE Atoms) up to a target box
@@ -180,7 +180,7 @@ rm -rf docs/_build && sphinx-build -b html docs docs/_build/html
 ## File map
 
 ```
-src/tricor/
+src/atomode/
 ├── __init__.py         exports
 ├── shells.py           CoordinationShellTarget (auto-filter lives here)
 ├── supercell.py        Supercell class, generate() orchestrator
@@ -208,7 +208,7 @@ tests/
 ```
 
 ```
-tricor-docs/
+atomode-docs/
 ├── docs/                 Sphinx source (algorithms/, examples/, etc.)
 ├── docs/_static/         pre-built HTML artefacts (iframes load these)
 └── scripts/              regen scripts (see scripts/README.md)
@@ -258,8 +258,8 @@ Benchmark (40 Å production cells):
 `measure_g3(backend="auto" | "numba" | "python")`. JIT compile is
 ~1–2 s on first call; cached for subsequent calls in the same process.
 
-As of `tricor 0.1.1`, **numba is a hard dependency** (no more `[fast]`
-extra). `pip install tricor` is the only command needed.
+As of `atomode 0.1.1`, **numba is a hard dependency** (no more `[fast]`
+extra). `pip install atomode` is the only command needed.
 
 ## Performance numbers (where the wallclock goes)
 
@@ -299,7 +299,7 @@ python scripts/regen_static_full.py --material silicon_dioxide --regime medium_r
 
 # Verify numba bit-identical to python for any cell
 python -c "
-import tricor as tc
+import atomode as tc
 from ase.build import bulk
 shell = tc.CoordinationShellTarget.from_atoms(bulk('Si','diamond',a=5.431))
 cell = tc.Supercell.from_atoms(bulk('Si','diamond',a=5.431),cell_dim_angstroms=(20,20,20),r_max=6,r_step=0.1,phi_num_bins=24,rng_seed=42)
@@ -310,7 +310,7 @@ import numpy as np; print('match:', np.array_equal(a, b))
 "
 
 # Force-copy regen artefacts into Sphinx build dir
-rsync -a tricor-docs/docs/_static/ tricor-docs/docs/_build/html/_static/
+rsync -a atomode-docs/docs/_static/ atomode-docs/docs/_build/html/_static/
 ```
 
 ## Open improvements that didn't ship this session
@@ -320,7 +320,7 @@ rsync -a tricor-docs/docs/_static/ tricor-docs/docs/_build/html/_static/
 | 1 | Per-pair `bond_weight` / `hard_core_scale` (currently global scalars) | small API change |
 | 2 | Auto-detect multi-modal angles (subsume SrTiO₃ whitelist) | heuristic in `shells.py` |
 | 3 | Per-pair `nonbond_push_scale` | matches #1 |
-| 4 | `CHANGELOG.md` for `tricor` repo | trivial, important for users upgrading |
+| 4 | `CHANGELOG.md` for `atomode` repo | trivial, important for users upgrading |
 | 5 | Trusted publishing via GitHub Actions (no API token) | one yaml file |
 | 6 | Reference experimental g(r) overlay for liquid/amorphous | docs only |
 | 7 | ML acceleration for 100×100×500 Å cells | see ML section below |
@@ -328,21 +328,21 @@ rsync -a tricor-docs/docs/_static/ tricor-docs/docs/_build/html/_static/
 
 ---
 
-# ML acceleration (`src/tricor/ml/`) — shipped 2026-05
+# ML acceleration (`src/atomode/ml/`) — shipped 2026-05
 
 EGNN-based ML backend for `Supercell.generate`, plus four end-to-end
-demo notebooks at `/Users/cophus/Library/CloudStorage/Dropbox/python/tricor/demos/`.
+demo notebooks at `/Users/cophus/Library/CloudStorage/Dropbox/python/atomode/demos/`.
 Goal: 200³ Å cells (≈ 600 k atoms) in ~1 min with no unphysical
 overlaps.  **Goal met.**
 
 ## Module layout
 
 ```
-src/tricor/ml/
+src/atomode/ml/
 ├── __init__.py        public API (EGNN, load_model, predict_*)
 ├── egnn.py            EGNN layer + model (~250 lines, equivariant)
-├── dataset.py         TricorMLDataset (one-shot) +
-│                      TricorMLStepDataset (step-pair) + cell-list PBC graph
+├── dataset.py         AtomodeMLDataset (one-shot) +
+│                      AtomodeMLStepDataset (step-pair) + cell-list PBC graph
 ├── inference.py       load_model, predict_positions, predict_iteratively,
 │                      _enforce_hard_core, predict_and_optionally_relax
 └── train.py           train loop, validate, MSE-on-displacement loss
@@ -365,7 +365,7 @@ NB 03 trains the step-pair EGNN (production) and (optionally, in a
 bonus benchmark cell at the end) a one-shot EGNN to demonstrate the
 failure mode that motivated the projection trick.  Both cache to
 `demos/scratch/` (relative path).  Repo `.gitignore` blocks `*.pt`,
-`*.h5`, `*.history.json`, `scratch/`, `src/tricor/ml/data/`.
+`*.h5`, `*.history.json`, `scratch/`, `src/atomode/ml/data/`.
 
 ## Key algorithmic finding: iterative ML + repulsion projection
 
@@ -397,7 +397,7 @@ Measured: amorphous 65 s · MRO 57 s · NC 55 s.  All three regimes:
 `sub_NN = 0`, `min_pair_distance > 1.25 Å` (well above SiO₂'s
 1.6 Å Si-O target).
 
-## Step-pair training (`TricorMLStepDataset`)
+## Step-pair training (`AtomodeMLStepDataset`)
 
 Trained on (x_t, x_{t+1}) pairs sampled at stride=1 from sub-sampled
 FIRE trajectories (32 frames/cell × 36 cells = 1116 samples).  Same

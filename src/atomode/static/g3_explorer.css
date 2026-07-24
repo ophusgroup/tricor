@@ -1,10 +1,10 @@
-.tricor-compare-widget {
+.atomode-widget {
   display: grid;
-  grid-template-rows: auto minmax(210px, 1fr) minmax(210px, 1fr) minmax(185px, 0.8fr);
-  width: 860px;
-  height: 860px;
-  min-width: 720px;
-  min-height: 740px;
+  grid-template-rows: auto minmax(220px, 1.15fr) minmax(150px, 0.78fr);
+  width: 920px;
+  height: 560px;
+  min-width: 760px;
+  min-height: 470px;
   color: #1e2933;
   background: linear-gradient(180deg, #f7f8f5 0%, #eef2ea 100%);
   border: 1px solid #d0d8cf;
@@ -13,24 +13,24 @@
   box-shadow: 0 10px 28px rgba(25, 44, 34, 0.08);
   resize: both;
   overflow: auto;
-  gap: 10px;
 }
 
-.tricor-compare-controls {
+.atomode-controls {
   display: flex;
   flex-wrap: wrap;
   gap: 10px 14px;
   align-items: center;
+  margin-bottom: 10px;
 }
 
-.tricor-compare-smoothing {
+.atomode-smoothing {
   display: flex;
   flex-wrap: nowrap;
   gap: 10px;
   align-items: center;
 }
 
-.tricor-compare-number {
+.atomode-number {
   display: inline-flex;
   flex-direction: row;
   align-items: center;
@@ -41,7 +41,7 @@
   font: 600 12px/1.2 ui-sans-serif, system-ui, sans-serif;
 }
 
-.tricor-compare-number input {
+.atomode-number input {
   width: 74px;
   height: 38px;
   min-height: 38px;
@@ -54,14 +54,14 @@
   padding: 6px 10px;
 }
 
-.tricor-compare-number input:focus,
-.tricor-compare-select:focus {
+.atomode-number input:focus,
+.atomode-select:focus {
   outline: none;
   border-color: #5c8c86;
   box-shadow: 0 0 0 3px rgba(92, 140, 134, 0.14);
 }
 
-.tricor-compare-select {
+.atomode-select {
   min-width: 220px;
   height: 38px;
   box-sizing: border-box;
@@ -74,7 +74,7 @@
   padding: 6px 12px;
 }
 
-.tricor-compare-toggle {
+.atomode-toggle {
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -83,14 +83,14 @@
   margin-left: auto;
 }
 
-.tricor-compare-status {
+.atomode-status {
   width: 100%;
   font: 600 13px/1.3 ui-sans-serif, system-ui, sans-serif;
   color: #38545d;
 }
 
-.tricor-compare-heatmap,
-.tricor-compare-profile {
+.atomode-heatmap,
+.atomode-profile {
   display: block;
   width: 100%;
   height: 100%;
@@ -99,93 +99,82 @@
   background: rgba(255, 255, 255, 0.58);
 }
 
-.compare-panel-bg {
+.atomode-heatmap {
+  margin-bottom: 8px;
+}
+
+.panel-bg {
   fill: transparent;
 }
 
-.compare-panel-title {
+.panel-title {
   fill: #162134;
   font: 600 15px ui-sans-serif, system-ui, sans-serif;
 }
 
-.compare-plot-frame {
+.plot-frame {
   fill: none;
   stroke: #405968;
   stroke-width: 1;
 }
 
-.compare-super-line {
+.profile-line {
   fill: none;
   stroke: #1b6370;
-  stroke-width: 2.3;
+  stroke-width: 2;
   vector-effect: non-scaling-stroke;
 }
 
-.compare-target-line {
-  fill: none;
-  stroke: #b35b1f;
-  stroke-width: 2.3;
-  vector-effect: non-scaling-stroke;
-}
-
-.compare-selection-area {
+.selection-area {
   fill: rgba(239, 148, 72, 0.18);
 }
 
-.compare-selection-handle {
+.selection-handle {
   stroke: #cf6c29;
   stroke-width: 2;
   vector-effect: non-scaling-stroke;
 }
 
-.compare-selection-handle.dragging {
+.selection-handle.dragging {
   stroke: #a33c10;
   stroke-width: 3;
 }
 
-.compare-axis-label,
-.compare-tick-label,
-.compare-legend-label {
+.axis-label,
+.tick-label {
   fill: #2d3c4f;
   font: 12px ui-sans-serif, system-ui, sans-serif;
 }
 
-.compare-tick-label {
+.tick-label {
   font-size: 11px;
 }
 
-.compare-ideal-line {
+.ideal-line {
   stroke: #7a8a93;
   stroke-width: 1.5;
   stroke-dasharray: 6 5;
   vector-effect: non-scaling-stroke;
 }
 
-.compare-ideal-label {
+.ideal-label {
   fill: #596a73;
   font: 11px ui-sans-serif, system-ui, sans-serif;
 }
 
-.compare-axis-tick {
+.axis-label-y {
+  transform-box: fill-box;
+  transform-origin: center;
+  transform: rotate(-90deg);
+}
+
+.axis-tick {
   stroke: #51636c;
   stroke-width: 1;
   vector-effect: non-scaling-stroke;
 }
 
-.compare-legend-swatch {
-  stroke-width: 2.5;
-  vector-effect: non-scaling-stroke;
-}
-
-.compare-target-swatch {
-  stroke: #b35b1f;
-}
-
-.compare-super-swatch {
-  stroke: #1b6370;
-}
-
-.compare-drag-overlay {
+.drag-overlay {
   fill: transparent;
   cursor: ew-resize;
 }

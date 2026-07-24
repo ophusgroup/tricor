@@ -105,7 +105,7 @@ def sliding_window_pairs(
     Parameters
     ----------
     potential_blurred
-        A blurred :class:`~tricor.ptycho.potential.PotentialStack`.
+        A blurred :class:`~atomode.ptycho.potential.PotentialStack`.
     atoms
         The structure the stack was built from.
     pair_peak

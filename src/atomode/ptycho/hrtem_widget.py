@@ -1,7 +1,7 @@
 """Interactive explorer tying an HRTEM frame to the local g2 / g3 block target.
 
 ``HRTEMExplorer`` is an :mod:`anywidget` widget over a propagated
-:class:`~tricor.ptycho.hrtem.ExitWaveStack`:
+:class:`~atomode.ptycho.hrtem.ExitWaveStack`:
 
 * **left** — the HRTEM intensity frame for the current thickness / defocus,
   a draggable circular window, and thickness / defocus / rotation sliders;
@@ -101,7 +101,7 @@ class HRTEMExplorer(anywidget.AnyWidget):
         """Parameters
         ----------
         stack
-            A propagated :class:`~tricor.ptycho.hrtem.ExitWaveStack`.
+            A propagated :class:`~atomode.ptycho.hrtem.ExitWaveStack`.
         atoms
             The structure the stack was propagated through.
         pair_peak

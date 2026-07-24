@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "tricor"
+name = "atomode"
 version = "0.1.1"
 description = "Generate disordered-to-nanocrystalline atomic supercells guided by three-body (g3) distributions."
 readme = "README.md"
@@ -47,16 +47,16 @@ dependencies = [
     # the ``thermal_relax`` / orientation-refinement code paths.
     # The pure-numpy fallback in ``_g3_numba.py`` is still maintained
     # for development and as a runtime safety net, but a fresh
-    # ``pip install tricor`` always pulls numba so the default
+    # ``pip install atomode`` always pulls numba so the default
     # user experience is the fast one.
     "numba>=0.58",
 ]
 
 [project.urls]
-Homepage = "https://github.com/ophusgroup/tricor"
-Documentation = "https://tricor.readthedocs.io"
-Repository = "https://github.com/ophusgroup/tricor"
-Issues = "https://github.com/ophusgroup/tricor/issues"
+Homepage = "https://github.com/ophusgroup/atomode"
+Documentation = "https://ophusgroup.github.io/atomode-docs"
+Repository = "https://github.com/ophusgroup/atomode"
+Issues = "https://github.com/ophusgroup/atomode/issues"
 
 [project.optional-dependencies]
 test = [
@@ -80,13 +80,13 @@ testpaths = ["tests"]
 addopts = ["-v", "--tb=short"]
 
 [tool.hatch.build.targets.wheel]
-# ``packages`` picks up every file under ``src/tricor/`` — Python
-# modules AND the JS/CSS/HTML widget assets in ``src/tricor/static/``.
-packages = ["src/tricor"]
+# ``packages`` picks up every file under ``src/atomode/`` — Python
+# modules AND the JS/CSS/HTML widget assets in ``src/atomode/static/``.
+packages = ["src/atomode"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "src/tricor",
+    "src/atomode",
     "tests",
     "README.md",
     "LICENSE",

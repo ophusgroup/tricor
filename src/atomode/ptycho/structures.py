@@ -50,7 +50,7 @@ def graded_supercell(
     reference
         Reference crystal (ASE ``Atoms``).
     shell
-        :class:`~tricor.CoordinationShellTarget` for ``reference``.
+        :class:`~atomode.CoordinationShellTarget` for ``reference``.
     cell_dim
         Box ``(Lx, Ly, Lz)`` in Å.
     axis
@@ -65,7 +65,7 @@ def graded_supercell(
         seed density linearly (size change concentrated at the sparse
         end).
     num_steps, displacement_sigma, weights, r_max, r_step, phi_num_bins
-        :meth:`~tricor.Supercell.generate` settings for the single
+        :meth:`~atomode.Supercell.generate` settings for the single
         relaxation.
     max_seeds
         Upper bound on the number of seeds (caps the dense end's cost
@@ -76,7 +76,7 @@ def graded_supercell(
     ase.Atoms
         The graded cell (orthorhombic, periodic).
     """
-    import tricor as tc
+    import atomode as tc
 
     box = np.array([float(v) for v in cell_dim], dtype=np.float64)
     v_box = float(np.prod(box))

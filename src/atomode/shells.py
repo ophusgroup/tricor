@@ -169,7 +169,7 @@ class CoordinationShellTarget:
         ``mace_calibration``.
 
         Requires the optional ``mace-torch`` dependency.  See
-        :func:`tricor._mace_calibrate.calibrate_to_mace` for the
+        :func:`atomode._mace_calibrate.calibrate_to_mace` for the
         keyword arguments.
         """
         from ._mace_calibrate import calibrate_to_mace as _calibrate
@@ -262,7 +262,7 @@ class CoordinationShellTarget:
         Examples
         --------
         >>> from ase.build import bulk
-        >>> import tricor as tc
+        >>> import atomode as tc
         >>> atoms = bulk("Si", "diamond", a=5.431)
         >>> shell = tc.CoordinationShellTarget.from_atoms(atoms,
         ...                                                phi_num_bins=90)

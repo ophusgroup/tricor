@@ -14,9 +14,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-import tricor as tc
-from tricor.shells import CoordinationShellTarget
-from tricor._shell_relax import _ShellRelaxMixin
+import atomode as tc
+from atomode.shells import CoordinationShellTarget
+from atomode._shell_relax import _ShellRelaxMixin
 
 
 def test_freeze_grain_interiors_default_is_off():

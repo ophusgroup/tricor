@@ -1,17 +1,17 @@
-"""Pseudo-ptychography → local-structure training data for tricor.
+"""Pseudo-ptychography → local-structure training data for atomode.
 
 Build (input, target) pairs for learning local g2 / g3 from
 ptychographic reconstructions:
 
 * **target** — window-weighted, asymptote-to-1 g2 / g3 measured directly
-  from the atomic structure (:mod:`tricor.ptycho.correlations`), over a
+  from the atomic structure (:mod:`atomode.ptycho.correlations`), over a
   soft circular-Hann (xy) + Gaussian (z) window
-  (:mod:`tricor.ptycho.weighting`).
+  (:mod:`atomode.ptycho.weighting`).
 * **input** — a blurred, depth-resolved projected potential in radians
-  (:mod:`tricor.ptycho.potential`, requires the optional ``abtem``
+  (:mod:`atomode.ptycho.potential`, requires the optional ``abtem``
   dependency — install with ``pip install -e '.[training]'``).
 
-An :func:`~tricor.ptycho.widget.PtychoExplorer` anywidget ties the two
+An :func:`~atomode.ptycho.widget.PtychoExplorer` anywidget ties the two
 together for interactive inspection.
 
 ``correlations`` and ``weighting`` have no heavy dependencies; ``abtem``
@@ -45,7 +45,7 @@ __all__ = [
 
 def __getattr__(name: str):
     # Lazy access to the abtem-backed and widget modules so that
-    # ``import tricor.ptycho`` stays light and abtem-free.
+    # ``import atomode.ptycho`` stays light and abtem-free.
     if name in ("potential_stack", "PotentialStack", "blur_stack", "scattering_power"):
         from . import potential
 

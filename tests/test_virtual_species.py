@@ -16,8 +16,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-import tricor as tc
-from tricor.shells import CoordinationShellTarget
+import atomode as tc
+from atomode.shells import CoordinationShellTarget
 
 
 def _build_carbon_sp_cell(atoms_graphite, atoms_diamond, w_graphite, w_diamond):

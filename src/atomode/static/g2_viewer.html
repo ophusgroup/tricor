@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
-<title>tricor g2 viewer</title>
+<title>atomode g2 viewer</title>
 <style>
   html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; color: #333; }
   #container { display: grid; grid-template-rows: auto 1fr auto; height: 100vh; background: #f7f8f5; }
@@ -18,7 +18,7 @@
     flex-wrap: wrap;
   }
   select { font: inherit; padding: 3px 6px; border-radius: 4px; border: 1px solid rgba(0,0,0,0.2); background: #fff; }
-  .tricor-checkbox-row { display: flex; align-items: center; gap: 6px; }
+  .atomode-checkbox-row { display: flex; align-items: center; gap: 6px; }
   #controls label { display: flex; align-items: center; gap: 6px; }
 </style>
 </head>
@@ -30,7 +30,7 @@
     <label>pair
       <select id="pair-select"></select>
     </label>
-    <label class="tricor-checkbox-row">
+    <label class="atomode-checkbox-row">
       <input type="checkbox" id="overlay-all"/>
       overlay all pairs
     </label>
@@ -38,7 +38,7 @@
   </div>
 </div>
 <script>
-const DATA = __TRICOR_DATA_PLACEHOLDER__;
+const DATA = __ATOMODE_DATA_PLACEHOLDER__;
 
 document.getElementById("title").textContent = DATA.title || "";
 document.getElementById("container").style.background = DATA.background_color || "#f7f8f5";

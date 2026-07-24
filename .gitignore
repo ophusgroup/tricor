@@ -9,7 +9,7 @@ dist/
 
 .claude/worktrees/
 
-src/tricor/.DS_Store
+src/atomode/.DS_Store
 
 .DS_Store
 docs/_build/

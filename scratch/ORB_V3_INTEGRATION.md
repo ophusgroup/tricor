@@ -1,7 +1,7 @@
 # Adding ORB-v3 as an alternative to MACE-MP0 — feasibility notes
 
 **Date:** 2026-06-19. **Status: investigated, deferred (not started).**
-Goal when revived: let tricor relax / calibrate against ORB-v3
+Goal when revived: let atomode relax / calibrate against ORB-v3
 (Orbital Materials) as a drop-in alternative to MACE-MP0, primarily to
 **benchmark speed** (ORB and MACE-MPA-0 are ~accuracy-equivalent).
 
@@ -13,7 +13,7 @@ arXiv:2504.06231. Code: https://github.com/orbital-materials/orb-models
 
 ## Verdict: easy. Physics code is untouched; only the calculator-construction sites change.
 
-Every MACE use in tricor goes through the **standard ASE interface**
+Every MACE use in atomode goes through the **standard ASE interface**
 (`atoms.calc`, `get_potential_energy()`, `get_forces()`). ORB-v3 ships
 exactly that (`ORBCalculator`). So the relaxation loops, the
 calibration math, and the soft-wall wrapper are all backend-agnostic
@@ -21,9 +21,9 @@ already. Only the spots that *build* the calculator are MACE-specific.
 
 ### MACE construction sites (the only things to change)
 
-1. **Library** — `src/tricor/_mace_calibrate.py::_load_mace()` (~L61-69),
+1. **Library** — `src/atomode/_mace_calibrate.py::_load_mace()` (~L61-69),
    called once at `calibrate_to_mace` (~L135). One-line `mace_mp(...)`.
-2. **Regen script** — `tricor-docs/scripts/regen_mace_examples.py::_load_mace_calc()`
+2. **Regen script** — `atomode-docs/scripts/regen_mace_examples.py::_load_mace_calc()`
    (~L277-291), module-level cached calc. Reused at L703 (wall), L754
    (per-stage SP), L768 (orient scoring).
 3. **Generated reproducers** — direct `mace_mp(...)` in each
@@ -36,7 +36,7 @@ already. Only the spots that *build* the calculator are MACE-specific.
   on `atoms.get_potential_energy()` / `get_forces()`.
 - Calibration (`_mace_calibrate.py`): FD-Hessian from forces + energy
   scans for Morse fit. Uses only energy/forces, no MACE internals.
-- Soft wall (`tricor-docs/scripts/_wall_calculator.py::MinDistanceWallCalculator`):
+- Soft wall (`atomode-docs/scripts/_wall_calculator.py::MinDistanceWallCalculator`):
   generic ASE wrapper around `base_calc` — works with any calculator.
 - `mace-torch` is an **optional** dep (guarded import, helpful error).
   Add `orb-models` the same way.
@@ -72,7 +72,7 @@ calc = ORBCalculator(orbff, atoms_adapter=adapter, device="cpu")
 
 ## Three caveats that matter for the speed test
 
-**1. The 10× is a GPU story; tricor runs MACE on CPU.** All paper
+**1. The 10× is a GPU story; atomode runs MACE on CPU.** All paper
 numbers are NVIDIA H200. At 1k atoms (Table 1, steps/s):
 
 | model | steps/s | vs MACE |

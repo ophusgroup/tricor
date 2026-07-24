@@ -360,20 +360,20 @@ function drawPairCompare(svg, superProfile, targetProfile, rValues, rEdges, sele
 
 function render({ model, el }) {
   const root = document.createElement("div");
-  root.className = "tricor-compare-widget";
+  root.className = "atomode-compare-widget";
 
   const controls = document.createElement("div");
-  controls.className = "tricor-compare-controls";
+  controls.className = "atomode-compare-controls";
 
   const select = document.createElement("select");
-  select.className = "tricor-compare-select";
+  select.className = "atomode-compare-select";
   controls.appendChild(select);
 
   const sigmaControls = document.createElement("div");
-  sigmaControls.className = "tricor-compare-smoothing";
+  sigmaControls.className = "atomode-compare-smoothing";
 
   const sigmaRLabel = document.createElement("label");
-  sigmaRLabel.className = "tricor-compare-number";
+  sigmaRLabel.className = "atomode-compare-number";
   const sigmaRText = document.createElement("span");
   sigmaRText.textContent = "sigma_r";
   const sigmaRInput = document.createElement("input");
@@ -385,7 +385,7 @@ function render({ model, el }) {
   sigmaControls.appendChild(sigmaRLabel);
 
   const sigmaPhiLabel = document.createElement("label");
-  sigmaPhiLabel.className = "tricor-compare-number";
+  sigmaPhiLabel.className = "atomode-compare-number";
   const sigmaPhiText = document.createElement("span");
   sigmaPhiText.textContent = "sigma_phi";
   const sigmaPhiInput = document.createElement("input");
@@ -397,7 +397,7 @@ function render({ model, el }) {
   sigmaControls.appendChild(sigmaPhiLabel);
 
   const sliceMaxLabel = document.createElement("label");
-  sliceMaxLabel.className = "tricor-compare-number";
+  sliceMaxLabel.className = "atomode-compare-number";
   const sliceMaxText = document.createElement("span");
   sliceMaxText.textContent = "slice max";
   const sliceMaxInput = document.createElement("input");
@@ -412,7 +412,7 @@ function render({ model, el }) {
   controls.appendChild(sigmaControls);
 
   const toggleLabel = document.createElement("label");
-  toggleLabel.className = "tricor-compare-toggle";
+  toggleLabel.className = "atomode-compare-toggle";
   const checkbox = document.createElement("input");
   checkbox.type = "checkbox";
   toggleLabel.appendChild(checkbox);
@@ -422,7 +422,7 @@ function render({ model, el }) {
   controls.appendChild(toggleLabel);
 
   const autoShellLabel = document.createElement("label");
-  autoShellLabel.className = "tricor-compare-toggle";
+  autoShellLabel.className = "atomode-compare-toggle";
   const autoShellCb = document.createElement("input");
   autoShellCb.type = "checkbox";
   autoShellCb.checked = !!model.get("auto_shell");
@@ -437,16 +437,16 @@ function render({ model, el }) {
   });
 
   const status = document.createElement("div");
-  status.className = "tricor-compare-status";
+  status.className = "atomode-compare-status";
   controls.appendChild(status);
 
   const targetPanel = document.createElement("canvas");
-  targetPanel.className = "tricor-compare-heatmap";
+  targetPanel.className = "atomode-compare-heatmap";
   const supercellPanel = document.createElement("canvas");
-  supercellPanel.className = "tricor-compare-heatmap";
+  supercellPanel.className = "atomode-compare-heatmap";
 
   const bottomPanel = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  bottomPanel.classList.add("tricor-compare-profile");
+  bottomPanel.classList.add("atomode-compare-profile");
   bottomPanel.setAttribute("preserveAspectRatio", "xMinYMin meet");
 
   root.appendChild(controls);

@@ -2,7 +2,7 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
-// matplotlib RdBu_r — same stops as src/tricor/static/g3_viewer.html so
+// matplotlib RdBu_r — same stops as src/atomode/static/g3_viewer.html so
 // the in-notebook widget matches the docs-site g3 viewer.
 const RDBU_R_STOPS = [
   [0.000, [  5,  48,  97]],
@@ -151,7 +151,7 @@ function drawHeatmap(canvas, imageValues, shape, rEdges, phiEdgesDeg, title, nor
   const finiteValues = imageValues.filter((value) => Number.isFinite(value));
   // autoVmax: 99.5th-percentile, floor at 1.5 (so the white midpoint at
   // 1.0 always sits inside the visible range), then snap to a "nice"
-  // round number — matches src/tricor/static/g3_viewer.html so the
+  // round number — matches src/atomode/static/g3_viewer.html so the
   // notebook widget renders the same scale as the docs-site g3 viewer.
   const autoVmax = niceRoundUp(Math.max(
     percentile(finiteValues, 0.995) || 1,
@@ -369,20 +369,20 @@ function drawPairProfile(svg, profile, rValues, rEdges, selection, dragging) {
 
 function render({ model, el }) {
   const root = document.createElement("div");
-  root.className = "tricor-widget";
+  root.className = "atomode-widget";
 
   const controls = document.createElement("div");
-  controls.className = "tricor-controls";
+  controls.className = "atomode-controls";
 
   const select = document.createElement("select");
-  select.className = "tricor-select";
+  select.className = "atomode-select";
   controls.appendChild(select);
 
   const sigmaControls = document.createElement("div");
-  sigmaControls.className = "tricor-smoothing";
+  sigmaControls.className = "atomode-smoothing";
 
   const sigmaRLabel = document.createElement("label");
-  sigmaRLabel.className = "tricor-number";
+  sigmaRLabel.className = "atomode-number";
   const sigmaRText = document.createElement("span");
   sigmaRText.textContent = "sigma_r";
   const sigmaRInput = document.createElement("input");
@@ -394,7 +394,7 @@ function render({ model, el }) {
   sigmaControls.appendChild(sigmaRLabel);
 
   const sigmaPhiLabel = document.createElement("label");
-  sigmaPhiLabel.className = "tricor-number";
+  sigmaPhiLabel.className = "atomode-number";
   const sigmaPhiText = document.createElement("span");
   sigmaPhiText.textContent = "sigma_phi";
   const sigmaPhiInput = document.createElement("input");
@@ -406,7 +406,7 @@ function render({ model, el }) {
   sigmaControls.appendChild(sigmaPhiLabel);
 
   const sliceMaxLabel = document.createElement("label");
-  sliceMaxLabel.className = "tricor-number";
+  sliceMaxLabel.className = "atomode-number";
   const sliceMaxText = document.createElement("span");
   sliceMaxText.textContent = "slice max";
   const sliceMaxInput = document.createElement("input");
@@ -421,7 +421,7 @@ function render({ model, el }) {
   controls.appendChild(sigmaControls);
 
   const toggleLabel = document.createElement("label");
-  toggleLabel.className = "tricor-toggle";
+  toggleLabel.className = "atomode-toggle";
   const checkbox = document.createElement("input");
   checkbox.type = "checkbox";
   toggleLabel.appendChild(checkbox);
@@ -431,7 +431,7 @@ function render({ model, el }) {
   controls.appendChild(toggleLabel);
 
   const autoShellLabel = document.createElement("label");
-  autoShellLabel.className = "tricor-toggle";
+  autoShellLabel.className = "atomode-toggle";
   const autoShellCb = document.createElement("input");
   autoShellCb.type = "checkbox";
   autoShellCb.checked = !!model.get("auto_shell");
@@ -446,13 +446,13 @@ function render({ model, el }) {
   });
 
   const status = document.createElement("div");
-  status.className = "tricor-status";
+  status.className = "atomode-status";
   controls.appendChild(status);
 
   const topPanel = document.createElement("canvas");
-  topPanel.className = "tricor-heatmap";
+  topPanel.className = "atomode-heatmap";
   const bottomPanel = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  bottomPanel.classList.add("tricor-profile");
+  bottomPanel.classList.add("atomode-profile");
   bottomPanel.setAttribute("preserveAspectRatio", "xMinYMin meet");
 
   root.appendChild(controls);

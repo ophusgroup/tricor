@@ -860,7 +860,7 @@ class G3Distribution:
             elif backend == "numba":
                 raise RuntimeError(
                     "backend='numba' requested but numba is not installed; "
-                    "pip install tricor[fast]"
+                    "pip install atomode[fast]"
                 )
             # backend == "auto" and numba missing: fall through to numpy
 

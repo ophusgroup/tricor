@@ -8,7 +8,7 @@ coarse in depth (``sigma_z`` ≈ 10–40 Å, set by the probe depth of
 field).  Picking one depth slice ``z0`` from the depth-blurred stack is
 equivalent to weighting each atom's contribution by ``G(z - z0)`` with
 that same ``sigma_z`` — exactly the depth weight the matching g2 / g3
-target uses (:mod:`tricor.ptycho.correlations`).
+target uses (:mod:`atomode.ptycho.correlations`).
 
 Requires the optional ``abtem`` dependency (``pip install -e '.[training]'``).
 A realistic, non-Gaussian probe-CTF depth kernel is a planned follow-up;
@@ -87,7 +87,7 @@ def potential_stack(
     Parameters
     ----------
     atoms
-        ASE ``Atoms`` (orthorhombic, periodic) — typically a tricor
+        ASE ``Atoms`` (orthorhombic, periodic) — typically a atomode
         supercell, e.g. 50 × 50 × 200 Å.
     sampling
         Target in-plane pixel size (Å); abTEM rounds it to integer gpts.
@@ -152,7 +152,7 @@ def scattering_power(
     element and the abTEM ``parametrization``.
 
     Values are computed once per element via abTEM and cached to
-    ``tricor/ptycho/data/scattering_<parametrization>.json``.
+    ``atomode/ptycho/data/scattering_<parametrization>.json``.
 
     Parameters
     ----------

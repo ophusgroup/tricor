@@ -64,7 +64,7 @@ async function ensureThree() {
         "\n\nYour Jupyter environment likely can't reach a CDN. " +
         "Workarounds: (a) run Jupyter on a network with internet access, " +
         "(b) open the exported HTML files directly, or " +
-        "(c) file a tricor issue asking for a locally-bundled Three.js option.",
+        "(c) file a atomode issue asking for a locally-bundled Three.js option.",
     );
   }
   // Stable blob URL for Three.js that OrbitControls can reference.
@@ -124,15 +124,15 @@ async function render({ model, el }) {
 
   // -- container --
   const root = document.createElement("div");
-  root.classList.add("tricor-structure-widget");
+  root.classList.add("atomode-structure-widget");
   el.appendChild(root);
 
   const canvasWrap = document.createElement("div");
-  canvasWrap.classList.add("tricor-structure-canvas");
+  canvasWrap.classList.add("atomode-structure-canvas");
   root.appendChild(canvasWrap);
 
   const controlsPanel = document.createElement("div");
-  controlsPanel.classList.add("tricor-structure-controls");
+  controlsPanel.classList.add("atomode-structure-controls");
   root.appendChild(controlsPanel);
 
   // -- Three.js setup --
@@ -473,14 +473,14 @@ async function render({ model, el }) {
     const pairVis = model.get("bond_pair_visible");
     if (pairLabels.length > 0) {
       const pairDiv = document.createElement("div");
-      pairDiv.classList.add("tricor-control-group");
+      pairDiv.classList.add("atomode-control-group");
       const pairTitle = document.createElement("div");
-      pairTitle.classList.add("tricor-control-label");
+      pairTitle.classList.add("atomode-control-label");
       pairTitle.textContent = "Bond types";
       pairDiv.appendChild(pairTitle);
       pairLabels.forEach((label, idx) => {
         const row = document.createElement("label");
-        row.classList.add("tricor-checkbox-row");
+        row.classList.add("atomode-checkbox-row");
         const cb = document.createElement("input");
         cb.type = "checkbox";
         cb.checked = pairVis[idx];
@@ -608,9 +608,9 @@ async function render({ model, el }) {
   // -- UI helpers --
   function makeSliderGroup(label, min, max, value, step, onChange) {
     const group = document.createElement("div");
-    group.classList.add("tricor-control-group");
+    group.classList.add("atomode-control-group");
     const lbl = document.createElement("div");
-    lbl.classList.add("tricor-control-label");
+    lbl.classList.add("atomode-control-label");
     const valSpan = document.createElement("span");
     valSpan.textContent = value.toFixed(2);
     lbl.textContent = label + " ";
@@ -622,7 +622,7 @@ async function render({ model, el }) {
     slider.max = max;
     slider.step = step;
     slider.value = value;
-    slider.classList.add("tricor-slider");
+    slider.classList.add("atomode-slider");
     slider.addEventListener("input", () => {
       const v = parseFloat(slider.value);
       valSpan.textContent = v.toFixed(2);
@@ -634,24 +634,24 @@ async function render({ model, el }) {
 
   function makeDualSliderGroup(label, min, max, valueLo, valueHi, step, onChange) {
     const group = document.createElement("div");
-    group.classList.add("tricor-control-group");
+    group.classList.add("atomode-control-group");
     const lbl = document.createElement("div");
-    lbl.classList.add("tricor-control-label");
+    lbl.classList.add("atomode-control-label");
     lbl.textContent = label;
     group.appendChild(lbl);
 
     const loSlider = document.createElement("input");
     loSlider.type = "range"; loSlider.min = min; loSlider.max = max;
     loSlider.step = step; loSlider.value = valueLo;
-    loSlider.classList.add("tricor-slider", "tricor-slider-dual");
+    loSlider.classList.add("atomode-slider", "atomode-slider-dual");
 
     const hiSlider = document.createElement("input");
     hiSlider.type = "range"; hiSlider.min = min; hiSlider.max = max;
     hiSlider.step = step; hiSlider.value = valueHi;
-    hiSlider.classList.add("tricor-slider", "tricor-slider-dual");
+    hiSlider.classList.add("atomode-slider", "atomode-slider-dual");
 
     const valText = document.createElement("span");
-    valText.classList.add("tricor-dual-value");
+    valText.classList.add("atomode-dual-value");
     valText.textContent = `${valueLo.toFixed(2)} - ${valueHi.toFixed(2)}`;
 
     function update() {
@@ -671,9 +671,9 @@ async function render({ model, el }) {
 
   function makeCheckbox(label, checked, onChange) {
     const group = document.createElement("div");
-    group.classList.add("tricor-control-group");
+    group.classList.add("atomode-control-group");
     const lbl = document.createElement("label");
-    lbl.classList.add("tricor-checkbox-row");
+    lbl.classList.add("atomode-checkbox-row");
     const cb = document.createElement("input");
     cb.type = "checkbox";
     cb.checked = checked;

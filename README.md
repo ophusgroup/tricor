@@ -1,32 +1,32 @@
-# tricor
+# atomode
 
-[![Documentation Status](https://readthedocs.org/projects/tricor/badge/?version=latest)](https://tricor.readthedocs.io/en/latest/?badge=latest)
+[![Documentation Status](https://readthedocs.org/projects/atomode/badge/?version=latest)](https://ophusgroup.github.io/atomode-docs/en/latest/?badge=latest)
 
 Generate disordered atomic supercells guided by three-body (g3) distributions, spanning the full spectrum from liquid to nanocrystalline.
 
-**[Documentation](https://tricor.readthedocs.io)**
+**[Documentation](https://ophusgroup.github.io/atomode-docs)**
 
 ## Installation
 
 ```bash
-pip install tricor
+pip install atomode
 ```
 
 Or to install the development checkout:
 
 ```bash
-git clone https://github.com/ophusgroup/tricor
-cd tricor
+git clone https://github.com/ophusgroup/atomode
+cd atomode
 uv sync                # or: pip install -e '.[test]'
 ```
 
-`tricor` requires Python ≥ 3.10 and works on Linux, macOS, and Windows.
+`atomode` requires Python ≥ 3.10 and works on Linux, macOS, and Windows.
 
 ## Quick start - Si
 
 ```python
 from ase.build import bulk
-import tricor as tc
+import atomode as tc
 
 atoms = bulk('Si', 'diamond', a=5.431)
 shell_target = tc.CoordinationShellTarget.from_atoms(
@@ -140,10 +140,10 @@ All presets use `relative_density=0.96`. Abbreviations: `rep_wt` = `repulsion_we
 into a physically realistic structure. Three worked pipelines are
 documented, in order of accuracy:
 
-- **[MACE-MP0 refinement](https://tricor.readthedocs.io/en/latest/examples_mace/index.html)**
+- **[MACE-MP0 refinement](https://ophusgroup.github.io/atomode-docs/en/latest/examples_mace/index.html)**
   *(recommended)* — relax with a universal machine-learning potential
   for near-DFT accuracy; minutes per ~5000-atom cell on a laptop CPU.
-- **[Fast FIRE refinement](https://tricor.readthedocs.io/en/latest/examples_refined/index.html)**
+- **[Fast FIRE refinement](https://ophusgroup.github.io/atomode-docs/en/latest/examples_refined/index.html)**
   — the built-in spring-network FIRE quench (`refine_orientations=True`
   for the SO(3) grain alignment + the FIRE pass). Fastest, and the only
   option that stays practical at 100³ Å and larger, but less accurate

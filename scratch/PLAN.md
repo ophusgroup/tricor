@@ -6,12 +6,12 @@
 
 ## What landed
 
-### Code (`src/tricor/ml/`)
+### Code (`src/atomode/ml/`)
 
 - `egnn.py` — equivariant graph neural net (Satorras 2021), ~250 LOC, 23 k params at the default 32-hidden × 3-layer config used by all demos.
 - `dataset.py`
-  - `TricorMLDataset` — one-shot (voronoi, fire_pos) pairs.
-  - `TricorMLStepDataset` — (x_t, x_{t+stride}) trajectory pairs.
+  - `AtomodeMLDataset` — one-shot (voronoi, fire_pos) pairs.
+  - `AtomodeMLStepDataset` — (x_t, x_{t+stride}) trajectory pairs.
   - `build_pbc_graph_chunked` — cell-list PBC neighbour finder via `scipy.spatial.cKDTree`.  Falls back to chunked O(N²) when SciPy unavailable.
 - `inference.py`
   - `load_model` — auto-picks MPS/CUDA/CPU device.
@@ -21,7 +21,7 @@
   - `predict_and_optionally_relax` — wraps the above into `Supercell.generate`'s ML backend.
 - `train.py` — train + validate loops, MSE-on-displacement loss with min-image PBC correction (this fix was critical; see WIKI).
 
-### Supercell integration (`src/tricor/supercell.py`)
+### Supercell integration (`src/atomode/supercell.py`)
 
 `generate(backend='ml' | 'ml+fire', ml_model=…, …)` with new kwargs:
 - `ml_iterative_steps` — K, default 0 (one-shot mode)
@@ -34,11 +34,11 @@
 ### Tests
 
 - `tests/test_ml_smoke.py` — 7 tests (graph, EGNN forward, equivariance, collate, end-to-end backend='ml').  Always run.
-- `tests/test_ml_sio2.py` — 14 acceptance gate tests.  Skip when no `src/tricor/ml/data/sio2/checkpoint.pt` (gitignored — the file used to live there, now lives in `demos/scratch/checkpoint.pt`).  When you want to run the gates, copy the demo checkpoint into the legacy path or rewrite the test to point at the new location.
+- `tests/test_ml_sio2.py` — 14 acceptance gate tests.  Skip when no `src/atomode/ml/data/sio2/checkpoint.pt` (gitignored — the file used to live there, now lives in `demos/scratch/checkpoint.pt`).  When you want to run the gates, copy the demo checkpoint into the legacy path or rewrite the test to point at the new location.
 
 All 21 ML tests pass on the current branch.
 
-### Demo notebooks (`/Users/cophus/Library/CloudStorage/Dropbox/python/tricor/demos/`)
+### Demo notebooks (`/Users/cophus/Library/CloudStorage/Dropbox/python/atomode/demos/`)
 
 | nb | what | wallclock |
 |---|---|---|
@@ -46,7 +46,7 @@ All 21 ML tests pass on the current branch.
 | `02_refined_sio2_40A.ipynb` | refinement + FIRE | ≈ 10 min |
 | `03_ml_sio2_200A.ipynb` | iter ML + repulsion proj at 200³ + bonus one-shot comparison | ≈ 1 min/regime production path, +bonus failure-mode demo |
 
-All three use `./scratch/` (relative) for training data + checkpoints.  Repo `.gitignore` blocks `*.pt`, `*.h5`, `*.history.json`, `scratch/`, `src/tricor/ml/data/`.
+All three use `./scratch/` (relative) for training data + checkpoints.  Repo `.gitignore` blocks `*.pt`, `*.h5`, `*.history.json`, `scratch/`, `src/atomode/ml/data/`.
 
 ## Numbers worth knowing (SiO₂ amorphous at 200³ Å)
 
@@ -83,7 +83,7 @@ Pipeline is generic — extend to Si, C (sp²/sp³), Cu, SrTiO₃.  Need:
 
 ### 5. Acceptance-gate tests need a permanent home for the checkpoint
 
-`tests/test_ml_sio2.py` currently expects `src/tricor/ml/data/sio2/checkpoint.pt` (now gitignored).  Either:
+`tests/test_ml_sio2.py` currently expects `src/atomode/ml/data/sio2/checkpoint.pt` (now gitignored).  Either:
 - have the test build a tiny checkpoint on demand via a fixture (~30 s in conftest), or
 - bake a pre-trained checkpoint into the test data dir via `git lfs` or external download.
 
@@ -93,4 +93,4 @@ The `grain_size` scalar conditioning is barely used by the current model (the Vo
 
 ### 7. Benchmark ORB-v3 as a MACE-MP0 alternative
 
-Relevant to the speed story behind this whole project (ML vs FIRE vs MACE).  ORB-v3 (Orbital Materials) is ~accuracy-equivalent to MACE-MPA-0 but markedly faster on GPU, and drops into tricor's ASE-calculator interface with minimal change.  Investigated 2026-06-19, **deferred**.  Full feasibility notes — construction sites to change, ORB API, GPU-vs-CPU and conservative-vs-direct caveats, recommended first benchmark — in `scratch/ORB_V3_INTEGRATION.md`.
+Relevant to the speed story behind this whole project (ML vs FIRE vs MACE).  ORB-v3 (Orbital Materials) is ~accuracy-equivalent to MACE-MPA-0 but markedly faster on GPU, and drops into atomode's ASE-calculator interface with minimal change.  Investigated 2026-06-19, **deferred**.  Full feasibility notes — construction sites to change, ORB API, GPU-vs-CPU and conservative-vs-direct caveats, recommended first benchmark — in `scratch/ORB_V3_INTEGRATION.md`.
