@@ -77,6 +77,9 @@ def _compute_pair(task):
         from .polar import polar_fft_features
 
         polar = polar_fft_features(arr, pb.sampling, (float(cx), float(cy)), **kw["polar"])
+        from .polar import default_orders
+
+        polar_orders = list(default_orders(kw["polar"].get("mode", "autocorrelation")))
 
     out = []
     for ang in kw["rotations"]:
@@ -90,6 +93,7 @@ def _compute_pair(task):
             )
         if polar is not None:
             pair["polar"] = polar
+            pair["polar_orders"] = polar_orders
         out.append(pair)
     return out
 

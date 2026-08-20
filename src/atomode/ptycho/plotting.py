@@ -210,7 +210,8 @@ def plot_hrtem_pair(pairs, index: int, *, figsize: tuple = (15, 4)):
 
 def plot_polar_features(features, r=None, *, ax=None, title="angular symmetry orders",
                         skip_m0: bool = True, gamma: float = 1.0,
-                        per_channel: bool = True, figsize: tuple = (5, 3.2)):
+                        per_channel: bool = True, orders=None,
+                        figsize: tuple = (5, 3.2)):
     """Heatmap of the ``(max_order + 1, n_r)`` angular-symmetry features.
 
     Parameters
@@ -219,6 +220,9 @@ def plot_polar_features(features, r=None, *, ax=None, title="angular symmetry or
         Array from :func:`atomode.ptycho.polar_fft_features`.
     r
         Radial bin centres (Å); defaults to bin index.
+    orders
+        Angular order of each row, for the tick labels.  Defaults to the
+        even orders when the row count matches, else ``0 … n-1``.
     skip_m0
         Row 0 (the radial profile) is typically far larger than the
         modulation rows, so it is excluded from the colour scale by
@@ -239,7 +243,11 @@ def plot_polar_features(features, r=None, *, ax=None, title="angular symmetry or
     from .._plotting import show_2d
 
     f = np.asarray(features, dtype=np.float64)
-    m_max = f.shape[0] - 1
+    n_ch = f.shape[0]
+    if orders is None:
+        from .polar import EVEN_ORDERS
+        orders = EVEN_ORDERS if n_ch == len(EVEN_ORDERS) else tuple(range(n_ch))
+    orders = list(orders)
     x1 = float(r[-1]) if r is not None else f.shape[1]
 
     if ax is None:
@@ -255,7 +263,7 @@ def plot_polar_features(features, r=None, *, ax=None, title="angular symmetry or
 
     show_2d(
         norm,
-        extent=[0, x1, m_max + 0.5, -0.5],
+        extent=[0, x1, n_ch - 0.5, -0.5],
         ax=ax,
         cmap="magma",
         aspect="auto",
@@ -269,7 +277,8 @@ def plot_polar_features(features, r=None, *, ax=None, title="angular symmetry or
         ylabel="order m (m-fold)",
         colorbar=True,
     )
-    ax.set_yticks(range(0, m_max + 1, 2))
+    ax.set_yticks(range(n_ch))
+    ax.set_yticklabels([str(o) for o in orders])
     return ax
 
 
@@ -301,7 +310,7 @@ def plot_polar_pair(pairs, index: int, *, key: str = "polar", figsize: tuple = (
                 xlabel="x (px)", ylabel="y (px)", colorbar=True)
         k += 1
 
-    plot_polar_features(p[key], p.get("r"), ax=ax[k],
+    plot_polar_features(p[key], p.get("r"), ax=ax[k], orders=p.get("polar_orders"),
                         title=f"input {p[key].shape[0]} × {p[key].shape[1]}  {head}")
     k += 1
 

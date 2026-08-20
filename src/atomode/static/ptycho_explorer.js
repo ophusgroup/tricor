@@ -295,8 +295,10 @@ function drawPolar(canvas, model) {
   ctx.font = "9px sans-serif";
   ctx.textAlign = "right";
   const rowH = ph / M;
-  for (let m = 0; m < M; m += 2) {
-    ctx.fillText(String(m), ML - 3, MT + (m + 0.75) * rowH);
+  const ords = model.get("polar_orders") || [];
+  for (let m = 0; m < M; m++) {
+    const lab = ords.length === M ? ords[m] : m;
+    if (M <= 8 || m % 2 === 0) ctx.fillText(String(lab), ML - 3, MT + (m + 0.75) * rowH);
   }
   ctx.textAlign = "center";
   for (let k = 0; k <= 2; k++) {

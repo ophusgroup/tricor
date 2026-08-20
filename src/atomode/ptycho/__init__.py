@@ -63,8 +63,8 @@ def __getattr__(name: str):
         from . import plotting
 
         return getattr(plotting, name)
-    if name in ("angular_symmetry_kernel", "polar_fft_features",
-                "add_polar_features"):
+    if name in ("polar_fft_features", "add_polar_features",
+                "default_orders", "EVEN_ORDERS", "ALL_ORDERS"):
         from . import polar
 
         return getattr(polar, name)

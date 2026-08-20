@@ -240,6 +240,9 @@ def sliding_window_pairs_hrtem(
                         polar_feat = polar_fft_features(
                             full, stack.sampling, (float(cx), float(cy)), **polar
                         )
+                        from .polar import default_orders
+
+                        polar_ord = list(default_orders(polar.get("mode", "autocorrelation")))
                     for ang in rotations:
                         pair = TrainingPair(
                             cx=float(cx), cy=float(cy), thickness=t, defocus=float(df),
@@ -257,6 +260,7 @@ def sliding_window_pairs_hrtem(
                                     pair[key] = rep[key]
                         if polar_feat is not None:
                             pair["polar"] = polar_feat
+                            pair["polar_orders"] = polar_ord
                         pairs.append(pair)
         if show_progress:
             print(f"\r  frames: thickness {t:.0f} A done", end="", flush=True)

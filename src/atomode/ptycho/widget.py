@@ -64,7 +64,8 @@ class PtychoExplorer(anywidget.AnyWidget):
     polar_r_max = traitlets.Float(10.0).tag(sync=True)
     polar_gamma = traitlets.Float(1.0).tag(sync=True)        # display power law
     polar_per_channel = traitlets.Bool(True).tag(sync=True)  # scale each order row
-    polar_skip_m0 = traitlets.Bool(True).tag(sync=True)      # exclude row 0 from scaling
+    polar_skip_m0 = traitlets.Bool(True).tag(sync=True)
+    polar_orders = traitlets.List(trait=traitlets.Int()).tag(sync=True)      # exclude row 0 from scaling
 
     # --- right panels: correlations ---
     r = traitlets.List(trait=traitlets.Float()).tag(sync=True)
@@ -223,6 +224,9 @@ class PtychoExplorer(anywidget.AnyWidget):
             (float(self.window_cx), float(self.window_cy)),
             **kw,
         )
+        from .polar import default_orders
+
+        self.polar_orders = list(default_orders(kw.get("mode", "autocorrelation")))
         self.polar_shape = [int(feat.shape[0]), int(feat.shape[1])]
         self.polar_values = feat.ravel().tolist()
         self.polar_r_max = float(kw.get("n_r", 100) * kw.get("r_step", 0.1))

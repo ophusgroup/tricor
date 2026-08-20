@@ -72,6 +72,7 @@ class HRTEMExplorer(anywidget.AnyWidget):
     polar_gamma = traitlets.Float(1.0).tag(sync=True)
     polar_per_channel = traitlets.Bool(True).tag(sync=True)
     polar_skip_m0 = traitlets.Bool(True).tag(sync=True)
+    polar_orders = traitlets.List(trait=traitlets.Int()).tag(sync=True)
     fft_values = traitlets.List(trait=traitlets.Float()).tag(sync=True)
     fft_shape = traitlets.List(trait=traitlets.Int()).tag(sync=True)
 
@@ -242,6 +243,9 @@ class HRTEMExplorer(anywidget.AnyWidget):
             self._frame, self._stack.sampling,
             (float(self.window_cx), float(self.window_cy)), **kw,
         )
+        from .polar import default_orders
+
+        self.polar_orders = list(default_orders(kw.get("mode", "autocorrelation")))
         self.polar_shape = [int(feat.shape[0]), int(feat.shape[1])]
         self.polar_values = feat.ravel().tolist()
         self.polar_r_max = float(kw.get("n_r", 100) * kw.get("r_step", 0.1))
