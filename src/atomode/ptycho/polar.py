@@ -243,9 +243,10 @@ def polar_fft_features(
         rows.append(np.real(spec[o]) if o == 0 else np.abs(spec[o]))
     out = np.asarray(rows)
 
-    # Normalise on the zero-lag peak (the windowed patch variance), which is
-    # stable and positive, rather than on a mean that can pass through zero.
-    scale = abs(float(out[0][: max(1, int(0.05 / r_step))].mean()))
+    # Normalise on the zero-lag peak (the windowed patch variance).  The
+    # autocorrelation maximum sits at r -> 0, so this is stable and positive,
+    # unlike a mean that can pass through zero.
+    scale = float(np.max(out[0]))
     if scale > 1e-12:
         out = out / scale
     return out * _radial_window(r, r_max, taper)[None, :]

@@ -273,12 +273,21 @@ function drawPolar(canvas, model) {
 
   // Row 0 is the radial profile and is far larger than the modulation rows,
   // so it is excluded from a shared colour scale by default.
-  const scale = new Array(M).fill(1);
+  // Row 0 is signed (the pair correlation dips below zero), so each row is
+  // mapped from its own min to its own max.  Taking |.| instead would fold
+  // the negative lobes and put a notch at every zero crossing.
+  const lo = new Array(M).fill(0), scale = new Array(M).fill(1);
   if (perCh) {
     for (let m = 0; m < M; m++) {
-      let mx = 0;
-      for (let i = 0; i < NR; i++) { const v = Math.abs(vals[m * NR + i]); if (Number.isFinite(v) && v > mx) mx = v; }
-      scale[m] = mx > 0 ? mx : 1;
+      let mn = Infinity, mx = -Infinity;
+      for (let i = 0; i < NR; i++) {
+        const v = vals[m * NR + i];
+        if (!Number.isFinite(v)) continue;
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+      }
+      lo[m] = Number.isFinite(mn) ? mn : 0;
+      scale[m] = mx > lo[m] ? mx - lo[m] : 1;
     }
   } else {
     let mx = 0;
@@ -294,7 +303,7 @@ function drawPolar(canvas, model) {
   const img = octx.createImageData(NR, M);
   for (let m = 0; m < M; m++) {
     for (let i = 0; i < NR; i++) {
-      let t = Math.abs(vals[m * NR + i]) / scale[m];
+      let t = (vals[m * NR + i] - lo[m]) / scale[m];
       t = Math.pow(Math.max(0, Math.min(1, t)), gamma);
       const c = rampRGB(MAGMA, t);
       const k = (m * NR + i) * 4;

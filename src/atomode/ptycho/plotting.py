@@ -253,15 +253,17 @@ def plot_polar_features(features, r=None, *, ax=None, title="angular symmetry or
     if ax is None:
         _, ax = plt.subplots(figsize=figsize)
 
-    # Row 0 is signed; display its magnitude so the negative lobe does not
-    # render as a black band.
-    f = np.abs(f)
+    # Row 0 is signed (the pair correlation dips below zero).  Map each row
+    # from its own min to its own max rather than taking |.|, which would
+    # fold the negative lobes and put a notch at every zero crossing.
     if per_channel:
-        norm = f / np.maximum(f.max(axis=1, keepdims=True), 1e-12)
+        lo = f.min(axis=1, keepdims=True)
+        hi = f.max(axis=1, keepdims=True)
+        norm = (f - lo) / np.maximum(hi - lo, 1e-12)
     else:
         scale = f[1:] if (skip_m0 and f.shape[0] > 1) else f
-        vmax = float(np.percentile(scale, 99.5)) if scale.size else 1.0
-        norm = f / max(vmax, 1e-12)
+        vmax = float(np.percentile(np.abs(scale), 99.5)) if scale.size else 1.0
+        norm = (f - f.min()) / max(vmax - f.min(), 1e-12)
     norm = np.clip(norm, 0.0, 1.0) ** float(gamma)
 
     show_2d(
