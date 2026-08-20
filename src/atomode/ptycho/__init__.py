@@ -58,10 +58,16 @@ def __getattr__(name: str):
         from . import hrtem_widget
 
         return getattr(hrtem_widget, name)
-    if name in ("plot_scattering_power", "plot_training_pair", "plot_hrtem_pair"):
+    if name in ("plot_scattering_power", "plot_training_pair", "plot_hrtem_pair",
+                "plot_polar_features", "plot_polar_pair"):
         from . import plotting
 
         return getattr(plotting, name)
+    if name in ("angular_symmetry_kernel", "polar_fft_features",
+                "add_polar_features"):
+        from . import polar
+
+        return getattr(polar, name)
     if name in ("sliding_window_pairs", "TrainingPair"):
         from . import training
 

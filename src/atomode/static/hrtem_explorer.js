@@ -239,6 +239,93 @@ function drawG2(canvas, model) {
   ctx.textAlign = "left"; ctx.fillText("weighted g2", MARGIN.left, 12);
 }
 
+
+// ---- angular-symmetry panel (the 13 x N_r network input) -----------------
+const MAGMA = [[0.0, [0, 0, 4]], [0.25, [81, 18, 124]], [0.5, [183, 55, 121]],
+               [0.75, [252, 137, 97]], [1.0, [252, 253, 191]]];
+
+function rampRGB(stops, t) {
+  t = Math.max(0, Math.min(1, t));
+  for (let i = 1; i < stops.length; i++) {
+    if (t <= stops[i][0]) {
+      const [t0, c0] = stops[i - 1], [t1, c1] = stops[i];
+      const f = (t - t0) / (t1 - t0 || 1);
+      return [Math.round(lerp(c0[0], c1[0], f)), Math.round(lerp(c0[1], c1[1], f)),
+              Math.round(lerp(c0[2], c1[2], f))];
+    }
+  }
+  return stops[stops.length - 1][1];
+}
+
+function drawPolar(canvas, model) {
+  const vals = model.get("polar_values") || [];
+  const shape = model.get("polar_shape") || [0, 0];
+  const M = shape[0], NR = shape[1];
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  if (!vals.length || !M || !NR) return;
+
+  const gamma = model.get("polar_gamma") || 1.0;
+  const perCh = model.get("polar_per_channel");
+  const skip0 = model.get("polar_skip_m0");
+  const rMax = model.get("polar_r_max") || 10;
+
+  // Row 0 is the radial profile and is far larger than the modulation rows,
+  // so it is excluded from a shared colour scale by default.
+  const scale = new Array(M).fill(1);
+  if (perCh) {
+    for (let m = 0; m < M; m++) {
+      let mx = 0;
+      for (let i = 0; i < NR; i++) { const v = vals[m * NR + i]; if (Number.isFinite(v) && v > mx) mx = v; }
+      scale[m] = mx > 0 ? mx : 1;
+    }
+  } else {
+    let mx = 0;
+    for (let m = (skip0 && M > 1) ? 1 : 0; m < M; m++) {
+      for (let i = 0; i < NR; i++) { const v = vals[m * NR + i]; if (Number.isFinite(v) && v > mx) mx = v; }
+    }
+    for (let m = 0; m < M; m++) scale[m] = mx > 0 ? mx : 1;
+  }
+
+  const off = document.createElement("canvas");
+  off.width = NR; off.height = M;
+  const octx = off.getContext("2d");
+  const img = octx.createImageData(NR, M);
+  for (let m = 0; m < M; m++) {
+    for (let i = 0; i < NR; i++) {
+      let t = vals[m * NR + i] / scale[m];
+      t = Math.pow(Math.max(0, Math.min(1, t)), gamma);
+      const c = rampRGB(MAGMA, t);
+      const k = (m * NR + i) * 4;
+      img.data[k] = c[0]; img.data[k + 1] = c[1]; img.data[k + 2] = c[2]; img.data[k + 3] = 255;
+    }
+  }
+  octx.putImageData(img, 0, 0);
+
+  const ML = 26, MB = 16, MT = 12, MR = 4;
+  const pw = W - ML - MR, ph = H - MT - MB;
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(off, ML, MT, pw, ph);
+
+  ctx.fillStyle = "#444";
+  ctx.font = "9px sans-serif";
+  ctx.textAlign = "right";
+  const rowH = ph / M;
+  for (let m = 0; m < M; m += 2) {
+    ctx.fillText(String(m), ML - 3, MT + (m + 0.75) * rowH);
+  }
+  ctx.textAlign = "center";
+  for (let k = 0; k <= 2; k++) {
+    const r = (rMax * k) / 2;
+    ctx.fillText(r.toFixed(0), ML + (r / rMax) * pw, H - 4);
+  }
+  ctx.textAlign = "left";
+  ctx.fillText("order m", 2, 9);
+  ctx.textAlign = "right";
+  ctx.fillText("r (Å)", W - 2, 9);
+}
+
 // ---- render --------------------------------------------------------------
 function render({ model, el: root }) {
   root.classList.add("hrtem-explorer");
@@ -271,10 +358,24 @@ function render({ model, el: root }) {
 
   const layout = model.get("layout") || "side";
   const transpose = model.get("transpose");
-  let frameCanvas, histCanvas, inputCanvas, fftCanvas, g3Canvas, g2Canvas, vmaxInput;
-  let thickSlider, thickVal, dfSlider, dfVal, rotSlider, rotVal;
+  let frameCanvas, histCanvas, g3Canvas, g2Canvas, vmaxInput;
+  let polarCanvas, gammaSlider, gammaVal, perChBox;
+  let thickSlider, thickVal, dfSlider, dfVal;
   const nThick = (model.get("thicknesses") || [0]).length;
 
+  function mkPolarControls(parent) {
+    el("span", "px-label", parent).textContent = "γ";
+    gammaSlider = el("input", null, parent);
+    gammaSlider.type = "range"; gammaSlider.min = 0.1; gammaSlider.max = 1.0;
+    gammaSlider.step = 0.05; gammaSlider.value = model.get("polar_gamma");
+    gammaSlider.style.width = "70px";
+    gammaVal = el("span", "px-val", parent);
+    const lab = el("label", "px-label", parent);
+    perChBox = el("input", null, lab);
+    perChBox.type = "checkbox";
+    perChBox.checked = !!model.get("polar_per_channel");
+    lab.appendChild(document.createTextNode(" per-order"));
+  }
   function mkVmax(parent) {
     el("span", "px-label", parent).textContent = "g3 max";
     const v = el("input", null, parent);
@@ -283,38 +384,42 @@ function render({ model, el: root }) {
   }
 
   if (layout === "stacked") {
-    // Full-width frame (long axis horizontal) on top; previews + g2/g3 below.
+    // Wide cell: full-width frame on top, analysis panels in one row beneath.
     const wrap = el("div", "px-wrap px-stacked", root);
     const lh = transpose ? Ly : Lx, lv = transpose ? Lx : Ly;
     frameCanvas = el("canvas", "px-frame", wrap);
-    frameCanvas.width = 760; frameCanvas.height = Math.max(80, Math.round(760 * lv / lh));
-    histCanvas = el("canvas", "px-hist", wrap); histCanvas.width = 760; histCanvas.height = 50;
+    frameCanvas.width = 960;
+    frameCanvas.height = Math.max(80, Math.min(190, Math.round(960 * lv / lh)));
     [thickSlider, thickVal] = mkRange(el("div", "px-row", wrap), "thick", 0, nThick - 1, 1, model.get("thickness_index"));
     [dfSlider, dfVal] = mkRange(el("div", "px-row", wrap), "defocus", -120, 120, 5, model.get("defocus_offset"));
-    [rotSlider, rotVal] = mkRange(el("div", "px-row", wrap), "rotate", -180, 180, 5, model.get("window_angle"));
-    const below = el("div", "px-wrap", wrap);
-    const mid = el("div", "px-col", below);
-    inputCanvas = el("canvas", "px-input", mid); inputCanvas.width = 168; inputCanvas.height = 168;
-    fftCanvas = el("canvas", "px-input", mid); fftCanvas.width = 168; fftCanvas.height = 168;
-    const right = el("div", "px-col", below);
-    g3Canvas = el("canvas", "px-g3", right); g3Canvas.width = 520; g3Canvas.height = 240;
-    g2Canvas = el("canvas", "px-g2", right); g2Canvas.width = 520; g2Canvas.height = 150;
+
+    const panels = el("div", "px-wrap px-panels", wrap);
+    const cpol = el("div", "px-col", panels);
+    polarCanvas = el("canvas", "px-polar", cpol); polarCanvas.width = 340; polarCanvas.height = 200;
+    mkPolarControls(el("div", "px-row", cpol));
+    histCanvas = el("canvas", "px-hist", cpol); histCanvas.width = 340; histCanvas.height = 46;
+    const right = el("div", "px-col", panels);
+    g3Canvas = el("canvas", "px-g3", right); g3Canvas.width = 340; g3Canvas.height = 186;
+    g2Canvas = el("canvas", "px-g2", right); g2Canvas.width = 340; g2Canvas.height = 124;
     vmaxInput = mkVmax(el("div", "px-row", right));
   } else {
+    // Three columns (frame | angular symmetry | g3 + g2) so the frame and the
+    // angular map stay side by side while dragging the window.
     const wrap = el("div", "px-wrap", root);
     const left = el("div", "px-col", wrap);
     frameCanvas = el("canvas", "px-frame", left);
-    frameCanvas.width = 340; frameCanvas.height = Math.round(340 * Ly / Lx);
-    histCanvas = el("canvas", "px-hist", left); histCanvas.width = 340; histCanvas.height = 50;
+    frameCanvas.width = 300; frameCanvas.height = Math.round(300 * Ly / Lx);
     [thickSlider, thickVal] = mkRange(el("div", "px-row", left), "thick", 0, nThick - 1, 1, model.get("thickness_index"));
     [dfSlider, dfVal] = mkRange(el("div", "px-row", left), "defocus", -120, 120, 5, model.get("defocus_offset"));
-    [rotSlider, rotVal] = mkRange(el("div", "px-row", left), "rotate", -180, 180, 5, model.get("window_angle"));
+
     const mid = el("div", "px-col", wrap);
-    inputCanvas = el("canvas", "px-input", mid); inputCanvas.width = 168; inputCanvas.height = 168;
-    fftCanvas = el("canvas", "px-input", mid); fftCanvas.width = 168; fftCanvas.height = 168;
+    polarCanvas = el("canvas", "px-polar", mid); polarCanvas.width = 330; polarCanvas.height = 196;
+    mkPolarControls(el("div", "px-row", mid));
+    histCanvas = el("canvas", "px-hist", mid); histCanvas.width = 330; histCanvas.height = 46;
+
     const right = el("div", "px-col", wrap);
-    g3Canvas = el("canvas", "px-g3", right); g3Canvas.width = 360; g3Canvas.height = 210;
-    g2Canvas = el("canvas", "px-g2", right); g2Canvas.width = 360; g2Canvas.height = 150;
+    g3Canvas = el("canvas", "px-g3", right); g3Canvas.width = 330; g3Canvas.height = 186;
+    g2Canvas = el("canvas", "px-g2", right); g2Canvas.width = 330; g2Canvas.height = 124;
     vmaxInput = mkVmax(el("div", "px-row", right));
   }
 
@@ -323,21 +428,20 @@ function render({ model, el: root }) {
 
   const sgn = (x) => (x >= 0 ? "+" : "");
   function syncControls() {
+    if (gammaSlider) {
+      gammaSlider.value = model.get("polar_gamma");
+      gammaVal.textContent = (model.get("polar_gamma") || 1).toFixed(2);
+      perChBox.checked = !!model.get("polar_per_channel");
+    }
     // Labels + status only — never reset slider thumbs (Python does not move
     // these controls, so resetting them is what made the defocus thumb jump).
     const thicks = model.get("thicknesses") || [0];
     thickVal.textContent = `${(thicks[model.get("thickness_index")] || 0).toFixed(0)} Å`;
     dfVal.textContent = `Δf ${sgn(model.get("defocus_offset"))}${model.get("defocus_offset").toFixed(0)} Å`;
-    rotVal.textContent = `${(model.get("window_angle") || 0).toFixed(0)}°`;
     status.textContent = model.get("status") || "";
   }
   function redrawFrame() { ensureClims(); drawFrame(frameCanvas, model, drag, frameClim); drawHist(histCanvas, model.get("slice_values") || [], frameClim, histAxis); }
-  function redrawInputs() {
-    ensureClims();
-    drawGrey(inputCanvas, model.get("input_values") || [], ...(model.get("input_shape") || [0, 0]), "input (net)");
-    drawGrey(fftCanvas, model.get("fft_values") || [], ...(model.get("fft_shape") || [0, 0]), "diffractogram |FFT|", fftClim);
-  }
-  function redrawAll() { redrawFrame(); redrawInputs(); drawG3(g3Canvas, model); drawG2(g2Canvas, model); syncControls(); }
+  function redrawAll() { redrawFrame(); drawPolar(polarCanvas, model); drawG3(g3Canvas, model); drawG2(g2Canvas, model); syncControls(); }
 
   // --- window drag on the frame ---
   function pointerToAngstrom(ev) {
@@ -404,8 +508,15 @@ function render({ model, el: root }) {
   thickSlider.addEventListener("change", () => { model.set("thickness_index", parseInt(thickSlider.value, 10)); model.save_changes(); });
   dfSlider.addEventListener("input", () => { dfVal.textContent = `Δf ${sgn(+dfSlider.value)}${(+dfSlider.value).toFixed(0)} Å`; });
   dfSlider.addEventListener("change", () => { model.set("defocus_offset", parseFloat(dfSlider.value)); model.save_changes(); });
-  rotSlider.addEventListener("input", () => { rotVal.textContent = `${(+rotSlider.value).toFixed(0)}°`; });
-  rotSlider.addEventListener("change", () => { model.set("window_angle", parseFloat(rotSlider.value)); model.save_changes(); });
+  gammaSlider.addEventListener("input", () => {
+    gammaVal.textContent = parseFloat(gammaSlider.value).toFixed(2);
+    model.set("polar_gamma", parseFloat(gammaSlider.value));
+    model.save_changes();
+  });
+  perChBox.addEventListener("change", () => {
+    model.set("polar_per_channel", perChBox.checked);
+    model.save_changes();
+  });
   vmaxInput.addEventListener("change", () => {
     const v = parseFloat(vmaxInput.value);
     model.set("g3_vmax", Number.isFinite(v) && v > 0 ? v : -1.0); model.save_changes();
@@ -413,8 +524,9 @@ function render({ model, el: root }) {
 
   // react to Python-side updates (frame/inputs change; clims stay fixed)
   model.on("change:slice_values", redrawFrame);
-  model.on("change:input_values", redrawInputs);
-  model.on("change:fft_values", redrawInputs);
+  model.on("change:polar_values", () => drawPolar(polarCanvas, model));
+  model.on("change:polar_gamma", () => { drawPolar(polarCanvas, model); syncControls(); });
+  model.on("change:polar_per_channel", () => { drawPolar(polarCanvas, model); syncControls(); });
   model.on("change:g3_slice_values", () => drawG3(g3Canvas, model));
   model.on("change:g2", () => drawG2(g2Canvas, model));
   model.on("change:g3_vmax", () => drawG3(g3Canvas, model));

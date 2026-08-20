@@ -84,6 +84,8 @@ def sliding_window_pairs_hrtem(
     y_positions=None,
     rotations=None,
     representations=("real",),
+    polar: dict | None = None,
+    store_image: bool = True,
     atom_scale: np.ndarray | None = None,
     scattering_weighted: bool = True,
     rng_seed: int = 0,
@@ -120,7 +122,17 @@ def sliding_window_pairs_hrtem(
         to ``(0.0,)``.
     representations
         Subset of ``("real", "fft", "real_radial", "fft_radial")`` to store
-        on each pair (``"real"`` is always present as ``input``).
+        on each pair.
+    polar
+        When set, a dict of keyword arguments for
+        :func:`atomode.ptycho.polar.polar_fft_features`; each pair then
+        carries a ``polar`` key holding the ``(max_order + 1, n_r)``
+        angular-symmetry descriptor, built directly from the HRTEM frame.
+        It is rotation invariant, so it is computed once per window and
+        frame and shared across ``rotations``.
+    store_image
+        Keep the Cartesian windowed crop as ``input``.  Set ``False`` when
+        only the ``polar`` descriptor is wanted, to skip the crop entirely.
     atom_scale, scattering_weighted
         Per-atom scattering weighting (computed once if not supplied).
     n_jobs
@@ -220,17 +232,31 @@ def sliding_window_pairs_hrtem(
             for cx in xs:
                 for cy in ys:
                     g2, g3, r, phi, nwin = target_map[(ti, round(float(cx), 6), round(float(cy), 6))]
+                    # Rotation invariant -> built once per window / frame.
+                    polar_feat = None
+                    if polar is not None:
+                        from .polar import polar_fft_features
+
+                        polar_feat = polar_fft_features(
+                            full, stack.sampling, (float(cx), float(cy)), **polar
+                        )
                     for ang in rotations:
-                        im = windowed_image(full, stack.sampling, (float(cx), float(cy)), side, angle_deg=ang)
                         pair = TrainingPair(
                             cx=float(cx), cy=float(cy), thickness=t, defocus=float(df),
-                            angle=float(ang), input=im, g2=g2, g3_slice=g3, r=r, phi_deg=phi,
+                            angle=float(ang), g2=g2, g3_slice=g3, r=r, phi_deg=phi,
                             n_window=int(nwin),
                         )
-                        if reps:
-                            rep = hrtem_input(im)
-                            for key in reps:
-                                pair[key] = rep[key]
+                        if store_image or reps:
+                            im = windowed_image(full, stack.sampling,
+                                                (float(cx), float(cy)), side, angle_deg=ang)
+                            if store_image:
+                                pair["input"] = im
+                            if reps:
+                                rep = hrtem_input(im)
+                                for key in reps:
+                                    pair[key] = rep[key]
+                        if polar_feat is not None:
+                            pair["polar"] = polar_feat
                         pairs.append(pair)
         if show_progress:
             print(f"\r  frames: thickness {t:.0f} A done", end="", flush=True)

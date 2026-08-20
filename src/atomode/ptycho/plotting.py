@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import numpy as np
 
-__all__ = ["plot_scattering_power", "plot_training_pair", "plot_hrtem_pair"]
+__all__ = [
+    "plot_scattering_power",
+    "plot_training_pair",
+    "plot_hrtem_pair",
+    "plot_polar_features",
+    "plot_polar_pair",
+]
 
 # First atomic number of each period (H, Li, Na, K, Rb, Cs, Fr).
 _PERIOD_STARTS = (1, 3, 11, 19, 37, 55, 87)
@@ -195,6 +201,123 @@ def plot_hrtem_pair(pairs, index: int, *, figsize: tuple = (15, 4)):
         vmin=0,
         vmax=2,
         title="g3 slice (r01 ~ NN)",
+        xlabel="r02 (Å)",
+        ylabel="angle (deg)",
+    )
+    fig.tight_layout()
+    return ax
+
+
+def plot_polar_features(features, r=None, *, ax=None, title="angular symmetry orders",
+                        skip_m0: bool = True, gamma: float = 1.0,
+                        per_channel: bool = True, figsize: tuple = (5, 3.2)):
+    """Heatmap of the ``(max_order + 1, n_r)`` angular-symmetry features.
+
+    Parameters
+    ----------
+    features
+        Array from :func:`atomode.ptycho.polar_fft_features`.
+    r
+        Radial bin centres (Å); defaults to bin index.
+    skip_m0
+        Row 0 (the radial profile) is typically far larger than the
+        modulation rows, so it is excluded from the colour scale by
+        default — it is still drawn, just not allowed to saturate the map.
+    gamma
+        Display power law: the normalised map is raised to ``gamma``
+        before colouring.  Values below 1 (e.g. 0.5) lift the weak high
+        orders into view.  Display only, the data is untouched.
+    per_channel
+        Scale each order row to its own maximum (default), so every order
+        is equally visible regardless of how the amplitude falls off with
+        ``m`` — without it the high orders are too faint to read against
+        row 0.  Display only.  ``skip_m0`` applies to the shared-scale
+        path only, i.e. when this is ``False``.
+    """
+    import matplotlib.pyplot as plt
+
+    from .._plotting import show_2d
+
+    f = np.asarray(features, dtype=np.float64)
+    m_max = f.shape[0] - 1
+    x1 = float(r[-1]) if r is not None else f.shape[1]
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=figsize)
+
+    if per_channel:
+        norm = f / np.maximum(f.max(axis=1, keepdims=True), 1e-12)
+    else:
+        scale = f[1:] if (skip_m0 and f.shape[0] > 1) else f
+        vmax = float(np.percentile(scale, 99.5)) if scale.size else 1.0
+        norm = f / max(vmax, 1e-12)
+    norm = np.clip(norm, 0.0, 1.0) ** float(gamma)
+
+    show_2d(
+        norm,
+        extent=[0, x1, m_max + 0.5, -0.5],
+        ax=ax,
+        cmap="magma",
+        aspect="auto",
+        # show_2d defaults to origin="lower", which would put row 0 (m = 0) at
+        # the *bottom* of the axis while the ticks label it 12.
+        origin="upper",
+        vmin=0,
+        vmax=1,
+        title=title,
+        xlabel="r (Å)" if r is not None else "r (bin)",
+        ylabel="order m (m-fold)",
+        colorbar=True,
+    )
+    ax.set_yticks(range(0, m_max + 1, 2))
+    return ax
+
+
+def plot_polar_pair(pairs, index: int, *, key: str = "polar", figsize: tuple = (15, 3.4)):
+    """Plot one pair: input crop, angular-symmetry features, g2, g3 slice.
+
+    The middle panel is the ``(max_order + 1, n_r)`` network input built by
+    :func:`atomode.ptycho.polar_fft_features`.
+    """
+    import matplotlib.pyplot as plt
+
+    from .._plotting import show_2d
+
+    p = pairs[index]
+    # The Cartesian crop is optional: samplers run with ``store_image=False``
+    # skip it entirely, in which case the panel is simply dropped.
+    has_image = "input" in p
+    n_panels = 4 if has_image else 3
+    fig, ax = plt.subplots(1, n_panels, figsize=figsize)
+    k = 0
+
+    if "thickness" in p:
+        head = (f"(t={p['thickness']:.0f} Å, Δf={p['defocus']:+.0f} Å)")
+    else:
+        head = (f"(cx={p['cx']:.0f}, cy={p['cy']:.0f}, z0={p['z0']:.0f} Å)")
+
+    if has_image:
+        show_2d(p["input"].T, ax=ax[k], cmap="gray", title=f"crop  {head}",
+                xlabel="x (px)", ylabel="y (px)", colorbar=True)
+        k += 1
+
+    plot_polar_features(p[key], p.get("r"), ax=ax[k],
+                        title=f"input {p[key].shape[0]} × {p[key].shape[1]}  {head}")
+    k += 1
+
+    ax[k].plot(p["r"], p["g2"])
+    ax[k].axhline(1, ls="--", c="gray")
+    ax[k].set(xlabel="r (Å)", ylabel="weighted g2", title="target g2")
+    k += 1
+    show_2d(
+        p["g3_slice"],
+        extent=[0, p["r"][-1], 0, 180],
+        ax=ax[k],
+        cmap="RdBu_r",
+        aspect="auto",
+        vmin=0,
+        vmax=2,
+        title="target g3 slice (r01 ~ NN)",
         xlabel="r02 (Å)",
         ylabel="angle (deg)",
     )

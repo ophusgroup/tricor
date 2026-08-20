@@ -24,6 +24,7 @@ import numpy as np
 import traitlets
 
 from .correlations import local_correlations
+from .polar import polar_fft_features
 from .weighting import WindowSpec, windowed_image
 
 _STATIC = pathlib.Path(__file__).parent.parent / "static"
@@ -57,6 +58,14 @@ class PtychoExplorer(anywidget.AnyWidget):
     input_values = traitlets.List(trait=traitlets.Float()).tag(sync=True)
     input_shape = traitlets.List(trait=traitlets.Int()).tag(sync=True)  # [nx, ny]
 
+    # --- angular-symmetry descriptor (the network input) ---
+    polar_values = traitlets.List(trait=traitlets.Float()).tag(sync=True)
+    polar_shape = traitlets.List(trait=traitlets.Int()).tag(sync=True)  # [orders, n_r]
+    polar_r_max = traitlets.Float(10.0).tag(sync=True)
+    polar_gamma = traitlets.Float(1.0).tag(sync=True)        # display power law
+    polar_per_channel = traitlets.Bool(True).tag(sync=True)  # scale each order row
+    polar_skip_m0 = traitlets.Bool(True).tag(sync=True)      # exclude row 0 from scaling
+
     # --- right panels: correlations ---
     r = traitlets.List(trait=traitlets.Float()).tag(sync=True)
     phi_deg = traitlets.List(trait=traitlets.Float()).tag(sync=True)
@@ -83,6 +92,7 @@ class PtychoExplorer(anywidget.AnyWidget):
         phi_num_bins: int = 36,
         scattering_weighted: bool = True,
         layout: str | None = None,
+        polar: dict | None = None,
         **kwargs,
     ):
         """Parameters
@@ -144,13 +154,18 @@ class PtychoExplorer(anywidget.AnyWidget):
         self.window_cy = float(ly) / 2.0
         self.slice_index = int(stack.n_slices // 2)
 
+        # Angular-symmetry panel config; the radial grid follows the target's.
+        self._polar_kwargs = dict(n_r=int(round(float(r_max) / float(r_step))),
+                                  r_step=float(r_step))
+        if polar:
+            self._polar_kwargs.update(polar)
+
         self._update_slice()
         self._update_corr()
-        self._update_input()
+        self._update_polar()
 
         self.observe(self._on_slice, names="slice_index")
         self.observe(self._on_window, names=["window_cx", "window_cy"])
-        self.observe(self._on_angle, names="window_angle")
 
     # -- payload builders -------------------------------------------------
     def _update_slice(self) -> None:
@@ -196,6 +211,22 @@ class PtychoExplorer(anywidget.AnyWidget):
             f"σz={self._sigma_z:.0f} Å · rot {self.window_angle:.0f}°"
         )
 
+    def _update_polar(self) -> None:
+        """The (orders, n_r) angular-symmetry descriptor for this window.
+
+        Rotation invariant, so it does not react to the rotation slider.
+        """
+        kw = dict(self._polar_kwargs)
+        feat = polar_fft_features(
+            self._stack.array[int(self.slice_index)],
+            self._stack.sampling,
+            (float(self.window_cx), float(self.window_cy)),
+            **kw,
+        )
+        self.polar_shape = [int(feat.shape[0]), int(feat.shape[1])]
+        self.polar_values = feat.ravel().tolist()
+        self.polar_r_max = float(kw.get("n_r", 100) * kw.get("r_step", 0.1))
+
     def _update_input(self) -> None:
         """The rotated, circular-windowed crop the network would see."""
         img = windowed_image(
@@ -216,7 +247,7 @@ class PtychoExplorer(anywidget.AnyWidget):
         try:
             self._update_slice()
             self._update_corr()
-            self._update_input()
+            self._update_polar()
         finally:
             self._suspend = False
 
@@ -226,21 +257,7 @@ class PtychoExplorer(anywidget.AnyWidget):
         self._suspend = True
         try:
             self._update_corr()
-            self._update_input()
+            self._update_polar()
         finally:
             self._suspend = False
 
-    def _on_angle(self, _change) -> None:
-        # The circular window makes the target rotation-invariant, so only
-        # the input preview changes — g2 / g3 stay put.
-        if self._suspend:
-            return
-        self._suspend = True
-        try:
-            self._update_input()
-            self.status = (
-                f"z0={self.z0:.1f} Å · window {self.window_side:.0f} Å (circular) · "
-                f"σz={self._sigma_z:.0f} Å · rot {self.window_angle:.0f}°"
-            )
-        finally:
-            self._suspend = False

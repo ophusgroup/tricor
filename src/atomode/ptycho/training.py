@@ -69,14 +69,29 @@ def _compute_pair(task):
         rng_seed=kw["rng_seed"],
     )
     arr = pb.array[pb.slice_index_for_z(z0)]  # (nx, ny)
-    return [
-        TrainingPair(
+
+    # The angular-symmetry descriptor is rotation invariant, so it is built
+    # once per window and shared by every rotated input.
+    polar = None
+    if kw.get("polar") is not None:
+        from .polar import polar_fft_features
+
+        polar = polar_fft_features(arr, pb.sampling, (float(cx), float(cy)), **kw["polar"])
+
+    out = []
+    for ang in kw["rotations"]:
+        pair = TrainingPair(
             cx=float(cx), cy=float(cy), z0=float(z0), angle=float(ang),
-            input=windowed_image(arr, pb.sampling, (cx, cy), kw["side"], angle_deg=ang),
             g2=corr.g2, g3_slice=corr.g3_slice, r=corr.r, phi_deg=corr.phi_deg,
         )
-        for ang in kw["rotations"]
-    ]
+        if kw["store_image"]:
+            pair["input"] = windowed_image(
+                arr, pb.sampling, (cx, cy), kw["side"], angle_deg=ang
+            )
+        if polar is not None:
+            pair["polar"] = polar
+        out.append(pair)
+    return out
 
 
 def sliding_window_pairs(
@@ -94,6 +109,8 @@ def sliding_window_pairs(
     y_positions=None,
     z_positions=None,
     rotations=None,
+    polar: dict | None = None,
+    store_image: bool = True,
     atom_scale: np.ndarray | None = None,
     scattering_weighted: bool = True,
     rng_seed: int = 0,
@@ -135,6 +152,17 @@ def sliding_window_pairs(
         input is re-sampled (periodic bicubic) — free rotation
         augmentation.  Defaults to ``(0.0,)`` (no augmentation); pass e.g.
         ``np.arange(0, 360, 45)`` to emit 8 inputs per window.
+    polar
+        When set, a dict of keyword arguments for
+        :func:`atomode.ptycho.polar.polar_fft_features`; each pair then
+        carries a ``polar`` key holding the ``(max_order + 1, n_r)``
+        angular-symmetry descriptor, built inside the worker processes
+        (so it parallelises with everything else) directly from the
+        periodic field.  It is rotation invariant, so it is computed once
+        per window and shared across ``rotations``.
+    store_image
+        Keep the Cartesian windowed crop as ``input``.  Set ``False`` when
+        only the ``polar`` descriptor is wanted, to skip the crop entirely.
     atom_scale, scattering_weighted
         Per-atom scattering weighting (computed once if not supplied).
     rng_seed
@@ -186,6 +214,7 @@ def sliding_window_pairs(
         side=float(side), sigma_z=float(sigma_z), r_max=r_max, r_step=r_step,
         phi_num_bins=phi_num_bins, pair_peak=pair_peak, atom_scale=atom_scale,
         n_random=n_random, rng_seed=rng_seed, rotations=rotations,
+        polar=polar, store_image=bool(store_image),
     )
 
     xs = (np.asarray(x_positions, dtype=np.float64)

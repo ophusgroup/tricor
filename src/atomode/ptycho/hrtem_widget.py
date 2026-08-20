@@ -27,6 +27,7 @@ import traitlets
 
 from .correlations import local_correlations
 from .hrtem import default_defocus, hrtem_image, hrtem_input
+from .polar import polar_fft_features
 from .weighting import WindowSpec, windowed_image
 
 _STATIC = pathlib.Path(__file__).parent.parent / "static"
@@ -63,6 +64,14 @@ class HRTEMExplorer(anywidget.AnyWidget):
     # --- input previews ---
     input_values = traitlets.List(trait=traitlets.Float()).tag(sync=True)
     input_shape = traitlets.List(trait=traitlets.Int()).tag(sync=True)
+
+    # --- angular-symmetry descriptor (the network input) ---
+    polar_values = traitlets.List(trait=traitlets.Float()).tag(sync=True)
+    polar_shape = traitlets.List(trait=traitlets.Int()).tag(sync=True)  # [orders, n_r]
+    polar_r_max = traitlets.Float(10.0).tag(sync=True)
+    polar_gamma = traitlets.Float(1.0).tag(sync=True)
+    polar_per_channel = traitlets.Bool(True).tag(sync=True)
+    polar_skip_m0 = traitlets.Bool(True).tag(sync=True)
     fft_values = traitlets.List(trait=traitlets.Float()).tag(sync=True)
     fft_shape = traitlets.List(trait=traitlets.Int()).tag(sync=True)
 
@@ -96,6 +105,7 @@ class HRTEMExplorer(anywidget.AnyWidget):
         scattering_weighted: bool = True,
         defocus_offset: float = 0.0,
         layout: str | None = None,
+        polar: dict | None = None,
         **kwargs,
     ):
         """Parameters
@@ -151,15 +161,20 @@ class HRTEMExplorer(anywidget.AnyWidget):
         self.thickness_index = int(stack.n_thicknesses - 1)
         self._sync_thickness()
 
+        # Angular-symmetry panel config; the radial grid follows the target's.
+        self._polar_kwargs = dict(n_r=int(round(float(r_max) / float(r_step))),
+                                  r_step=float(r_step))
+        if polar:
+            self._polar_kwargs.update(polar)
+
         self._update_frame()
         self._update_corr()
-        self._update_input()
+        self._update_polar()
         self._init_contrast()
 
         self.observe(self._on_thickness, names="thickness_index")
         self.observe(self._on_defocus, names="defocus_offset")
         self.observe(self._on_window, names=["window_cx", "window_cy"])
-        self.observe(self._on_angle, names="window_angle")
 
     # -- helpers ----------------------------------------------------------
     def _sync_thickness(self) -> None:
@@ -217,6 +232,20 @@ class HRTEMExplorer(anywidget.AnyWidget):
         fft = hrtem_input(im)["fft"]
         self.fft_clim = [float(np.percentile(fft, 2.0)), float(np.percentile(fft, 99.7))]
 
+    def _update_polar(self) -> None:
+        """The (orders, n_r) angular-symmetry descriptor for this window.
+
+        Rotation invariant, so it does not react to the rotation slider.
+        """
+        kw = dict(self._polar_kwargs)
+        feat = polar_fft_features(
+            self._frame, self._stack.sampling,
+            (float(self.window_cx), float(self.window_cy)), **kw,
+        )
+        self.polar_shape = [int(feat.shape[0]), int(feat.shape[1])]
+        self.polar_values = feat.ravel().tolist()
+        self.polar_r_max = float(kw.get("n_r", 100) * kw.get("r_step", 0.1))
+
     def _update_input(self) -> None:
         im = windowed_image(
             self._frame, self._stack.sampling,
@@ -244,25 +273,20 @@ class HRTEMExplorer(anywidget.AnyWidget):
             self._sync_thickness()
             self._update_frame()
             self._update_corr()
-            self._update_input()
+            self._update_polar()
         self._guard(go)
 
     def _on_defocus(self, _change) -> None:
         def go():
             self._sync_thickness()
             self._update_frame()
-            self._update_input()
+            self._update_polar()
             self._update_corr()  # refresh status line (defocus shown)
         self._guard(go)
 
     def _on_window(self, _change) -> None:
         def go():
             self._update_corr()
-            self._update_input()
+            self._update_polar()
         self._guard(go)
 
-    def _on_angle(self, _change) -> None:
-        # Circular window -> target unchanged; only the input preview moves.
-        def go():
-            self._update_input()
-        self._guard(go)

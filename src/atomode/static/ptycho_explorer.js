@@ -123,34 +123,6 @@ function drawHist(canvas, model) {
 }
 
 // ---- input preview: the rotated, circular-windowed crop the net sees ------
-function drawInput(canvas, model) {
-  const vals = model.get("input_values") || [];
-  const shape = model.get("input_shape") || [0, 0];
-  const [nx, ny] = shape;
-  const ctx = canvas.getContext("2d");
-  const W = canvas.width, H = canvas.height;
-  ctx.clearRect(0, 0, W, H);
-  if (!vals.length || nx * ny !== vals.length) return;
-  const finite = vals.filter((v) => Number.isFinite(v)).slice().sort((a, b) => a - b);
-  const vmin = percentile(finite, 0.01), vmax = percentile(finite, 0.99);
-  const span = vmax - vmin || 1;
-  const img = ctx.createImageData(nx, ny);
-  for (let i = 0; i < nx; i++) {
-    for (let j = 0; j < ny; j++) {
-      const [r, g, b] = grey((vals[i * ny + j] - vmin) / span);
-      const k = (j * nx + i) * 4;  // x horizontal, y vertical
-      img.data[k] = r; img.data[k + 1] = g; img.data[k + 2] = b; img.data[k + 3] = 255;
-    }
-  }
-  const off = document.createElement("canvas");
-  off.width = nx; off.height = ny;
-  off.getContext("2d").putImageData(img, 0, 0);
-  ctx.imageSmoothingEnabled = true;
-  ctx.drawImage(off, 0, 0, W, H);
-  ctx.fillStyle = "#fff"; ctx.font = "10px sans-serif"; ctx.textAlign = "left";
-  ctx.fillText("input (net)", 5, 13);
-}
-
 // ---- right panels: g3 heatmap + g2 line (shared r axis) -------------------
 const MARGIN = { left: 42, right: 56, top: 18, bottom: 26 };
 
@@ -250,6 +222,93 @@ function drawG2(canvas, model) {
   ctx.textAlign = "left"; ctx.fillText("weighted g2", MARGIN.left, 12);
 }
 
+
+// ---- angular-symmetry panel (the 13 x N_r network input) -----------------
+const MAGMA = [[0.0, [0, 0, 4]], [0.25, [81, 18, 124]], [0.5, [183, 55, 121]],
+               [0.75, [252, 137, 97]], [1.0, [252, 253, 191]]];
+
+function rampRGB(stops, t) {
+  t = Math.max(0, Math.min(1, t));
+  for (let i = 1; i < stops.length; i++) {
+    if (t <= stops[i][0]) {
+      const [t0, c0] = stops[i - 1], [t1, c1] = stops[i];
+      const f = (t - t0) / (t1 - t0 || 1);
+      return [Math.round(lerp(c0[0], c1[0], f)), Math.round(lerp(c0[1], c1[1], f)),
+              Math.round(lerp(c0[2], c1[2], f))];
+    }
+  }
+  return stops[stops.length - 1][1];
+}
+
+function drawPolar(canvas, model) {
+  const vals = model.get("polar_values") || [];
+  const shape = model.get("polar_shape") || [0, 0];
+  const M = shape[0], NR = shape[1];
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  if (!vals.length || !M || !NR) return;
+
+  const gamma = model.get("polar_gamma") || 1.0;
+  const perCh = model.get("polar_per_channel");
+  const skip0 = model.get("polar_skip_m0");
+  const rMax = model.get("polar_r_max") || 10;
+
+  // Row 0 is the radial profile and is far larger than the modulation rows,
+  // so it is excluded from a shared colour scale by default.
+  const scale = new Array(M).fill(1);
+  if (perCh) {
+    for (let m = 0; m < M; m++) {
+      let mx = 0;
+      for (let i = 0; i < NR; i++) { const v = vals[m * NR + i]; if (Number.isFinite(v) && v > mx) mx = v; }
+      scale[m] = mx > 0 ? mx : 1;
+    }
+  } else {
+    let mx = 0;
+    for (let m = (skip0 && M > 1) ? 1 : 0; m < M; m++) {
+      for (let i = 0; i < NR; i++) { const v = vals[m * NR + i]; if (Number.isFinite(v) && v > mx) mx = v; }
+    }
+    for (let m = 0; m < M; m++) scale[m] = mx > 0 ? mx : 1;
+  }
+
+  const off = document.createElement("canvas");
+  off.width = NR; off.height = M;
+  const octx = off.getContext("2d");
+  const img = octx.createImageData(NR, M);
+  for (let m = 0; m < M; m++) {
+    for (let i = 0; i < NR; i++) {
+      let t = vals[m * NR + i] / scale[m];
+      t = Math.pow(Math.max(0, Math.min(1, t)), gamma);
+      const c = rampRGB(MAGMA, t);
+      const k = (m * NR + i) * 4;
+      img.data[k] = c[0]; img.data[k + 1] = c[1]; img.data[k + 2] = c[2]; img.data[k + 3] = 255;
+    }
+  }
+  octx.putImageData(img, 0, 0);
+
+  const ML = 26, MB = 16, MT = 12, MR = 4;
+  const pw = W - ML - MR, ph = H - MT - MB;
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(off, ML, MT, pw, ph);
+
+  ctx.fillStyle = "#444";
+  ctx.font = "9px sans-serif";
+  ctx.textAlign = "right";
+  const rowH = ph / M;
+  for (let m = 0; m < M; m += 2) {
+    ctx.fillText(String(m), ML - 3, MT + (m + 0.75) * rowH);
+  }
+  ctx.textAlign = "center";
+  for (let k = 0; k <= 2; k++) {
+    const r = (rMax * k) / 2;
+    ctx.fillText(r.toFixed(0), ML + (r / rMax) * pw, H - 4);
+  }
+  ctx.textAlign = "left";
+  ctx.fillText("order m", 2, 9);
+  ctx.textAlign = "right";
+  ctx.fillText("r (Å)", W - 2, 9);
+}
+
 // ---- render --------------------------------------------------------------
 function render({ model, el: root }) {
   root.classList.add("ptycho-explorer");
@@ -258,7 +317,7 @@ function render({ model, el: root }) {
   const [Lx, Ly] = model.get("extent") || [1, 1];
 
   let sliceCanvas, sliceSlider, sliceVal, histCanvas, g3Canvas, g2Canvas, vmaxInput;
-  let rotSlider, rotVal, inputCanvas;
+  let polarCanvas, gammaSlider, gammaVal, perChBox;
 
   function mkSlider(parent) {
     el("span", "px-label", parent).textContent = "slice";
@@ -266,17 +325,23 @@ function render({ model, el: root }) {
     s.type = "range"; s.min = 0; s.step = 1;
     return s;
   }
-  function mkRotation(parent) {
-    el("span", "px-label", parent).textContent = "rotate";
-    const s = el("input", null, parent);
-    s.type = "range"; s.min = -180; s.max = 180; s.step = 5;
-    s.value = model.get("window_angle") || 0;
-    return s;
-  }
-  function mkInput(parent) {
-    const c = el("canvas", "px-input", parent);
-    c.width = 150; c.height = 150;
+  function mkPolar(parent, w, h) {
+    const c = el("canvas", "px-polar", parent);
+    c.width = w; c.height = h;
     return c;
+  }
+  function mkPolarControls(parent) {
+    el("span", "px-label", parent).textContent = "γ";
+    gammaSlider = el("input", null, parent);
+    gammaSlider.type = "range"; gammaSlider.min = 0.1; gammaSlider.max = 1.0;
+    gammaSlider.step = 0.05; gammaSlider.value = model.get("polar_gamma");
+    gammaSlider.style.width = "70px";
+    gammaVal = el("span", "px-val", parent);
+    const lab = el("label", "px-label", parent);
+    perChBox = el("input", null, lab);
+    perChBox.type = "checkbox";
+    perChBox.checked = !!model.get("polar_per_channel");
+    lab.appendChild(document.createTextNode(" per-order"));
   }
   function mkVmax(parent) {
     el("span", "px-label", parent).textContent = "g3 max";
@@ -286,40 +351,51 @@ function render({ model, el: root }) {
     return v;
   }
 
+  function mkHist(parent, w) {
+    const c = el("canvas", "px-hist", parent);
+    c.width = w; c.height = 46;
+    return c;
+  }
+
   if (layout === "stacked") {
-    // Full-width slice on top; g3 over g2 below (shared radial axis).
+    // Wide cell: full-width slice on top, analysis panels in one row beneath.
     const wrap = el("div", "px-wrap px-stacked", root);
     const lh = transpose ? Ly : Lx, lv = transpose ? Lx : Ly;
     sliceCanvas = el("canvas", "px-slice", wrap);
-    sliceCanvas.width = 760;
-    sliceCanvas.height = Math.max(90, Math.round(760 * lv / lh));
+    sliceCanvas.width = 960;
+    sliceCanvas.height = Math.max(80, Math.min(190, Math.round(960 * lv / lh)));
     const row = el("div", "px-row", wrap);
     sliceSlider = mkSlider(row);
     sliceVal = el("span", "px-val", row);
-    histCanvas = el("canvas", "px-hist", wrap);
-    histCanvas.width = 760; histCanvas.height = 64;
-    const irow = el("div", "px-row", wrap);
-    rotSlider = mkRotation(irow); rotVal = el("span", "px-val", irow);
-    inputCanvas = mkInput(wrap);
-    const col = el("div", "px-col", wrap);
-    g3Canvas = el("canvas", "px-g3", col); g3Canvas.width = 520; g3Canvas.height = 240;
-    g2Canvas = el("canvas", "px-g2", col); g2Canvas.width = 520; g2Canvas.height = 150;
-    vmaxInput = mkVmax(el("div", "px-row", wrap));
+
+    const panels = el("div", "px-wrap px-panels", wrap);
+    const cpol = el("div", "px-col", panels);
+    polarCanvas = mkPolar(cpol, 340, 200);
+    mkPolarControls(el("div", "px-row", cpol));
+    histCanvas = mkHist(cpol, 340);
+    const ccor = el("div", "px-col", panels);
+    g3Canvas = el("canvas", "px-g3", ccor); g3Canvas.width = 340; g3Canvas.height = 186;
+    g2Canvas = el("canvas", "px-g2", ccor); g2Canvas.width = 340; g2Canvas.height = 124;
+    vmaxInput = mkVmax(el("div", "px-row", ccor));
   } else {
+    // Three columns (slice | angular symmetry | g3 + g2) rather than one tall
+    // stack, so the slice and the angular map stay side by side while dragging.
     const wrap = el("div", "px-wrap", root);
     const left = el("div", "px-col px-left", wrap);
     sliceCanvas = el("canvas", "px-slice", left);
     sliceCanvas.width = 300; sliceCanvas.height = 300;
-    sliceSlider = mkSlider(el("div", "px-row", left));
-    sliceVal = el("span", "px-val", left.lastChild);
-    histCanvas = el("canvas", "px-hist", left);
-    histCanvas.width = 300; histCanvas.height = 70;
-    const irow = el("div", "px-row", left);
-    rotSlider = mkRotation(irow); rotVal = el("span", "px-val", irow);
-    inputCanvas = mkInput(left);
+    const srow = el("div", "px-row", left);
+    sliceSlider = mkSlider(srow);
+    sliceVal = el("span", "px-val", srow);
+
+    const mid = el("div", "px-col", wrap);
+    polarCanvas = mkPolar(mid, 330, 196);
+    mkPolarControls(el("div", "px-row", mid));
+    histCanvas = mkHist(mid, 330);
+
     const right = el("div", "px-col px-right", wrap);
-    g3Canvas = el("canvas", "px-g3", right); g3Canvas.width = 360; g3Canvas.height = 210;
-    g2Canvas = el("canvas", "px-g2", right); g2Canvas.width = 360; g2Canvas.height = 150;
+    g3Canvas = el("canvas", "px-g3", right); g3Canvas.width = 330; g3Canvas.height = 186;
+    g2Canvas = el("canvas", "px-g2", right); g2Canvas.width = 330; g2Canvas.height = 124;
     vmaxInput = mkVmax(el("div", "px-row", right));
   }
 
@@ -331,14 +407,15 @@ function render({ model, el: root }) {
     sliceSlider.max = (model.get("n_slices") || 1) - 1;
     sliceSlider.value = model.get("slice_index");
     sliceVal.textContent = `${model.get("slice_index")} (z=${model.get("z0").toFixed(1)} Å)`;
-    rotSlider.value = model.get("window_angle");
-    rotVal.textContent = `${(model.get("window_angle") || 0).toFixed(0)}°`;
+    gammaSlider.value = model.get("polar_gamma");
+    gammaVal.textContent = (model.get("polar_gamma") || 1).toFixed(2);
+    perChBox.checked = !!model.get("polar_per_channel");
     status.textContent = model.get("status") || "";
   }
   function redrawAll() {
     drawSlice(sliceCanvas, model, drag);
     drawHist(histCanvas, model);
-    drawInput(inputCanvas, model);
+    drawPolar(polarCanvas, model);
     drawG3(g3Canvas, model);
     drawG2(g2Canvas, model);
     syncControls();
@@ -386,9 +463,13 @@ function render({ model, el: root }) {
     model.set("slice_index", parseInt(sliceSlider.value, 10));
     model.save_changes();
   });
-  rotSlider.addEventListener("input", () => {
-    rotVal.textContent = `${parseFloat(rotSlider.value).toFixed(0)}°`;
-    model.set("window_angle", parseFloat(rotSlider.value));
+  gammaSlider.addEventListener("input", () => {
+    gammaVal.textContent = parseFloat(gammaSlider.value).toFixed(2);
+    model.set("polar_gamma", parseFloat(gammaSlider.value));
+    model.save_changes();
+  });
+  perChBox.addEventListener("change", () => {
+    model.set("polar_per_channel", perChBox.checked);
     model.save_changes();
   });
   vmaxInput.addEventListener("change", () => {
@@ -399,13 +480,14 @@ function render({ model, el: root }) {
 
   // react to Python-side updates
   model.on("change:slice_values", () => { drawSlice(sliceCanvas, model, drag); drawHist(histCanvas, model); });
-  model.on("change:input_values", () => drawInput(inputCanvas, model));
   model.on("change:g3_slice_values", () => drawG3(g3Canvas, model));
   model.on("change:g2", () => drawG2(g2Canvas, model));
   model.on("change:g3_vmax", () => drawG3(g3Canvas, model));
+  model.on("change:polar_values", () => drawPolar(polarCanvas, model));
+  model.on("change:polar_gamma", () => { drawPolar(polarCanvas, model); syncControls(); });
+  model.on("change:polar_per_channel", () => { drawPolar(polarCanvas, model); syncControls(); });
   model.on("change:status", syncControls);
   model.on("change:slice_index", syncControls);
-  model.on("change:window_angle", () => { drawInput(inputCanvas, model); syncControls(); });
 
   redrawAll();
 }

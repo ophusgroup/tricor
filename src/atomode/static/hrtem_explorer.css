@@ -69,3 +69,13 @@
   color: #666;
   font-variant-numeric: tabular-nums;
 }
+
+.px-polar {
+  display: block;
+  margin-top: 4px;
+  max-width: 100%;
+  image-rendering: pixelated;
+}
+
+.px-panels { margin-top: 6px; }
+.px-polar { display: block; max-width: 100%; image-rendering: pixelated; }

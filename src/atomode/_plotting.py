@@ -2581,9 +2581,23 @@ class _PlottingMixin:
         background: str = "white",
         colormap: str = "Reds",
         tetrahedral_thresh: float = 0.4,
+        tetrahedra: "dict | None" = None,
+        octahedra: "dict | None" = None,
+        cuboctahedra: "dict | None" = None,
+        polyhedra_color=(0.95, 0.55, 0.25),
+        polyhedra_opacity: float = 0.9,
+        polyhedra_edge_color=(0.12, 0.12, 0.15, 0.45),
+        show_bonds: "bool | None" = None,
         show_progress: bool = True,
     ):
-        """Render a bond-centric rotating 3D view of the atomic structure.
+        """Render a rotating 3D view of the atomic structure.
+
+        By default bonds are the primary visual: crystalline (tetrahedral)
+        bonds are drawn thick and coloured by depth; boundary / amorphous
+        bonds are drawn faint.  Passing one of *tetrahedra* / *octahedra* /
+        *cuboctahedra* instead renders translucent coordination polyhedra
+        (matplotlib depth-sorts the faces per frame, which is stable for
+        the shrunken, non-overlapping polyhedra) and disables bonds.
 
         Bonds are the primary visual: crystalline (tetrahedral) bonds
         are drawn thick and coloured by depth; boundary / amorphous
@@ -2629,116 +2643,173 @@ class _PlottingMixin:
         tetrahedral_thresh
             Maximum norm of mean NN displacement vector for an atom to
             be classified as crystalline.  Smaller = stricter.
+        tetrahedra, octahedra, cuboctahedra
+            Coordination-polyhedra config dict (at most one), e.g.
+            ``octahedra=dict(center_symbol="Nb", vertex_symbol="N",
+            bond_length=2.19, scale=0.5)``.  When set, translucent
+            polyhedra replace bonds and bonds are disabled unless
+            *show_bonds* is passed explicitly.  ``scale=0.5`` shrinks each
+            polyhedron to its bond midpoints so neighbours separate.
+        polyhedra_color, polyhedra_opacity, polyhedra_edge_color
+            Face RGB, face opacity, and edge RGBA for rendered polyhedra.
+            A ``color`` / ``opacity`` key inside the polyhedra dict wins.
+        show_bonds
+            Force bonds on/off.  ``None`` (default) draws bonds only when
+            no polyhedra are requested.
         show_progress
             Print frame counter during GIF rendering.
         """
         import matplotlib.pyplot as plt
-        from mpl_toolkits.mplot3d.art3d import Line3DCollection
+        from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
 
         pos = self.atoms.positions.copy()
         cell_mat = np.asarray(self.atoms.cell.array, dtype=np.float64)
         cell_inv = np.linalg.inv(cell_mat)
         num_atoms = len(self.atoms)
 
-        # --- bond cutoff ---
-        if bond_cutoff is None:
-            if shell_target is not None:
-                # Use a generous cutoff (pair_peak + 3*sigma or 1.2x)
-                pair_peak_max = float(np.max(
-                    np.asarray(shell_target.pair_peak, dtype=np.float64),
-                ))
-                bond_cutoff = pair_peak_max * 1.2
-            else:
-                bond_cutoff = 3.0
-
-        if shell_target is not None:
-            coord_target = np.asarray(shell_target.coordination_target, dtype=np.float64)
-            species_idx = (
-                self._atom_shell_species_index
-                if getattr(self, "_atom_shell_species_index", None) is not None
-                else self._atom_species_index
-            )
-            k_per_atom = np.array([
-                int(np.round(coord_target[species_idx[a]].sum()))
-                for a in range(num_atoms)
-            ], dtype=np.intp)
-        else:
-            k_per_atom = np.full(num_atoms, 4, dtype=np.intp)
-
-        # --- find bonds ---
-        bi_all, bj_all, bd_all = neighbor_list("ijd", self.atoms, bond_cutoff)
+        # --- resolve polyhedra vs. bonds ---
+        # A polyhedra config replaces bonds as the primary visual; bonds
+        # are then off unless the caller forces them with show_bonds.
+        poly_cfg = _resolve_polyhedra_cfg(
+            tetrahedra=tetrahedra, octahedra=octahedra, cuboctahedra=cuboctahedra,
+        )
+        draw_polyhedra = poly_cfg is not None
+        if show_bonds is None:
+            show_bonds = not draw_polyhedra
 
         def _min_image(delta: np.ndarray) -> np.ndarray:
             frac = delta @ cell_inv
             frac -= np.rint(frac)
             return frac @ cell_mat
 
-        # --- classify atoms as crystalline ---
-        # Two criteria (either makes an atom crystalline):
-        # 1) Tetrahedral check (MATLAB style): K NN within cutoff and
-        #    symmetric coordination (mean displacement < thresh).
-        #    Allow K-1 to K+1 neighbors for tolerance.
-        # 2) Grain interior: deep inside a crystalline Voronoi cell.
-        is_crystalline_atom = np.zeros(num_atoms, dtype=bool)
-
-        # Criterion 1: tetrahedral / symmetric coordination
-        for a in range(num_atoms):
-            mask = bi_all == a
-            nn_count = int(np.sum(mask))
-            k_target = int(k_per_atom[a])
-            if nn_count < max(k_target - 1, 1) or nn_count > k_target + 1:
-                continue
-            # Use K nearest for the displacement check
-            dists_a = bd_all[mask]
-            js_a = bj_all[mask]
-            order = np.argsort(dists_a)[:k_target]
-            dxyz = _min_image(pos[js_a[order]] - pos[a])
-            mean_disp = np.linalg.norm(np.mean(dxyz, axis=0))
-            if mean_disp < tetrahedral_thresh:
-                is_crystalline_atom[a] = True
-
-        # Criterion 2: grain interior atoms (always crystalline)
-        grain_ids = self._grain_ids
-        grain_seeds = self._grain_seeds
-        if grain_ids is not None and grain_seeds is not None:
-            pp_max = float(np.max(
-                np.asarray(shell_target.pair_peak, dtype=np.float64),
-            )) if shell_target is not None else 2.5
-            bw = pp_max * 0.5
-            delta_seeds = pos[:, None, :] - grain_seeds[None, :, :]
-            frac_ds = delta_seeds @ cell_inv
-            frac_ds -= np.rint(frac_ds)
-            cart_ds = frac_ds @ cell_mat
-            dist_to_seeds = np.sqrt(np.sum(cart_ds ** 2, axis=2))
-            for ia in range(num_atoms):
-                gid = grain_ids[ia]
-                if gid < 0:
-                    continue
-                d_own = dist_to_seeds[ia, gid]
-                dists_copy = dist_to_seeds[ia].copy()
-                dists_copy[gid] = np.inf
-                d_other = float(np.min(dists_copy))
-                if (d_other - d_own) * 0.5 > bw:
-                    is_crystalline_atom[ia] = True
-
-        # Keep i < j for unique bonds
-        mask_ij = bi_all < bj_all
-        bi, bj = bi_all[mask_ij], bj_all[mask_ij]
-
-        # Bond is crystalline if BOTH endpoints are crystalline
-        bond_is_cryst = is_crystalline_atom[bi] & is_crystalline_atom[bj]
-
-        # Bond segment endpoints (minimum-image)
-        bond_vecs = _min_image(pos[bj] - pos[bi])
-        bond_starts = pos[bi]
-        bond_ends = bond_starts + bond_vecs
-
-        # --- center everything ---
+        # --- center everything (atoms, bonds, polyhedra share this frame) ---
         a_vec, b_vec, c_vec = cell_mat[0], cell_mat[1], cell_mat[2]
         center = 0.5 * (a_vec + b_vec + c_vec)
         pos_c = pos - center
-        bstart_c = bond_starts - center
-        bend_c = bond_ends - center
+        extent = float(np.max(np.abs(pos_c))) * 1.15
+
+        # --- bonds (skipped entirely when polyhedra are the visual) ---
+        cryst_mask = bnd_mask = None
+        bstart_c = bend_c = None
+        if show_bonds:
+            if bond_cutoff is None:
+                if shell_target is not None:
+                    # Use a generous cutoff (pair_peak + 3*sigma or 1.2x)
+                    pair_peak_max = float(np.max(
+                        np.asarray(shell_target.pair_peak, dtype=np.float64),
+                    ))
+                    bond_cutoff = pair_peak_max * 1.2
+                else:
+                    bond_cutoff = 3.0
+
+            if shell_target is not None:
+                coord_target = np.asarray(shell_target.coordination_target, dtype=np.float64)
+                species_idx = (
+                    self._atom_shell_species_index
+                    if getattr(self, "_atom_shell_species_index", None) is not None
+                    else self._atom_species_index
+                )
+                k_per_atom = np.array([
+                    int(np.round(coord_target[species_idx[a]].sum()))
+                    for a in range(num_atoms)
+                ], dtype=np.intp)
+            else:
+                k_per_atom = np.full(num_atoms, 4, dtype=np.intp)
+
+            # --- find bonds ---
+            bi_all, bj_all, bd_all = neighbor_list("ijd", self.atoms, bond_cutoff)
+
+            # --- classify atoms as crystalline ---
+            # Two criteria (either makes an atom crystalline):
+            # 1) Tetrahedral check (MATLAB style): K NN within cutoff and
+            #    symmetric coordination (mean displacement < thresh).
+            #    Allow K-1 to K+1 neighbors for tolerance.
+            # 2) Grain interior: deep inside a crystalline Voronoi cell.
+            is_crystalline_atom = np.zeros(num_atoms, dtype=bool)
+
+            # Criterion 1: tetrahedral / symmetric coordination
+            for a in range(num_atoms):
+                mask = bi_all == a
+                nn_count = int(np.sum(mask))
+                k_target = int(k_per_atom[a])
+                if nn_count < max(k_target - 1, 1) or nn_count > k_target + 1:
+                    continue
+                # Use K nearest for the displacement check
+                dists_a = bd_all[mask]
+                js_a = bj_all[mask]
+                order = np.argsort(dists_a)[:k_target]
+                dxyz = _min_image(pos[js_a[order]] - pos[a])
+                mean_disp = np.linalg.norm(np.mean(dxyz, axis=0))
+                if mean_disp < tetrahedral_thresh:
+                    is_crystalline_atom[a] = True
+
+            # Criterion 2: grain interior atoms (always crystalline)
+            grain_ids = self._grain_ids
+            grain_seeds = self._grain_seeds
+            if grain_ids is not None and grain_seeds is not None:
+                pp_max = float(np.max(
+                    np.asarray(shell_target.pair_peak, dtype=np.float64),
+                )) if shell_target is not None else 2.5
+                bw = pp_max * 0.5
+                delta_seeds = pos[:, None, :] - grain_seeds[None, :, :]
+                frac_ds = delta_seeds @ cell_inv
+                frac_ds -= np.rint(frac_ds)
+                cart_ds = frac_ds @ cell_mat
+                dist_to_seeds = np.sqrt(np.sum(cart_ds ** 2, axis=2))
+                for ia in range(num_atoms):
+                    gid = grain_ids[ia]
+                    if gid < 0:
+                        continue
+                    d_own = dist_to_seeds[ia, gid]
+                    dists_copy = dist_to_seeds[ia].copy()
+                    dists_copy[gid] = np.inf
+                    d_other = float(np.min(dists_copy))
+                    if (d_other - d_own) * 0.5 > bw:
+                        is_crystalline_atom[ia] = True
+
+            # Keep i < j for unique bonds
+            mask_ij = bi_all < bj_all
+            bi, bj = bi_all[mask_ij], bj_all[mask_ij]
+
+            # Bond is crystalline if BOTH endpoints are crystalline
+            bond_is_cryst = is_crystalline_atom[bi] & is_crystalline_atom[bj]
+
+            # Bond segment endpoints (minimum-image), box-centred
+            bond_vecs = _min_image(pos[bj] - pos[bi])
+            bstart_c = pos[bi] - center
+            bend_c = bstart_c + bond_vecs
+            cryst_mask = bond_is_cryst
+            bnd_mask = ~bond_is_cryst
+
+        # --- polyhedra geometry (static; only the rotation changes) ---
+        poly_verts = None          # (n_poly, n_vertices, 3), box-centred
+        poly_faces_per = None      # list[n_poly] of list[face index arrays]
+        poly_facecolor = None
+        if draw_polyhedra:
+            group = _render_polyhedra_group(
+                self.atoms, poly_cfg, cell_obj=self,
+                default_color=tuple(polyhedra_color),
+                default_opacity=polyhedra_opacity,
+            )
+            n_poly = int(group["num"])
+            if n_poly > 0:
+                n_v = int(group["n_vertices"])
+                # _polyhedra_vertex_coords already box-centres the vertices,
+                # so they live in the same frame as pos_c (no re-centering).
+                poly_verts = np.asarray(
+                    group["vertices"], dtype=np.float64,
+                ).reshape(n_poly, n_v, 3)
+                if group["per_polyhedron_topology"]:
+                    poly_faces_per = [
+                        [np.asarray(f, dtype=int) for f in pf]
+                        for pf in group["polyhedra_faces_per_poly"]
+                    ]
+                else:
+                    shared = [np.asarray(f, dtype=int) for f in group["faces"]]
+                    poly_faces_per = [shared] * n_poly
+                poly_facecolor = (*group["color"], float(group["opacity"]))
+            else:
+                draw_polyhedra = False
 
         # Cell outline edges
         o = -center
@@ -2755,10 +2826,6 @@ class _PlottingMixin:
 
         # --- colormap for crystalline bonds (depth-coloured) ---
         cmap = plt.get_cmap(colormap)
-
-        cryst_mask = bond_is_cryst
-        bnd_mask = ~bond_is_cryst
-        extent = float(np.max(np.abs(pos_c))) * 1.15
 
         dpi = 100
         figsize = (width / dpi, height / dpi)
@@ -2785,35 +2852,54 @@ class _PlottingMixin:
             except (TypeError, AttributeError):
                 pass  # older matplotlib
 
-            # Rotate bond endpoints in x-y plane (like MATLAB)
-            bs_r = _rotate_2d(bstart_c, theta_rad)
-            be_r = _rotate_2d(bend_c, theta_rad)
+            # --- bonds (only when no polyhedra, or forced on) ---
+            if show_bonds and cryst_mask is not None:
+                # Rotate bond endpoints in x-y plane (like MATLAB)
+                bs_r = _rotate_2d(bstart_c, theta_rad)
+                be_r = _rotate_2d(bend_c, theta_rad)
 
-            # --- boundary bonds: very faint ---
-            if np.any(bnd_mask):
-                segs_b = list(zip(bs_r[bnd_mask], be_r[bnd_mask]))
-                lc_b = Line3DCollection(
-                    segs_b, linewidths=0.3,
-                    colors=(0.0, 0.0, 0.0, 0.05),
-                )
-                ax.add_collection3d(lc_b)
+                # --- boundary bonds: very faint ---
+                if np.any(bnd_mask):
+                    segs_b = list(zip(bs_r[bnd_mask], be_r[bnd_mask]))
+                    lc_b = Line3DCollection(
+                        segs_b, linewidths=0.3,
+                        colors=(0.0, 0.0, 0.0, 0.05),
+                    )
+                    ax.add_collection3d(lc_b)
 
-            # --- crystalline bonds: depth-coloured + depth-width ---
-            # Camera at +x (azim=0): larger rotated-x = closer.
-            # Linear depth with floor so far bonds remain visible.
-            if np.any(cryst_mask):
-                segs_cr = list(zip(bs_r[cryst_mask], be_r[cryst_mask]))
-                mid_x_rot = 0.5 * (bs_r[cryst_mask, 0] + be_r[cryst_mask, 0])
-                norm_depth = (mid_x_rot + extent) / max(2.0 * extent, _EPS)
-                norm_depth = np.clip(norm_depth, 0, 1)
-                # Colormap: 0.15 at back (faint but visible), 0.95 at front
-                cryst_colors = cmap(0.15 + 0.8 * norm_depth)
-                # Linewidth: 0.4 at back, 2.0 at front
-                cryst_lw = 0.4 + 1.6 * norm_depth
-                lc_c = Line3DCollection(
-                    segs_cr, linewidths=cryst_lw, colors=cryst_colors,
+                # --- crystalline bonds: depth-coloured + depth-width ---
+                # Camera at +x (azim=0): larger rotated-x = closer.
+                # Linear depth with floor so far bonds remain visible.
+                if np.any(cryst_mask):
+                    segs_cr = list(zip(bs_r[cryst_mask], be_r[cryst_mask]))
+                    mid_x_rot = 0.5 * (bs_r[cryst_mask, 0] + be_r[cryst_mask, 0])
+                    norm_depth = (mid_x_rot + extent) / max(2.0 * extent, _EPS)
+                    norm_depth = np.clip(norm_depth, 0, 1)
+                    # Colormap: 0.15 at back (faint but visible), 0.95 at front
+                    cryst_colors = cmap(0.15 + 0.8 * norm_depth)
+                    # Linewidth: 0.4 at back, 2.0 at front
+                    cryst_lw = 0.4 + 1.6 * norm_depth
+                    lc_c = Line3DCollection(
+                        segs_cr, linewidths=cryst_lw, colors=cryst_colors,
+                    )
+                    ax.add_collection3d(lc_c)
+
+            # --- polyhedra: translucent faces, matplotlib depth-sorts them ---
+            if draw_polyhedra:
+                flat_r = _rotate_2d(poly_verts.reshape(-1, 3), theta_rad)
+                pv_r = flat_r.reshape(poly_verts.shape)
+                tris = [
+                    pv_r[p][f]
+                    for p in range(pv_r.shape[0])
+                    for f in poly_faces_per[p]
+                ]
+                pc = Poly3DCollection(
+                    tris,
+                    facecolors=[poly_facecolor] * len(tris),
+                    edgecolors=[tuple(polyhedra_edge_color)] * len(tris),
+                    linewidths=0.25,
                 )
-                ax.add_collection3d(lc_c)
+                ax.add_collection3d(pc)
 
             # --- cell outline ---
             if show_cell:
