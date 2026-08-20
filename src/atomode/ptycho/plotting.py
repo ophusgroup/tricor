@@ -253,6 +253,9 @@ def plot_polar_features(features, r=None, *, ax=None, title="angular symmetry or
     if ax is None:
         _, ax = plt.subplots(figsize=figsize)
 
+    # Row 0 is signed; display its magnitude so the negative lobe does not
+    # render as a black band.
+    f = np.abs(f)
     if per_channel:
         norm = f / np.maximum(f.max(axis=1, keepdims=True), 1e-12)
     else:

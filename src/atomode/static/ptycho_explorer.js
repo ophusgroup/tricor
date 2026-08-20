@@ -260,13 +260,13 @@ function drawPolar(canvas, model) {
   if (perCh) {
     for (let m = 0; m < M; m++) {
       let mx = 0;
-      for (let i = 0; i < NR; i++) { const v = vals[m * NR + i]; if (Number.isFinite(v) && v > mx) mx = v; }
+      for (let i = 0; i < NR; i++) { const v = Math.abs(vals[m * NR + i]); if (Number.isFinite(v) && v > mx) mx = v; }
       scale[m] = mx > 0 ? mx : 1;
     }
   } else {
     let mx = 0;
     for (let m = (skip0 && M > 1) ? 1 : 0; m < M; m++) {
-      for (let i = 0; i < NR; i++) { const v = vals[m * NR + i]; if (Number.isFinite(v) && v > mx) mx = v; }
+      for (let i = 0; i < NR; i++) { const v = Math.abs(vals[m * NR + i]); if (Number.isFinite(v) && v > mx) mx = v; }
     }
     for (let m = 0; m < M; m++) scale[m] = mx > 0 ? mx : 1;
   }
@@ -277,7 +277,7 @@ function drawPolar(canvas, model) {
   const img = octx.createImageData(NR, M);
   for (let m = 0; m < M; m++) {
     for (let i = 0; i < NR; i++) {
-      let t = vals[m * NR + i] / scale[m];
+      let t = Math.abs(vals[m * NR + i]) / scale[m];
       t = Math.pow(Math.max(0, Math.min(1, t)), gamma);
       const c = rampRGB(MAGMA, t);
       const k = (m * NR + i) * 4;

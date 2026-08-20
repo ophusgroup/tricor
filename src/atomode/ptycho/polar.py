@@ -198,8 +198,10 @@ def polar_fft_features(
     Returns
     -------
     numpy.ndarray
-        ``(len(orders), n_r)`` non-negative features.  Use
-        :func:`default_orders` to recover which order each row is.
+        ``(len(orders), n_r)``.  Row 0 is signed (it is the angularly
+        averaged pair correlation and dips below zero); rows ``m > 0`` are
+        magnitudes and non-negative.  Use :func:`default_orders` to recover
+        which order each row is.
     """
     from scipy.ndimage import map_coordinates
 
@@ -227,10 +229,23 @@ def polar_fft_features(
         order=int(spline_order), mode="grid-wrap" if wrap else "nearest",
     ).reshape(int(n_phi), int(n_r))
 
-    spec = np.abs(np.fft.fft(vals - vals.mean(), axis=0)) / int(n_phi)
-    out = spec[list(orders), :]
+    spec = np.fft.fft(vals - vals.mean(), axis=0) / int(n_phi)
 
-    scale = float(np.abs(out[0]).mean())
+    # Order 0 is the angular mean, which is real and *signed*: for an
+    # autocorrelation it is the angularly averaged pair correlation and it
+    # legitimately oscillates below zero (first crossing near 1 A for Si).
+    # Taking |.| there would fold the negative lobes up and put a cusp at
+    # every zero crossing; the sign is kept instead.  For m > 0 the
+    # magnitude is the point, since the phase is only the motif's
+    # orientation.
+    rows = []
+    for o in orders:
+        rows.append(np.real(spec[o]) if o == 0 else np.abs(spec[o]))
+    out = np.asarray(rows)
+
+    # Normalise on the zero-lag peak (the windowed patch variance), which is
+    # stable and positive, rather than on a mean that can pass through zero.
+    scale = abs(float(out[0][: max(1, int(0.05 / r_step))].mean()))
     if scale > 1e-12:
         out = out / scale
     return out * _radial_window(r, r_max, taper)[None, :]
