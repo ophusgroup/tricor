@@ -30,10 +30,17 @@ from ase.atoms import Atoms
 
 from .g3 import _EPS
 
+
+_XTAL_COLLISION_FRAC = 1.00
+
 if TYPE_CHECKING:
     from .shells import CoordinationShellTarget
     from .supercell import Supercell
 
+# The fast grain path sizes its master atom block from a statistical
+# envelope of the largest Voronoi cell radius. See the
+# ``can_fast`` branch of ``_GrainMixin._build_grain_atoms``.
+_FAST_PATH_EXACT_RADIUS_MAX_GRAINS = 64
 
 # --------------------------------------------------------------------------
 # Module-level helpers - ported from tests/tiling3d.py
@@ -52,10 +59,6 @@ def _unique_rows(points: np.ndarray, decimals: int = 12) -> np.ndarray:
 
 def _periodic_voronoi_3d(box: np.ndarray, seeds: np.ndarray) -> list[dict]:
     """Compute the periodic Voronoi cells of *seeds* in a rectangular box.
-
-    Uses the standard 27-replica trick: the central replica's cells are
-    closed (all vertices finite) because the surrounding replicas act as
-    neighbour points.
 
     Each returned cell dict has ``vertices`` (relative to its seed),
     ``equations`` and ``simplices`` from a :class:`scipy.spatial.ConvexHull`
@@ -88,11 +91,9 @@ def _periodic_voronoi_3d(box: np.ndarray, seeds: np.ndarray) -> list[dict]:
         region = vor.regions[region_index]
         if -1 in region or len(region) == 0:
             raise RuntimeError("Unexpected infinite Voronoi region")
-
         rel_vertices = _unique_rows(vor.vertices[region] - seed)
         if len(rel_vertices) < 4:
             raise RuntimeError("Voronoi cell has too few vertices for a 3D hull")
-
         hull = ConvexHull(rel_vertices)
         cells.append(
             {
@@ -285,9 +286,14 @@ def _sample_padding_atoms(
     pad_min_sep: float,
     rng: np.random.Generator,
     *,
-    max_rounds: int = 8,
+    max_rounds: int = 200,
     oversample: float = 4.0,
-) -> tuple[np.ndarray, int]:
+    exclude=None,
+    pair_cutoff: "np.ndarray | None" = None,
+    species_index: "np.ndarray | None" = None,
+    pad_row: int = 0,
+    backoff: float = 0.96,
+) -> tuple[np.ndarray, int, float]:
     """Batched rejection sampling for step 7b padding.
 
     Equivalent in spirit to the original serial trial-and-error loop:
@@ -299,29 +305,104 @@ def _sample_padding_atoms(
     metric via ``boxsize=box_dim``).  Drops step 7b padding wall-clock
     from ~131 s → ~3 s for amorphous at 100×100×400.
 
-    Returns ``(accepted_positions, total_trials)`` — ``total_trials``
-    mirrors the old ``tries`` counter for telemetry parity.
+    ``exclude`` is an optional ``f(points) -> bool array`` marking trial
+    positions that must be rejected regardless of spacing.  Used by
+    ``protect_crystallites`` to keep padding out of the crystalline Voronoi
+    cells: this sampler draws uniformly over the whole box, so the exact-count
+    shortfall otherwise lands random atoms INSIDE the crystallites as
+    interstitials.  Measured on a 20 Å corundum grain, 61 padding atoms sat
+    inside its hull and pushed the interior to CN 6.13-6.29 against the 6.000 a
+    perfect crystal gives — crystal-crystal pairs alone were exactly 6.000 /
+    100% six-fold, which is how the interstitials were identified.
 
-    Caller is responsible for the loose-placement fallback if this
-    returns fewer than ``n_missing`` atoms (it shouldn't except in
-    pathologically over-dense boxes).
+    PAIR-RESOLVED spacing.  ``pad_min_sep`` is a single scalar derived from
+    ``min(pair_hard_min)``, i.e. one pair's floor imposed on every pair.  For
+    corundum that is Al-O 1.710, so 0.8 x it lets an O-O land at 1.368 A when
+    its true floor is 2.326 A -- tighter than the 1.710 A pack that produced
+    the peroxide defects in the first place.  When ``pair_cutoff`` (an (S, S)
+    matrix), ``species_index`` (existing atom -> species row) and ``pad_row``
+    (the species being padded) are supplied, each trial is tested against the
+    real per-pair floor instead.  Species trees are built once and reused;
+    only the scale changes between rounds.
+
+    GRACEFUL BACKOFF.  The old version ran 8
+    fixed rounds and left the caller to loose-place the shortfall with NO
+    spacing test at all -- measured on Al2O3 cf=0.95 the batched sampler placed
+    0 of 535 atoms, so all 535 went in unchecked.  Instead the floor is relaxed
+    geometrically every 10 rounds with NO lower clamp, and the achieved scale is
+    RETURNED so the caller can record how far it had to give.  Relaxing the
+    floor is always preferable to the old behaviour of handing the shortfall to
+    an unchecked random placement.
+
+    Returns ``(accepted_positions, total_trials, effective_scale)``;
+    ``effective_scale < 1`` means the floor was relaxed to reach the count.
     """
     from scipy.spatial import cKDTree
 
     if n_missing <= 0:
-        return np.empty((0, 3), dtype=np.float64), 0
+        return np.empty((0, 3), dtype=np.float64), 0, 1.0
 
-    tree_existing = (
-        cKDTree(existing_positions, boxsize=box_dim)
-        if len(existing_positions) > 0 else None
-    )
+    use_pairs = pair_cutoff is not None and species_index is not None
+    trees_by_species: list = []
+    tree_existing = None
+    if use_pairs:
+        pair_cutoff = np.asarray(pair_cutoff, dtype=np.float64)
+        species_index = np.asarray(species_index, dtype=np.intp)
+        for srow in range(pair_cutoff.shape[0]):
+            sel = species_index == srow
+            trees_by_species.append(
+                cKDTree(existing_positions[sel], boxsize=box_dim)
+                if sel.any() else None
+            )
+        self_sep = pair_cutoff[pad_row, pad_row]
+    else:
+        tree_existing = (
+            cKDTree(existing_positions, boxsize=box_dim)
+            if len(existing_positions) > 0 else None
+        )
+        self_sep = pad_min_sep
 
     accepted = np.empty((0, 3), dtype=np.float64)
     total_trials = 0
-    for _round in range(max_rounds):
+    scale = 1.0
+    # `max_rounds` is the budget after which the decayed floor stops being
+    # meaningfully restrictive; `_HARD_ROUNDS` is the absolute ceiling.  We keep
+    # going past max_rounds because a short count changes composition AND
+    # density and is unrecoverable, whereas a padding atom is amorphous and
+    # free to move, so a tight pair involving one is separated by the
+    # relaxation that follows -- verified in isolation: a free atom 1.5 A from
+    # a FROZEN crystalline partner reaches its 2.975 A floor in 40 bond_relax
+    # sweeps with the frozen atom immobile, because `skip_mask` gives the free
+    # partner the whole displacement.  That repair does stall in an over-dense
+    # cell (measured: relative_density 1.2-1.8 leaves pairs ~0.3 A sub-floor
+    # indefinitely), so the guarantee is "placed, and separable at sane
+    # density", not "placed and always clean".
+    #
+    # Two independent exits, because the two failure modes are different:
+    #   * `_blocked` -- 40 CONSECUTIVE rounds in which `exclude` rejected the
+    #     entire batch.  That means the unprotected volume is saturated and no
+    #     amount of further decay helps, so stop early rather than grind.
+    #   * `_HARD_ROUNDS` -- an absolute ceiling, so the worst case is bounded
+    #     no matter how the accept fraction behaves.  Without it the `_blocked`
+    #     reset on every placement makes the true bound O(40 * n_missing);
+    #     measured by direct call at 12,409 rounds / 1.8e8 trials before this
+    #     ceiling existed.
+    _HARD_ROUNDS = 4 * max_rounds
+    _blocked = 0
+    _round = -1
+    while _round + 1 < _HARD_ROUNDS and _blocked < 40:
+        _round += 1
         need = n_missing - len(accepted)
         if need <= 0:
             break
+        if _round and _round % 10 == 0:
+            # UNCLAMPED, deliberately.  A clamp turns "floor relaxed to 0.84"
+            # into "N atoms placed with no spacing test at all", which is
+            # strictly worse and much harder to notice.  Backing off always
+            # beats giving up: the achieved scale is returned and recorded in
+            # atoms.info["padding_report"], so an over-dense box reports how
+            # far it had to give instead of hiding unchecked atoms.
+            scale *= backoff
         # Over-sample by ``oversample`` to absorb a typical ~25 %
         # rejection rate in a single round.  Floor at 256 so very
         # small ``need`` values still amortize the KDTree query.
@@ -329,12 +410,32 @@ def _sample_padding_atoms(
         trials = rng.random((n_trial, 3)) * box_dim
         total_trials += n_trial
 
-        # 1) Drop trials that collide with EXISTING atoms.
-        if tree_existing is not None:
+        # 0) Drop trials inside an excluded region (protected crystallites).
+        if exclude is not None and len(trials):
+            keep_ex = ~np.asarray(exclude(trials), dtype=bool)
+            trials = trials[keep_ex]
+            if trials.shape[0] == 0:
+                # The ONLY failure the floor decay cannot fix: every candidate
+                # landed inside a protected crystallite.  Padding deliberately
+                # never enters those cells, so if the unprotected volume is
+                # saturated the count cannot be filled at any scale.
+                _blocked += 1
+                continue
+
+        # 1) Drop trials that collide with EXISTING atoms, per-pair.  One
+        #    nearest-neighbour query per species row: the floor a trial must
+        #    clear depends on WHICH species it is near, so a single k=1 query
+        #    against all atoms cannot express it.
+        cand = trials
+        if use_pairs:
+            for srow, tree_s in enumerate(trees_by_species):
+                if tree_s is None or cand.shape[0] == 0:
+                    continue
+                d_nn, _ = tree_s.query(cand, k=1)
+                cand = cand[d_nn >= pair_cutoff[pad_row, srow] * scale]
+        elif tree_existing is not None:
             d_nn, _ = tree_existing.query(trials, k=1)
-            cand = trials[d_nn >= pad_min_sep]
-        else:
-            cand = trials
+            cand = trials[d_nn >= pad_min_sep * scale]
         if cand.shape[0] == 0:
             continue
 
@@ -343,7 +444,7 @@ def _sample_padding_atoms(
         if len(accepted) > 0:
             tree_acc = cKDTree(accepted, boxsize=box_dim)
             d_nn_acc, _ = tree_acc.query(cand, k=1)
-            cand = cand[d_nn_acc >= pad_min_sep]
+            cand = cand[d_nn_acc >= self_sep * scale]
         if cand.shape[0] == 0:
             continue
 
@@ -355,7 +456,7 @@ def _sample_padding_atoms(
         if len(cand) > 1:
             tree_cand = cKDTree(cand, boxsize=box_dim)
             pairs = tree_cand.query_pairs(
-                pad_min_sep, output_type="ndarray",
+                self_sep * scale, output_type="ndarray",
             )
             if len(pairs) > 0:
                 to_drop = np.zeros(len(cand), dtype=bool)
@@ -373,8 +474,9 @@ def _sample_padding_atoms(
             cand[:take] if accepted.shape[0] == 0
             else np.concatenate([accepted, cand[:take]], axis=0)
         )
+        _blocked = 0
 
-    return accepted, total_trials
+    return accepted, total_trials, scale
 
 
 def _push_close_pairs_apart(
@@ -385,10 +487,25 @@ def _push_close_pairs_apart(
     pbc,
     push_cutoff: float,
     max_iter: int = 40,
+    pair_cutoff: "np.ndarray | None" = None,
+    species_index: "np.ndarray | None" = None,
+    skip_mask: "np.ndarray | None" = None,
 ) -> np.ndarray:
-    """Iteratively push any pair closer than ``push_cutoff`` out to
-    ``push_cutoff`` along the pair axis, wrapping positions back into
-    the cell after each iteration.
+    """Iteratively push any pair closer than its cutoff out to that cutoff.
+
+    ``push_cutoff`` is the scalar fallback.  When ``pair_cutoff`` (an (S, S)
+    matrix) and ``species_index`` (atom -> species row) are supplied, each pair
+    gets its OWN target instead.
+
+    Why that matters: the caller used to collapse ``pair_hard_min`` to
+    ``np.min(...)`` and push every species pair to that one number.  For
+    corundum that is min(Al-Al 2.513, Al-O 1.710, O-O 2.326) = 1.710, so O-O
+    was left 0.62 A too close and Al-Al 0.80 A too close -- by construction,
+    in every pack.  Those residual contacts then became the MACE wall's floor
+    (pack min - margin), which licensed a peroxide collapse to 1.58 A.
+
+    ``skip_mask`` marks atoms that must not be moved; a pair is skipped only
+    when BOTH of its atoms are masked.
 
     Cheap geometric pre-conditioner used BEFORE shell_relax.  Without
     it, close pairs introduced by Voronoi-grain overlap padding or by
@@ -405,7 +522,14 @@ def _push_close_pairs_apart(
     """
     from scipy.spatial import cKDTree
 
-    if len(positions) == 0 or push_cutoff <= 0:
+    use_pairs = pair_cutoff is not None and species_index is not None
+    if use_pairs:
+        pair_cutoff = np.asarray(pair_cutoff, dtype=np.float64)
+        species_index = np.asarray(species_index, dtype=np.intp)
+        query_r = pair_cutoff.max()
+    else:
+        query_r = push_cutoff
+    if len(positions) == 0 or query_r <= 0:
         return positions
     positions = np.asarray(positions, dtype=np.float64).copy()
     cell_mat = np.asarray(cell_mat, dtype=np.float64)
@@ -421,20 +545,49 @@ def _push_close_pairs_apart(
         else:
             wrap = positions
             tree = cKDTree(wrap)
-        pairs = tree.query_pairs(float(push_cutoff), output_type="ndarray")
+        pairs = tree.query_pairs(query_r, output_type="ndarray")
         if len(pairs) == 0:
             break
         ii = pairs[:, 0]
         jj = pairs[:, 1]
+        if use_pairs:
+            target = pair_cutoff[species_index[ii], species_index[jj]]
+        else:
+            target = np.full(len(ii), push_cutoff)
+        if skip_mask is not None:
+            frozen_pair = skip_mask[ii] & skip_mask[jj]
+            if frozen_pair.any():
+                keep = ~frozen_pair
+                ii, jj, target = ii[keep], jj[keep], target[keep]
+                if len(ii) == 0:
+                    break
         delta = wrap[jj] - wrap[ii]
         if use_pbc:
             delta -= np.round(delta / box) * box
         d = np.linalg.norm(delta, axis=1).clip(min=1e-9)
-        needed = push_cutoff - d
+        active = d < target
+        if not active.any():
+            break
+        ii, jj, delta, d, target = (ii[active], jj[active], delta[active],
+                                    d[active], target[active])
+        needed = target - d
         unit = delta / d[:, None]
-        step = 0.5 * needed[:, None] * unit
-        np.add.at(positions, jj, step)
-        np.add.at(positions, ii, -step)
+        if skip_mask is None:
+            fi = fj = np.full(len(ii), 0.5)
+        else:
+            # A protected (crystalline) atom must not move, so its free partner
+            # absorbs the entire separation.  Splitting it 50/50 as before is
+            # what distorted the frozen grains: the push was enforcing the much
+            # larger pair-resolved separations by dragging lattice atoms, which
+            # created MORE short crystalline-crystalline contacts than it fixed
+            # (measured 78 -> 660).  Pairs with both atoms protected were
+            # already dropped above.
+            wi = (~skip_mask[ii]).astype(np.float64)
+            wj = (~skip_mask[jj]).astype(np.float64)
+            tot = np.clip(wi + wj, 1e-12, None)
+            fi, fj = wi / tot, wj / tot
+        np.add.at(positions, jj, (fj * needed)[:, None] * unit)
+        np.add.at(positions, ii, -(fi * needed)[:, None] * unit)
         if use_pbc:
             positions -= np.floor(positions / box) * box
     return positions
@@ -456,6 +609,7 @@ class _GrainMixin:
         grain_sources: "list[dict] | None" = None,
         rotations_override: "np.ndarray | None" = None,
         seeds: "np.ndarray | None" = None,
+        protect_crystallites: bool = False,
     ) -> Atoms:
         """Build a supercell with crystalline grains via Voronoi tiling.
 
@@ -708,6 +862,10 @@ class _GrainMixin:
             # ---- 6. Fill each grain ----
             ref_volume = float(abs(np.linalg.det(ref_cell)))
             species_density = float(len(ref_numbers) / max(ref_volume, _EPS))
+            # read early: the amorphous fill below needs it (see
+            # ``protect_crystallites``); the exact-count block re-reads the
+            # same attribute further down.
+            _rel_density = getattr(self, "relative_density", 1.0)
 
             # Per-species probabilities (for amorphous sampling) preserve the
             # reference composition on average.
@@ -740,7 +898,8 @@ class _GrainMixin:
             grain_ids_all: list[np.ndarray] = []
             shell_species_all: list[np.ndarray] = []
 
-            for i, (seed, cell) in enumerate(zip(seeds, cells)):
+            for i in range(len(seeds)):
+                seed, cell = seeds[i], cells[i]
                 src_idx = int(grain_source[i])
                 master = masters[src_idx]
                 src_offset = int(sources[src_idx]["species_offset"])
@@ -755,7 +914,16 @@ class _GrainMixin:
                         len(pos), src_offset, dtype=np.intp
                     )
                 else:
-                    expected = species_density * cell["volume"]
+                    # ``protect_crystallites``: relative_density describes the
+                    # AMORPHOUS region only, so scale the random fill here
+                    # instead of thinning the whole box afterwards.  Without
+                    # this the amorphous regions are filled at full crystal
+                    # density and the global trim then removes atoms at random
+                    # from the crystallites too -- measured at 10 A grains,
+                    # rd 0.78: grain density 85.6% of crystal, CN(Al-O) 4.785
+                    # against the 6.000 a perfect crystal gives.
+                    _fill_scale = _rel_density if protect_crystallites else 1.0
+                    expected = species_density * _fill_scale * cell["volume"]
                     n_atoms = int(np.floor(expected))
                     if self.rng.random() < expected - n_atoms:
                         n_atoms += 1
@@ -802,6 +970,40 @@ class _GrainMixin:
         hard_min_scalar = float(
             np.min(np.asarray(shell_target.pair_hard_min, dtype=np.float64))
         )
+        # Pair-RESOLVED floors.  `hard_min_scalar` above collapses the whole
+        # (S, S) matrix to its smallest entry, which for a multi-species
+        # reference is one particular pair's floor applied to every pair.  Keep
+        # the scalar for the legacy code paths, but push and collide against
+        # the real matrix.
+        _pair_hard = np.asarray(shell_target.pair_hard_min, dtype=np.float64)
+        _shell_species = [int(z) for z in np.asarray(shell_target.species)]
+        _z_to_row = {z: i for i, z in enumerate(_shell_species)}
+        _sp_idx = np.array([_z_to_row.get(int(z), 0) for z in numbers],
+                           dtype=np.intp)
+        # VALIDATE, do not silently degrade.  This used to be a boolean
+        # `_pair_ok` that fell back to the collapsed scalar whenever it was
+        # False.  Measured across all 20 catalogue seeds, the two conditions
+        # that could indicate a malformed matrix (dimension mismatch,
+        # non-finite entries) NEVER fired -- the only condition that ever
+        # fired was `shape[0] > 1`, which is False for every single-species
+        # reference (C, Ge, Si) where a 1x1 matrix is perfectly valid.  So the
+        # fallback protected nothing and instead disabled pair-resolved
+        # spacing for the elemental seeds, which left 18 crystalline-
+        # crystalline collisions down to 1.085 A in an a-Si cf=0.25 build.
+        # A malformed matrix here is a bug in CoordinationShellTarget, and
+        # quietly substituting min(pair_hard_min) would hide it.
+        if _pair_hard.shape[0] != len(_shell_species):
+            raise ValueError(
+                f"pair_hard_min is {_pair_hard.shape} but the shell target "
+                f"declares {len(_shell_species)} species; refusing to guess "
+                f"a per-pair floor.")
+        if not np.isfinite(_pair_hard).all():
+            raise ValueError(
+                "pair_hard_min contains non-finite entries; refusing to guess "
+                "a per-pair floor.")
+        # Padding telemetry: which species needed the floor relaxed, and how
+        # many atoms (if any) still went in with no spacing test at all.
+        _pad_report: dict = {}
         # For single-box-grain (a single coherent tile covering the
         # whole supercell), skip overlap removal + random padding
         # entirely: the only "close pairs" are PBC-wrap artefacts where
@@ -833,9 +1035,26 @@ class _GrainMixin:
             # guarantee a uniform per-species atom count across the
             # whole regime ladder.
             dup_cutoff = max(0.5, 0.7 * hard_min_scalar)
+            _dup_frac = 0.7
         else:
             dup_cutoff = max(0.5, 0.9 * hard_min_scalar)
+            _dup_frac = 0.9
         pad_min_sep = max(0.5, 0.8 * hard_min_scalar)
+        # PAIR-RESOLVED duplicate threshold.  `dup_cutoff` above is
+        # `_dup_frac * np.min(pair_hard_min)` -- the smallest entry of the
+        # whole matrix applied to every pair -- and it was the last remaining
+        # scalar distance threshold: push, crystal/crystal collision and
+        # padding all already use `_pair_hard`.  That left a band between the
+        # global scalar and a given pair's own floor in which nothing was even
+        # examined for deletion, so the pair-resolved push handled it instead
+        # by moving atoms.  Illustration on mp-1196402_Mn6Ga29: dup_cutoff is
+        # 0.9 * min(pair_hard_min) = 0.9 * 2.2181 = 1.996 A there, while the
+        # Ga-Ga floor is 2.3872 A, so a Ga-Ga pair in the 1.996-2.3872 A band
+        # was never examined for deletion and fell to the pair-resolved push
+        # instead.  (2.3872 A is the CLAMPED floor from shells.from_atoms;
+        # before that clamp it was the unclamped covalent value, 2.440 A.)
+        # `dup_cutoff` is retained because `push_cutoff` below still reads it.
+        _dup_matrix = np.maximum(0.5, _dup_frac * _pair_hard)
 
         # Target per-species counts: reference stoichiometry scaled by
         # (V_box / V_ref) * relative_density.  Rounding is done via
@@ -851,11 +1070,65 @@ class _GrainMixin:
         # ref_volume alone).  For the single-source case both paths
         # give the same answer.
         rel_density = float(getattr(self, "relative_density", 1.0))
+
+        # ``protect_crystallites``: the crystallites are already at crystal
+        # density and must not be counted against a relative-density-scaled
+        # target, or the surplus drop below will thin them.  Budget them at
+        # their actual count and apply relative_density only to the amorphous
+        # volume.
+        _protect = protect_crystallites
+        _xtal_of = None
+        if _protect and cells is None:
+            # The fast path is only taken when crystalline_fraction >= 0.9999,
+            # i.e. every grain is crystalline and there is no amorphous region
+            # for relative_density to describe.  Fail loudly rather than
+            # silently ignoring the flag.
+            raise ValueError(
+                "protect_crystallites=True requires a mixed build "
+                "(crystalline_fraction < 1): with every grain crystalline "
+                "there is no amorphous region for relative_density to apply "
+                "to, and the fast tiling path does not compute Voronoi cell "
+                "volumes."
+            )
+        if _protect:
+            _isx_arr = np.asarray(is_crystalline, dtype=bool)
+
+            def _xtal_of(gids):
+                m = np.zeros(len(gids), dtype=bool)
+                if _isx_arr.size:
+                    ok = gids >= 0
+                    m[ok] = _isx_arr[gids[ok]]
+                return m
+
+            _V_xtal = float(sum(float(c["volume"])
+                                for c, f in zip(cells, _isx_arr) if f))
+
+            # Half-space test against each protected grain's Voronoi hull, in
+            # that grain's seed-local frame.  ``equations`` is [n | d] with
+            # n·x + d <= 0 inside, the scipy ConvexHull convention.
+            _prot = [(np.asarray(seeds[gi], dtype=np.float64),
+                      np.asarray(cells[gi]["equations"], dtype=np.float64))
+                     for gi in np.flatnonzero(_isx_arr)
+                     if cells[gi] is not None
+                     and np.asarray(cells[gi]["equations"]).ndim == 2]
+
+            def _in_protected_cell(points):
+                pts = np.atleast_2d(np.asarray(points, dtype=np.float64))
+                bad = np.zeros(len(pts), dtype=bool)
+                for _seed, _eq in _prot:
+                    x = pts - _seed
+                    x -= box_dim * np.round(x / box_dim)
+                    bad |= (x @ _eq[:, :3].T + _eq[:, 3] <= 0.0).all(axis=1)
+                return bad
         _reduced_counts = species_counts.astype(np.int64)
         _divisor = int(np.gcd.reduce(_reduced_counts)) if _reduced_counts.size else 1
         _reduced_counts = _reduced_counts // max(_divisor, 1)
         _atoms_per_formula = int(np.sum(_reduced_counts))
-        if multi_source:
+        if _protect:
+            # amorphous share only; crystallites added back per species below
+            _target_total = float(species_density * (V_box - _V_xtal)
+                                  * rel_density)
+        elif multi_source:
             _target_total = float(species_density * V_box * rel_density)
         else:
             v_ratio = V_box / max(ref_volume, _EPS)
@@ -865,6 +1138,19 @@ class _GrainMixin:
             int(z): int(_reduced_counts[i] * _num_formula_units)
             for i, z in enumerate(unique_species)
         }
+        _xtal0_by_z: dict[int, int] = {}
+        if _protect:
+            # The crystalline share has to be in `target_by_z` BEFORE the
+            # removal block below, because that block's species priority reads
+            # it ("delete from the species most over target", ~line 1518).
+            # But it is the PRE-removal count, and step 7b would treat every
+            # crystalline atom deleted at a grain wall as a shortfall to pad --
+            # so it is re-taken after removal, further down.
+            _xm0 = _xtal_of(grain_ids)
+            _xtal0_by_z = {int(z): int(np.sum(numbers[_xm0] == z))
+                           for z in target_by_z}
+            for z in list(target_by_z):
+                target_by_z[z] += _xtal0_by_z[int(z)]
 
         if len(positions) > 0 and not skip_overlap_removal:
             from scipy.spatial import cKDTree
@@ -877,22 +1163,72 @@ class _GrainMixin:
             # 196 k atoms / 1.56 Å cutoff this drops the call from
             # ~3.2 s → ~0.1 s.
             tree = cKDTree(positions, boxsize=box_dim)
-            pair_arr = tree.query_pairs(
-                float(dup_cutoff), output_type="ndarray",
-            )
+            # Query radius must cover BOTH tests: the scalar `dup_cutoff` used
+            # for amorphous pairs (unchanged), and the pair-resolved
+            # crystalline-collision limit, which is larger.  Querying only at
+            # dup_cutoff meant an O-O grain collision at 1.6-1.86 A was never
+            # even examined -- 1.539 vs a 0.80 x 2.326 = 1.861 A limit.
+            # Cover the largest pair-resolved duplicate threshold, not the
+            # scalar: querying at `dup_cutoff` would never even return the
+            # pairs the matrix is meant to catch.
+            _query_r = float(_dup_matrix.max())
+            if _protect:
+                _query_r = max(_query_r,
+                               _XTAL_COLLISION_FRAC * _pair_hard.max())
+            pair_arr = tree.query_pairs(_query_r, output_type="ndarray")
             if len(pair_arr) > 0:
                 ov_i = pair_arr[:, 0]
                 ov_j = pair_arr[:, 1]
+                _dv = positions[ov_j] - positions[ov_i]
+                _dv -= box_dim * np.round(_dv / box_dim)
+                _pair_d = np.linalg.norm(_dv, axis=1)
             else:
                 ov_i = np.empty(0, dtype=np.intp)
                 ov_j = np.empty(0, dtype=np.intp)
+                _pair_d = np.empty(0, dtype=np.float64)
             # Running species counts so priority updates as we remove.
             z_counts = {int(z): int(np.sum(numbers == z)) for z in unique_species}
+            _xm = _xtal_of(grain_ids) if _protect else None
             remove: set[int] = set()
             for k in range(len(ov_i)):
                 ai, aj = int(ov_i[k]), int(ov_j[k])
                 if ai in remove or aj in remove:
                     continue
+                _is_xx = _xm is not None and _xm[ai] and _xm[aj]
+                _dup_lim = _dup_matrix[_sp_idx[ai], _sp_idx[aj]]
+                if not _is_xx and _pair_d[k] >= _dup_lim:
+                    # Outside THIS pair's duplicate threshold.  Previously the
+                    # scalar `dup_cutoff`, which for a multi-species reference
+                    # is one pair's floor imposed on all of them.
+                    continue
+                if _xm is not None:
+                    # A crystalline/amorphous straddling pair always loses the
+                    # amorphous atom.  A crystalline/crystalline pair used to be
+                    # left alone entirely, on the grounds that deleting either
+                    # punches a vacancy into the lattice.  But those pairs are
+                    # never repaired downstream: bond_relax runs with the
+                    # crystallites frozen, so a pair with BOTH atoms frozen
+                    # cannot move at any iteration count (measured: unchanged
+                    # from 0 to 800 sweeps), and it then sets the MACE wall's
+                    # floor for the whole cell.  A genuine collision -- two
+                    # atoms from adjacent grains nearly on top of each other --
+                    # is worse than a vacancy, so delete one of those; merely
+                    # distorted boundary pairs are still left alone.
+                    xi, xj = _xm[ai], _xm[aj]
+                    if xi and xj:
+                        _lim = (_XTAL_COLLISION_FRAC
+                                * _pair_hard[_sp_idx[ai], _sp_idx[aj]])
+                        if _pair_d[k] >= _lim:
+                            continue
+                        pick = ai if self.rng.random() < 0.5 else aj
+                        remove.add(pick)
+                        z_counts[int(numbers[pick])] -= 1
+                        continue
+                    if xi != xj:
+                        pick = aj if xi else ai
+                        remove.add(pick)
+                        z_counts[int(numbers[pick])] -= 1
+                        continue
                 zi, zj = int(numbers[ai]), int(numbers[aj])
                 if zi == zj:
                     pick = ai if self.rng.random() < 0.5 else aj
@@ -915,6 +1251,41 @@ class _GrainMixin:
                 numbers = numbers[mask]
                 grain_ids = grain_ids[mask]
                 shell_species_idx = shell_species_idx[mask]
+
+        # ---- 7a.9 Re-take the crystalline share AFTER overlap removal ----
+        # Adjacent crystalline grains meet at Voronoi walls with random
+        # relative orientation, so atoms across a wall land at arbitrary
+        # separations and _XTAL_COLLISION_FRAC (= 1.0, the FULL pair floor)
+        # deletes one atom of every sub-floor cross-wall pair.  That thins a
+        # shell either side of every wall, and the amount scales with total
+        # wall area, i.e. with grain COUNT: measured on SiO2, 24 A box,
+        # cf 0.75, rd 0.9 -- 4 grains lose 15% of the crystalline atoms,
+        # 12 grains 22%, 28 grains 28%, 92 grains 43%.
+        #
+        # `target_by_z` still carries the PRE-removal crystalline count, so
+        # step 7b below reads those deletions as a shortfall and pads them.
+        # Padding runs with `exclude=_in_protected_cell`, so every replacement
+        # lands in the AMORPHOUS region -- mass moves out of the grains and
+        # into the matrix.  (An earlier version of this comment cited "a 213
+        # atom crystalline deficit against a 237 atom amorphous excess, the
+        # gap being formula-unit rounding".  Do not rely on that: a deficit
+        # and an excess of different size cannot both be right, and the
+        # 24-atom gap did not reproduce.  Judge the fix on the matrix density
+        # ratio below, which does.)  The matrix reaches 1.99x the
+        # requested `relative_density` while the grains sit at 0.715 of
+        # crystal density, breaking the documented protect_crystallites
+        # contract that `relative_density` describes the amorphous region.
+        #
+        # Re-taking the share here means a crystalline atom lost to a genuine
+        # wall collision is simply not replaced, which is the correct
+        # behaviour: two grains meeting at a wall cannot both keep every atom.
+        # It does NOT restore crystalline density -- that is set by
+        # _XTAL_COLLISION_FRAC and is a separate physics choice.
+        if _protect and target_by_z:
+            _xm1 = _xtal_of(grain_ids)
+            for z in list(target_by_z):
+                _now = int(np.sum(numbers[_xm1] == z))
+                target_by_z[z] += _now - _xtal0_by_z.get(int(z), _now)
 
         # ---- 7b. Enforce exact per-species target counts ----
         # Bring each species to its reference-scaled target by randomly
@@ -941,9 +1312,13 @@ class _GrainMixin:
             idx = np.where(numbers == z)[0]
             current = int(len(idx))
             if current > target:
-                drop = self.rng.choice(
-                    idx, size=current - target, replace=False,
-                )
+                pool = idx
+                if _protect:
+                    # trim the amorphous region only
+                    _xm = _xtal_of(grain_ids)
+                    pool = idx[~_xm[idx]]
+                n_drop = min(current - target, len(pool))
+                drop = self.rng.choice(pool, size=n_drop, replace=False)
                 keep = np.ones(len(numbers), dtype=bool)
                 keep[drop] = False
                 positions = positions[keep]
@@ -957,14 +1332,45 @@ class _GrainMixin:
                 # for amorphous at 100×100×400 with n_missing≈9k and
                 # N_existing≈174k due to its per-trial O(N) distance
                 # scan).
-                added, _ = _sample_padding_atoms(
+                _pad_sp_idx = np.array(
+                    [_z_to_row.get(int(_zz), 0) for _zz in numbers],
+                    dtype=np.intp)
+                added, _, _pad_scale = _sample_padding_atoms(
                     positions, box_dim, n_missing, pad_min_sep, self.rng,
+                    exclude=(_in_protected_cell if _protect else None),
+                    pair_cutoff=_pair_hard,
+                    species_index=_pad_sp_idx,
+                    pad_row=_z_to_row.get(int(z), 0),
                 )
-                while len(added) < n_missing:
-                    # Loose-placement fallback if even the batched
-                    # sampler couldn't find enough non-colliding spots
-                    # (very over-dense box; should be rare).
-                    added = np.vstack([added, self.rng.random((1, 3)) * box_dim])
+                # Record any relaxation of the padding floor, and any atom that
+                # still had to be placed with NO spacing test, so a build that
+                # gave ground says so instead of looking clean.
+                if _pad_scale < 1.0:
+                    _pad_report.setdefault("relaxed", {})[int(z)] = float(_pad_scale)
+                # NO loose-placement fallback.  It placed atoms with no spacing
+                # test whatsoever -- measured 535 of 535 on Al2O3 cf=0.95 -- so
+                # an over-dense box silently produced a corrupt structure that
+                # looked complete.  The floor now backs off without limit; if
+                # the sampler still cannot fit them the box genuinely has no
+                # room, so say so and carry on short of the target count.
+                _n_short = max(0, n_missing - len(added))
+                if _n_short:
+                    _pad_report.setdefault("short", {})[int(z)] = _n_short
+                    print(
+                        f"  [tricor] padding: could not place {_n_short} of "
+                        f"{n_missing} atoms of Z={int(z)} (floor reached "
+                        f"{_pad_scale:.3f} x pair_hard_min). This is a VOLUME "
+                        f"failure, not a spacing one: padding never enters a "
+                        f"protected crystallite, so when the unprotected "
+                        f"volume is saturated no amount of floor relaxation "
+                        f"helps -- the sampler stops after 40 consecutive "
+                        f"fully-excluded rounds rather than grinding. Continuing "
+                        f"{_n_short} short, which changes composition and "
+                        f"density.", flush=True,
+                    )
+                n_missing = len(added)
+                if n_missing == 0:
+                    continue
                 positions = np.concatenate([positions, added], axis=0)
                 numbers = np.concatenate(
                     [numbers, np.full(n_missing, z, dtype=np.int64)],
@@ -994,15 +1400,32 @@ class _GrainMixin:
                 )
 
         # ---- 7b.5. Push any residual close pairs apart ----
+        # `numbers` may have changed length via overlap removal and padding,
+        # so the species index has to be rebuilt here rather than reused.
+        _sp_idx_after_removal = np.array(
+            [_z_to_row.get(int(z), 0) for z in numbers], dtype=np.intp)
         # For crystalline grain builds, only push pairs below the tight
         # dup_cutoff so boundary distortions (at 0.5-0.9 x hard_min)
         # survive the pre-conditioner and get resolved by shell_relax
         # via bond + repulsion springs.  For non-crystalline / liquid-
         # path cases we still push to hard_min.
         push_cutoff = dup_cutoff if is_crystalline_build else hard_min_scalar
+        # Pair-resolved push for EVERY build, crystalline included.  This was
+        # gated on `not is_crystalline_build` to preserve the tight scalar
+        # cutoff there, but that left the cf >= 0.9 regime pushing every pair to
+        # min(pair_hard_min) -- one pair's floor applied to all of them, which
+        # is the exact collapse this matrix exists to undo.  Crystalline atoms
+        # are pinned by `skip_mask` when protect_crystallites is on, and a pair
+        # with BOTH atoms protected is skipped outright, so crystal interiors
+        # are untouched; only the free atoms move.
+        _push_matrix = _pair_hard
         positions = _push_close_pairs_apart(
             positions, numbers, cell_mat, pbc=self.reference_atoms.pbc,
             push_cutoff=push_cutoff, max_iter=40,
+            pair_cutoff=_push_matrix,
+            species_index=(_sp_idx_after_removal if _push_matrix is not None
+                           else None),
+            skip_mask=(_xtal_of(grain_ids) if _protect else None),
         )
 
         # ---- 7c. Optional thermal displacement ----
@@ -1025,6 +1448,8 @@ class _GrainMixin:
         atoms.info["n_grains"] = int(np.sum(is_crystalline))
         atoms.info["grain_size"] = float(grain_size)
         atoms.info["crystalline_fraction"] = float(crystalline_fraction)
+        if _pad_report:
+            atoms.info["padding_report"] = _pad_report
         atoms.info["grain_radius"] = float(radius)
 
         self._grain_ids = grain_ids

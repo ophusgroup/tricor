@@ -44,8 +44,8 @@ class MinDistanceWallCalculator(Calculator):
         self,
         base_calc: Calculator,
         r_min_per_pair: dict,
-        k: float = 1000.0,
-        exponent: int = 4,
+        k: float = 50.0,
+        exponent: int = 2,
         **kwargs,
     ):
         """
@@ -59,12 +59,21 @@ class MinDistanceWallCalculator(Calculator):
             Keys are normalized to sorted tuples internally, so providing
             either (8, 14) or (14, 8) for Si-O works.
         k
-            Wall stiffness (eV / Å^exponent). 1000 is a reasonable default
-            — gives ~10 eV/Å force at 0.1 Å violation with exponent=4.
+            Wall stiffness (eV / Å^exponent).  Default k=50 with
+            exponent=2 gives 2*50*0.1 = 10 eV/Å at 0.1 Å penetration.
+            The previous default (k=1000, exponent=4) gave only
+            4*1000*1e-3 = 4 eV/Å there — a quartic wall's curvature
+            grows as delta^2, so it is negligible at small penetration
+            and explosive at large, which is what made FIRE overshoot
+            and diverge at maxstep=0.3.  Harmonic has constant
+            curvature 2k and conditions the optimiser far better.
+            Keeping k=1000 at exponent=2 would instead apply 100 eV/Å
+            at 0.05 Å — two orders of magnitude above a Si-O bond.
         exponent
-            Polynomial degree of the wall (≥ 1). 4 gives a steep but
-            smooth wall; 2 is harmonic; 1 is linear ramp (discontinuous
-            derivative, not recommended).
+            Polynomial degree of the wall (≥ 1). 2 is harmonic (the
+            default, best-conditioned); 4 gives a steep but smooth wall;
+            1 is a linear ramp (discontinuous derivative, not
+            recommended).
         """
         super().__init__(**kwargs)
         self.base_calc = base_calc
@@ -97,6 +106,18 @@ class MinDistanceWallCalculator(Calculator):
         system_changes=all_changes,
     ):
         Calculator.calculate(self, atoms, properties, system_changes)
+
+        # Backstop: a diverged trajectory (NaN/inf positions, e.g. from a
+        # float32 MACE overflow on pathological geometry) must fail as a
+        # catchable Python exception HERE.  If it reaches ase.neighbor_list
+        # below, the binning casts inf→int into garbage indices and the
+        # resulting allocation host-OOMs the worker — an uncatchable SIGKILL
+        # that takes down the whole multi-node SLURM step.
+        if not np.isfinite(self.atoms.positions).all():
+            raise RuntimeError(
+                "non-finite atom positions — trajectory diverged "
+                "(wall calculator refusing to build a neighbor list)"
+            )
 
         # 1. Base calculator: triggers a MACE forward pass when atoms changed.
         self.base_calc.calculate(self.atoms, properties, system_changes)
@@ -159,8 +180,8 @@ class MinDistanceWallCalculatorLoop(Calculator):
         self,
         base_calc: Calculator,
         r_min_per_pair: dict,
-        k: float = 1000.0,
-        exponent: int = 4,
+        k: float = 50.0,
+        exponent: int = 2,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -223,7 +244,7 @@ class MinDistanceWallCalculatorLoop(Calculator):
         self.results["wall_max_penetration"] = max_penetration
 
 
-def _per_pair_min_from_atoms_ase(atoms, margin: float = 0.0,
+def _per_pair_min_from_atoms_ase(atoms, margin: float = 0.1,
                                   cutoff: float = 5.0) -> dict:
     """Original ase.neighborlist implementation — fallback for non-
     orthogonal cells where cKDTree's ``boxsize`` torus metric is wrong.
@@ -255,7 +276,7 @@ def _per_pair_min_from_atoms_ase(atoms, margin: float = 0.0,
     return out
 
 
-def per_pair_min_from_atoms(atoms, margin: float = 0.0,
+def per_pair_min_from_atoms(atoms, margin: float = 0.1,
                               cutoff: float = 5.0) -> dict:
     """Compute observed min pair distance per (Z, Z) from the current atoms.
 

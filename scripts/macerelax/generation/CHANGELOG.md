@@ -6,6 +6,64 @@ traced back to exactly the code that produced it.
 
 ---
 
+## 2026-09-04 — Packing and relaxation overhaul; harmonic wall becomes the default
+
+### What
+
+**1. Hard-core floors are pair-resolved.** Overlap removal and the pre-relax
+push used a single scalar cutoff, `_dup_frac * min(pair_hard_min)`. For SiO2
+that is 1.3275 A applied to every pair, so an O-O contact anywhere in
+1.33-2.18 A was never examined against the 2.425 A O-O floor. Both steps now
+use the full `pair_hard_min` matrix. This applies to every grain build, not
+only when `protect_crystallites=True`.
+
+On the four `Supercell.PRESETS` (SiO2 mp-10851, 24 A, seed 42, 972 atoms) the
+sub-floor pair count goes 1678 -> 1285. `liquid` is bit-identical (no grain
+path). `SRO` and `MRO` improve on both count and worst contact. `amorphous`
+trades a 28% drop in violations for one contact 0.046 A tighter (1.3338 ->
+1.2881 A): removing more overlaps leaves a larger shortfall, which padding
+refills at a relaxed floor, recorded in `atoms.info["padding_report"]`.
+
+Exact per-species atom counts are now best-effort — the loose-placement
+fallback that guaranteed them is replaced by that floor back-off.
+
+**2. `protect_crystallites=True` (new, opt-in).** `relative_density` then
+describes the amorphous matrix only; crystalline grains stay at full crystal
+density and are frozen through the quench. Without it the global trim punches
+vacancies into the grains: at 10 A grains with `relative_density=0.78` the
+grain came out at 85.6% of crystal density, CN(Al-O) 4.785 against 6.000.
+
+**3. Wall defaults: quartic k=1000 -> harmonic k=50**, `exponent` 4 -> 2,
+`margin` 0.0 -> 0.1. Not a softening: at 0.1 A penetration the quartic gave
+4 eV/A where harmonic k=50 gives 10. The reason is conditioning — quartic
+curvature grows as delta^2, harmonic is constant at 2k. Generators that pass
+`WALL_K`/`WALL_EXPONENT` explicitly still override the class default.
+
+`MinDistanceWallCalculator.calculate` also now raises on non-finite positions
+rather than letting `ase.neighbor_list` cast inf->int and host-OOM the worker.
+
+**4. `tricor.crn` (new package).** Continuous random networks by
+Wooten-Winer-Weaire bond switching under a Keating potential — the topological
+route to an amorphous network, complementary to the Voronoi packing above.
+Tetravalent cations only; AX2 networks are built as a cation-only CRN and then
+decorated with bridging anions.
+
+`t_max` is an energy, so its useful range is a material property: a silicon
+switch costs ~1.3 eV and acceptance is 0% at 0.25 eV. Use `calibrate_t_melt()`
+to measure the network's own melting scale and drive the anneal with the
+dimensionless ratio. On 216-atom diamond Si, `t_melt` = 1.425 eV: at ratio 0.6
+the network stays crystalline, 1.0 gives a CRN (1.9% of switches accepted,
+E/atom 0.51, z=4 for 100% of atoms), and 1.5 starts collapsing geometry
+(min distance 1.052 A) while coordination still reads as perfect.
+
+### Verification
+
+`pytest tests/`: 30 passed / 9 skipped on `upstream/dev` and on this branch.
+`examples/generate_end_to_end.py` runs both pathways, with and without the
+MACE leg.
+
+---
+
 ## 2026-06-29 — MRO regime relative_density was an inversion (0.88 → 0.92)
 
 ### What

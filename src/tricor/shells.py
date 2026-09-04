@@ -18,6 +18,68 @@ def _cell_face_spacings(cell_matrix: np.ndarray) -> np.ndarray:
     return 1.0 / np.maximum(np.linalg.norm(inverse, axis=0), _EPS)
 
 
+# Fraction of the summed covalent radii used as the fallback hard-core floor,
+# for species pairs that never appear as a first-shell contact in the ordered
+# reference (so `pair_hard_min` came out ~0).  Applied by `from_atoms` ONLY
+# where the reference gave hard_min ~ 0, so pairs with a real measured hard
+# core are never altered.
+#
+# 1.0, i.e. the plain sum of covalent radii.  These pairs are not bonded in the
+# crystal, so approaching closer than a bond length is already unphysical.  The
+# 0.70 this replaced was anchored empirically -- the minimum of
+# hard_min/(r_cov_i+r_cov_j) over all MEASURED bonded pairs, i.e. the tightest
+# hard core any real bond exhibits -- but as a guard for UNMEASURED pairs it was
+# near-useless: a hypothetical O-O fallback got 0.92 A against a real O-O
+# approach of ~2.3 A.
+#
+# The value is only half the story: `from_atoms` clamps this fallback to the
+# shortest distance at which the pair actually occurs in the reference (see
+# `pair_observed_min` there).  That clamp is what makes 1.0 safe.  Raising the
+# fraction without it put the floor ABOVE real crystal contacts for seeds whose
+# sublattice is self-isolated -- "no fitted first shell" is not "no near
+# neighbours" -- and the reference crystal then violated its own hard core.
+# Measured on mp-1196402_Mn6Ga29: fallback 2.440 A against a real Ga-Ga contact
+# at 2.3872 A.  With the clamp the floor is 2.3872 A and the crystal is legal by
+# construction, while pairs that genuinely never occur still get the full
+# covalent-radii wall.
+#
+# Consequence for `frac`: at 0.70 the clamp almost never binds, which is why
+# this failure mode only appeared at 1.0.  Do not read the two as independent
+# knobs -- the fraction sets the ceiling, the observed minimum sets the floor.
+HARD_MIN_RADII_FRAC = 1.0
+
+
+def _radii_hard_min_floor(species: np.ndarray,
+                          frac: float = HARD_MIN_RADII_FRAC) -> np.ndarray:
+    """Physical hard-core floor (Å) per species pair from covalent radii.
+
+    ``from_atoms`` leaves ``pair_hard_min`` at 0 for species pairs that never
+    appear as contacts in the (ordered) reference crystal.  This is common:
+    any species with a self-isolated sublattice (e.g. Si in the Mn15Si26
+    chimney-ladder, where every Si is coordinated only by Mn) has no observed
+    like-neighbour distance, so its self-pair hard_min defaults to 0.  In the
+    *disordered* supercell that pair CAN come into contact, and a hard_min of 0
+    means ``bond_relax`` has no wall to stop the atoms merging to r=0 → MACE
+    float32 overflow → NaN forces → NaN positions → host-RAM OOM.
+
+    Returns ``frac * (r_cov_i + r_cov_j)``, with ``frac`` defaulting to 1.0 --
+    i.e. the plain sum of covalent radii.  Applied by ``from_atoms`` only
+    where ``pair_hard_min`` came out ~0 (no usable inner edge — absent pairs
+    AND pairs seen only at outer shells), so pairs with a real measured hard
+    core are never altered.  ``species`` is the sorted array of atomic numbers
+    (one per species index), so the (S, S) matrix aligns with ``pair_hard_min``.
+
+    NOTE: this is the CEILING, not the value that ships.  ``from_atoms`` takes
+    the elementwise minimum of this and the shortest distance at which the pair
+    actually occurs in the reference, so the floor can never exceed a real
+    crystal contact.  Calling this function directly gives the unclamped wall.
+    """
+    from ase.data import covalent_radii
+    rc = np.array([covalent_radii[int(z)] for z in np.asarray(species)],
+                  dtype=np.float64)
+    return float(frac) * (rc[:, None] + rc[None, :])
+
+
 def _gaussian_kernel(sigma_bins: float) -> np.ndarray:
     """Return a normalized 1D Gaussian kernel."""
     sigma_bins = float(sigma_bins)
@@ -338,6 +400,13 @@ class CoordinationShellTarget:
         pair_sigma = np.full((num_species, num_species), float(shell_hist_step), dtype=np.float64)
         pair_outer = np.zeros((num_species, num_species), dtype=np.float64)
         pair_mask = np.zeros((num_species, num_species), dtype=bool)
+        # Shortest distance at which this pair ACTUALLY occurs in the ordered
+        # reference, independent of whether a first shell could be fitted.
+        # `inf` means the pair never occurs within `extract_cutoff`, in which
+        # case the fallback below is left unclamped.  Used only to stop the
+        # covalent-radii fallback inventing a wall tighter than the crystal.
+        pair_observed_min = np.full((num_species, num_species), np.inf,
+                                    dtype=np.float64)
 
         for species_a in range(num_species):
             for species_b in range(species_a, num_species):
@@ -348,6 +417,9 @@ class CoordinationShellTarget:
                 distances = np.asarray(d[mask], dtype=np.float64)
                 if distances.size == 0:
                     continue
+                _obs_min = float(distances.min())
+                pair_observed_min[species_a, species_b] = _obs_min
+                pair_observed_min[species_b, species_a] = _obs_min
                 hard_min, r_inner, r_peak, sigma_r, r_outer = _infer_shell_window(
                     distances,
                     hist_step=float(shell_hist_step),
@@ -365,6 +437,54 @@ class CoordinationShellTarget:
                 pair_outer[species_b, species_a] = r_outer
                 pair_mask[species_a, species_b] = True
                 pair_mask[species_b, species_a] = True
+
+        # Hard-core floor for pairs with no usable hard core.  pair_hard_min
+        # stayed ~0 above for any pair with no first-shell contact in the
+        # ordered reference — either absent entirely, OR (as for Si-Si in the
+        # Mn15Si26 chimney-ladder) present only at outer shells so the inferred
+        # inner edge collapses to 0 (mask True, hard_min 0).  Either way
+        # bond_relax has no wall and collapses them to r=0 in the disordered
+        # supercell.  Give those a covalent-radii wall; measured pairs
+        # (hard_min > 0) are left exactly as-is — a strict no-op for
+        # already-healthy structures.  (An earlier version of this comment
+        # claimed measured pairs are "always >= 0.7 of the summed radii across
+        # the corpus".  That is false: the Ta2O5 polymorph mp-1392387 has a
+        # measured Ta-O hard_min of 1.6289 A against 0.7 x (r_cov_Ta + r_cov_O)
+        # = 1.6520 A, ratio 0.6902.  (Note the mp id: the other two Ta2O5
+        # polymorphs are above the bound -- mp-10390 at 0.7027, mp-1218312 at
+        # 0.7091 -- and mp-10390 shares the O10Ta4 formula, so the two are easy
+        # to confuse.)  Nothing depends on the bound -- the branch below tests
+        # hard_min < 1e-6, not a ratio -- but do not rebuild a guard on it.)
+        #
+        # CLAMPED TO THE REFERENCE.  "No fitted first shell" is not the same as
+        # "no near neighbours": a self-isolated sublattice can have real
+        # neighbours that never register as a first shell yet sit closer than
+        # the summed covalent radii.  Measured on mp-1196402_Mn6Ga29 (in
+        # regen_lists/regen_big_exp.cifs): Ga-Ga has no fitted shell, so it
+        # takes the fallback at 1.00 * (1.22 + 1.22) = 2.440 A, while the
+        # crystal itself has Ga-Ga at 2.3872 A.  The seed then violates its own
+        # hard core, and every downstream mechanism responds correctly to a
+        # false alarm -- with protect_crystallites=False the pair-resolved push
+        # moves the lattice (2.3872 -> 2.4394 A, the grain is distorted); with
+        # it True the crystal/crystal collision rule deletes one atom of the
+        # pair at random (measured 630 -> 614 atoms, Ga:Mn 4.833 -> 5.079, at
+        # _XTAL_COLLISION_FRAC = 1.00 -- that figure is specific to the
+        # constant's current value and does not hold if it is lowered).
+        # Neither is recoverable downstream, because the threshold and not the
+        # response is what is wrong.
+        #
+        # Taking the elementwise minimum with `pair_observed_min` makes the
+        # reference crystal legal against its own floor BY CONSTRUCTION, while
+        # leaving the full covalent-radii wall in force for pairs that genuinely
+        # never occur (observed min `inf`) -- the strict guard the
+        # HARD_MIN_RADII_FRAC = 1.0 change was after.  It also makes the choice
+        # of `frac` far less load-bearing: at 0.7 the clamp is almost never
+        # binding, which is why this failure mode only appeared at 1.0.
+        _unmeasured = pair_hard_min < 1e-6
+        if _unmeasured.any():
+            _fallback = np.minimum(_radii_hard_min_floor(species),
+                                   pair_observed_min)
+            pair_hard_min = np.where(_unmeasured, _fallback, pair_hard_min)
 
         coordination_target = np.zeros((num_species, num_species), dtype=np.float64)
         coordination_std = np.zeros((num_species, num_species), dtype=np.float64)
