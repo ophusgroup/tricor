@@ -473,6 +473,7 @@ class Supercell(
         # historical default).
         refine_orientations: bool = False,
         refine_orientations_kwargs: "dict | None" = None,
+        protect_crystallites: bool = False,
         show_progress: bool = True,
         **shell_relax_kwargs: Any,
     ) -> dict[str, Any]:
@@ -495,6 +496,19 @@ class Supercell(
             Volume fraction filled by crystalline grains (0–1).  Only
             used when *grain_size* is set.  The remaining volume is
             filled with random (amorphous) positions.
+        protect_crystallites
+            Opt-in (default ``False``, so existing behaviour is unchanged).
+            When ``True``, *relative_density* describes the AMORPHOUS region
+            only and the crystalline grains stay at full crystal density: the
+            random fill is scaled by *relative_density*, the exact-count trim
+            draws only from amorphous atoms, and overlap removal always
+            sacrifices the amorphous atom of a straddling pair.  Without it the
+            global trim punches vacancies into the grains — at 10 Å grains with
+            ``relative_density=0.78`` the grain came out at 85.6% of crystal
+            density with CN(Al–O) 4.785 against the 6.000 a perfect corundum
+            gives.  Requires ``crystalline_fraction < 1``.  Note that
+            :meth:`bond_relax` still moves every atom; pass its ``freeze_mask``
+            to hold the grains through that step too.
         bond_weight
             Harmonic spring strength pulling bonded neighbours toward
             the target bond distance.  Larger = tighter distances.
@@ -523,6 +537,37 @@ class Supercell(
         # --- construct atoms ---
         use_grains = (grain_size is not None and float(grain_size) > 0.0) or seeds is not None
 
+        # Initialise the grain bookkeeping that `crystalline_mask` reads, but
+        # ONLY if it has never been set.  `__init__` sets `_grain_ids = None`,
+        # so `is None` distinguishes "this object has never had grains" from
+        # "there is a grain build to preserve".
+        #
+        # Why initialise at all: grain_size=0 / None (the liquid control) used
+        # to leave both attributes at None, so `crystalline_mask` returned None
+        # and every caller had to guard it.  scripts/macerelax/expval/
+        # build_grain_matrix.py:295 did not, and raised AttributeError after
+        # the seed build, G3 measurement and full pack had already run.  With
+        # `_grain_ids` all -1 and `_grain_is_crystalline` empty the property
+        # returns all-False, the correct reading for a cell built with no
+        # grains.  It still returns None before any generate() call, so the
+        # documented unknown-vs-zero distinction survives.
+        #
+        # Why NOT unconditionally: an earlier version of this reset ran on
+        # every call, on the theory that a second generate() with no grains
+        # would otherwise report the previous build's crystallinity.  That is
+        # backwards.  `generate()`'s no-grain path never rebuilds
+        # `self.atoms` -- `_build_random_atoms` is called only at __init__
+        # (line 136) -- so after generate(grain_size=8) then
+        # generate(grain_size=None) the coordinates are BYTE-IDENTICAL to the
+        # grain build (verified: 270 atoms, max coordinate change 0.0 A) and
+        # the old mask was describing them correctly.  The unconditional reset
+        # reported 0 crystalline atoms for a cell that still contained a
+        # 99-atom grain.  The grain path overwrites both attributes itself, so
+        # preserving them here costs nothing.
+        if getattr(self, "_grain_ids", None) is None:
+            self._grain_ids = np.full(len(self.atoms), -1, dtype=np.intp)
+            self._grain_is_crystalline = np.zeros(0, dtype=bool)
+
         if use_grains:
             self.atoms = self._build_grain_atoms(
                 shell_target,
@@ -531,6 +576,7 @@ class Supercell(
                 displacement_sigma=displacement_sigma,
                 grain_sources=grain_sources,
                 seeds=seeds,
+                protect_crystallites=protect_crystallites,
             )
             # Remember the exact build parameters so
             # ``refine_initial_orientations`` can re-run the full
@@ -541,6 +587,7 @@ class Supercell(
                 displacement_sigma=float(displacement_sigma),
                 grain_sources=grain_sources,
                 seeds=seeds,
+                protect_crystallites=bool(protect_crystallites),
             )
 
             # Refresh cached arrays after rebuilding atoms
@@ -565,7 +612,7 @@ class Supercell(
                     )
                 self._atom_shell_species_index = asp
         else:
-            # Liquid path: atoms came from _build_random_atoms() at init
+            # atoms came from _build_random_atoms() at init
             # time with purely-random positions.  Pre-separate only
             # severe overlaps (< 0.35 * hard_min ~ one-third a bond),
             # leaving the rest for shell_relax's soft repulsion spring
@@ -675,6 +722,22 @@ class Supercell(
 
         # --- relax ---
         if int(num_steps) > 0:
+            # protect_crystallites guarded the grains during BUILDING (padding
+            # exclusion, straddling deletion sacrificing the amorphous atom)
+            # and then handed everything to shell_relax unmasked, which relaxed
+            # the crystallites it had just protected.  The caller could not
+            # intervene: `crystalline_mask` does not exist until generate()
+            # returns.  Latent so far only because every current caller passes
+            # num_steps=0 and runs its own bond_relax -- it goes live for
+            # anyone using the default num_steps=200.
+            # Full crystalline mask, not crystalline_interior_mask: the latter
+            # freezes only 0.4-34.5% of crystalline atoms depending on grain
+            # count (see _XTAL_COLLISION_FRAC in _grain.py), so it would leave
+            # the grains substantially free -- the opposite of the intent here.
+            if protect_crystallites and "freeze_mask" not in shell_relax_kwargs:
+                _fm = self.crystalline_mask
+                if _fm is not None and _fm.any():
+                    shell_relax_kwargs["freeze_mask"] = _fm
             summary = self.shell_relax(
                 shell_target,
                 num_steps=num_steps,
@@ -718,6 +781,68 @@ class Supercell(
         return summary
 
 
+    @property
+    def crystalline_mask(self):
+        """Per-atom boolean: was this atom placed inside a crystalline grain?
+
+        Built from the generator's own bookkeeping (``_grain_is_crystalline``
+        indexed by ``_grain_ids``), so it is exact rather than detected.  Atoms
+        added by the exact-count padding carry ``grain_id = -1`` and come back
+        ``False``, which is correct — they are random fill.  ``None`` if no
+        grain build has run.
+        """
+        gid = getattr(self, "_grain_ids", None)
+        isx = getattr(self, "_grain_is_crystalline", None)
+        if gid is None or isx is None:
+            return None
+        gid = np.asarray(gid)
+        isx = np.asarray(isx, dtype=bool)
+        m = np.zeros(len(gid), dtype=bool)
+        if isx.size:
+            ok = gid >= 0
+            m[ok] = isx[gid[ok]]
+        return m
+
+    def crystalline_interior_mask(self, shell_target=None):
+        """Crystalline atoms MINUS the grain-boundary shell.
+
+        The mask to freeze during relaxation.  Freezing every crystalline
+        atom (``crystalline_mask``) makes cross-wall contacts permanent:
+        adjacent grains meet at Voronoi walls with random relative
+        orientation, atoms land at arbitrary separations, and if both are
+        frozen no iteration count can separate them.  That is what forced
+        ``_XTAL_COLLISION_FRAC`` up to 1.0 -- deleting one atom of every
+        sub-floor cross-wall pair -- which costs 15-43% of the crystalline
+        atoms depending on grain count.
+
+        Freezing only the interiors lets the boundary shell relax instead.
+        Measured (SiO2, 24 A, cf 0.75, rd 0.9, 28 grains, bond_relax 40):
+
+            FRAC 1.00, freeze all       keep 0.715, min x-x 1.591, short +0.000
+            FRAC 0.60, freeze all       keep 0.976, min x-x 0.885, short +1.173
+            FRAC 0.60, freeze interiors keep 0.976, min x-x 1.572, short +0.012
+
+        i.e. interior-only freezing recovers 26 points of crystalline density
+        at no cost in contact quality.  Returns ``None`` when no grain build
+        has run, matching :attr:`crystalline_mask`.
+        """
+        xt = self.crystalline_mask
+        if xt is None:
+            return None
+        xt = np.asarray(xt, dtype=bool)
+        seeds = getattr(self, "_grain_seeds", None)
+        gids = getattr(self, "_grain_ids", None)
+        if seeds is None or gids is None or not xt.any():
+            return xt
+        from ._thermal_mc import detect_grain_boundary_atoms
+        ppm = None
+        if shell_target is not None:
+            ppm = float(np.max(np.asarray(shell_target.pair_peak)))
+        is_boundary = detect_grain_boundary_atoms(
+            self.atoms, gids, seeds, pair_peak_max=ppm,
+        )
+        return xt & ~np.asarray(is_boundary, dtype=bool)
+
     def bond_relax(
         self,
         shell_target,
@@ -726,6 +851,7 @@ class Supercell(
         repel_frac: float = 1.0,
         max_step: float = 0.2,
         device=None,
+        freeze_mask=None,
     ) -> None:
         """Combined attract-to-bond-peak + repel-from-hard-core sweep.
 
@@ -762,6 +888,24 @@ class Supercell(
             in dense regions.
         max_step
             Per-atom displacement cap (Å) per sweep.
+        freeze_mask
+            Optional ``(N,)`` bool array of atoms to hold fixed.  When
+            given, the sweep is driven one iteration at a time and the
+            masked positions are restored after EVERY sweep -- restoring
+            only at the end would let mobile atoms relax against frozen
+            neighbours that had themselves drifted (measured at n_iter=20
+            on a 20 Å corundum grain: rms 0.41 Å / max 1.03 Å of grain
+            motion, and the 3-4 Å shell dropping from 100% six-fold to
+            91%).  Measured cost of the frozen path relative to the
+            unfrozen one: 1.00x at 1.9k atoms, 1.05x at 4.4k, 1.03x at
+            8.6k -- within noise, and NOT growing with N.  (It was
+            1.12-1.26x and growing before the per-sweep spatial-hash
+            rebuild was removed from this loop.)
+            For a grain-in-matrix build, freeze
+            :meth:`crystalline_interior_mask`, NOT
+            :attr:`crystalline_mask`: freezing the grain-boundary shell as
+            well makes sub-floor cross-wall contacts permanent.  See
+            ``_XTAL_COLLISION_FRAC`` in ``_grain.py``.
         device
             Optional torch device.  ``None`` (default) runs the pure-
             NumPy CPU path.  A torch device (``"cuda"``, ``"cuda:0"``,
@@ -792,13 +936,52 @@ class Supercell(
             repel_frac=float(repel_frac),
             max_step=float(max_step),
         )
-        if device is None:
-            from ._pair_relax import _bond_relax_sweep
-            pos = _bond_relax_sweep(**kwargs)
+        if freeze_mask is None:
+            if device is None:
+                from ._pair_relax import _bond_relax_sweep
+                pos = _bond_relax_sweep(**kwargs)
+            else:
+                from ._pair_relax import _bond_relax_sweep_torch
+                pos = _bond_relax_sweep_torch(**kwargs, device=device)
+            self.atoms.positions = pos
         else:
-            from ._pair_relax import _bond_relax_sweep_torch
-            pos = _bond_relax_sweep_torch(**kwargs, device=device)
-        self.atoms.positions = pos
+            # Frozen atoms must be restored after EVERY sweep, not once at the
+            # end: the sweep is iterative internally, so restoring only at the
+            # end would let the mobile atoms relax against frozen neighbours
+            # that had themselves drifted.  Measured at n_iter=20 on a 20 Å
+            # corundum grain, the unfrozen path moves grain atoms by rms 0.41 Å
+            # / max 1.03 Å and drops the 3–4 Å shell from 100% six-fold to 91%.
+            fm = np.asarray(freeze_mask, dtype=bool)
+            if fm.shape != (len(self.atoms),):
+                raise ValueError(
+                    f"freeze_mask has shape {fm.shape}, expected "
+                    f"({len(self.atoms)},)"
+                )
+            one = dict(kwargs)
+            one["n_iter"] = 1
+            for _ in range(n_iter):
+                held = np.asarray(self.atoms.positions,
+                                  dtype=np.float64)[fm].copy()
+                one["positions"] = np.asarray(self.atoms.positions,
+                                              dtype=np.float64)
+                if device is None:
+                    from ._pair_relax import _bond_relax_sweep
+                    pos = _bond_relax_sweep(**one)
+                else:
+                    from ._pair_relax import _bond_relax_sweep_torch
+                    pos = _bond_relax_sweep_torch(**one, device=device)
+                pos = np.asarray(pos, dtype=np.float64)
+                pos[fm] = held
+                self.atoms.positions = pos
+                # NO per-sweep _rebuild_spatial_index() here.  It builds
+                # `_spatial_bins`, the periodic hash for local Monte Carlo
+                # queries, which only _monte_carlo.py reads -- _pair_relax.py
+                # never references it, and each sweep builds its own cKDTree
+                # from the positions passed in.  So rebuilding it inside the
+                # loop was pure overhead: n_iter list-of-lists builds over N
+                # atoms.  The single rebuild after the loop leaves the hash
+                # consistent for any later MC call, which is all that is
+                # needed.
         self._rebuild_spatial_index()
 
     def enforce_hard_core(
