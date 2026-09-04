@@ -62,6 +62,9 @@ Issues = "https://github.com/ophusgroup/tricor/issues"
 test = [
     "pytest>=7.0",
 ]
+mace = [
+    "mace-torch>=0.3",
+]
 # Training-pair generation for the ptychography -> local-g2/g3 ML
 # project (``training`` branch).  abTEM supplies the projected
 # electrostatic potentials that are blurred into pseudo-ptychographic
